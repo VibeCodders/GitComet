@@ -5,14 +5,18 @@
   (.github/workflows/build-release-artifacts.yml).
 
 .DESCRIPTION
-  Checks the Windows prerequisites (Rust toolchain, MSVC linker, Windows SDK),
-  then runs:
+  Checks the Windows prerequisites (Rust toolchain, MSVC linker, Windows SDK,
+  disk space), then runs:
 
     cargo build -p gitcomet --release --locked --features ui-gpui,gix --bin gitcomet
 
   The repository's .cargo/config.toml already points the linker at
   scripts/windows/msvc-linker.cmd, so no shell setup is required beyond having
   Visual Studio Build Tools / Community installed.
+
+  The script prepends C:\Windows\System32 to PATH so Windows tools always
+  win over GNU coreutils (e.g. from Git Bash) that otherwise shadow sort.exe
+  and break the MSVC linker script.
 
 .PARAMETER Configuration
   Build profile: Release (default), Debug, or ReleaseWithDebug.
@@ -24,7 +28,8 @@
 
 .PARAMETER Features
   Cargo feature list for the gitcomet crate. Defaults to "ui-gpui,gix" (the
-  full GUI app used by the release pipeline).
+  full GUI app used by the release pipeline). Pass an empty string to build
+  with the crate's default features.
 
 .PARAMETER Package
   Also create the portable ZIP under dist/ (gitcomet-v<version>-windows-<arch>
@@ -32,6 +37,10 @@
 
 .PARAMETER SkipLocked
   Do not pass --locked to cargo (use this if Cargo.lock is out of date).
+
+.PARAMETER MinFreeSpaceGb
+  Minimum free disk space (GB) required on the drive hosting the repo before
+  the build starts. Defaults to 10.
 
 .EXAMPLE
   .\scripts\windows\build.ps1
@@ -51,11 +60,14 @@ param(
   [ValidateSet("host", "x64", "arm64")]
   [string]$Arch = "host",
 
+  [AllowEmptyString()]
   [string]$Features = "ui-gpui,gix",
 
   [switch]$Package,
 
-  [switch]$SkipLocked
+  [switch]$SkipLocked,
+
+  [int]$MinFreeSpaceGb = 10
 )
 
 $ErrorActionPreference = "Stop"
@@ -80,6 +92,12 @@ function Assert-CommandOnPath {
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $targetDir = Join-Path $repoRoot "target"
+$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+# Windows tools first: GNU coreutils shipped with Git for Windows shadow
+# sort.exe (msvc-linker.cmd) and other tools when their bin dirs precede
+# System32 on PATH.
+$env:PATH = "$([Environment]::SystemDirectory);$env:PATH"
 
 # ── Architecture ───────────────────────────────────────────────────────────
 $cargoTarget = $null
@@ -105,6 +123,9 @@ Write-Step "Checking prerequisites (architecture: $archLabel, configuration: $Co
 Assert-CommandOnPath "cargo" "Install the Rust toolchain with https://rustup.rs and reopen your shell."
 Assert-CommandOnPath "rustc" "Install the Rust toolchain with https://rustup.rs and reopen your shell."
 
+$cargoVersion = (& cargo --version | Select-Object -First 1).Trim()
+Write-Host "  - cargo:    $cargoVersion"
+
 if ($cargoTarget) {
   $installedTargets = & rustup target list --installed 2>$null
   if ($LASTEXITCODE -ne 0 -or ($installedTargets -notcontains $cargoTarget)) {
@@ -127,27 +148,54 @@ if ([string]::IsNullOrWhiteSpace($vsInstall)) {
   throw "No Visual Studio installation with the MSVC $linkerArch tools was found.`nInstall the 'Desktop development with C++' workload (component: $vsComponent) in Visual Studio Installer."
 }
 
+# MSVC toolset must contain at least one version directory.
+$msvcTools = Join-Path $vsInstall "VC\Tools\MSVC"
+$msvcVersions = @(Get-ChildItem -LiteralPath $msvcTools -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending)
+if ($msvcVersions.Count -eq 0) {
+  throw "No MSVC toolset found under '$msvcTools'.`nRe-run the Visual Studio Installer and add the C++ (MSVC) tools, then repair the installation."
+}
+Write-Host "  - MSVC:     $vsInstall (toolset $($msvcVersions[0].Name))"
+
+# Windows SDK must ship kernel32.lib for the target architecture.
 $sdkRoot = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\Lib"
 if (-not (Test-Path -LiteralPath $sdkRoot)) {
   throw "Windows SDK not found at '$sdkRoot'.`nInstall the Windows 10/11 SDK component in Visual Studio Installer."
 }
+$sdkFound = $false
+foreach ($sdkVer in (Get-ChildItem -LiteralPath $sdkRoot -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending)) {
+  if (Test-Path -LiteralPath (Join-Path $sdkVer.FullName "um\$linkerArch\kernel32.lib")) {
+    Write-Host "  - Windows SDK: $sdkRoot ($($sdkVer.Name))"
+    $sdkFound = $true
+    break
+  }
+}
+if (-not $sdkFound) {
+  throw "Windows SDK $linkerArch libraries missing (kernel32.lib not found under '$sdkRoot').`nInstall the Windows 10/11 SDK component in Visual Studio Installer."
+}
 
-Write-Host "  - cargo:    $((Get-Command cargo).Source)"
-Write-Host "  - MSVC:     $vsInstall"
-Write-Host "  - Windows SDK: $sdkRoot"
+# Free disk space on the drive hosting the repo (a release build needs several GB).
+$repoDrive = (Get-Item -LiteralPath $repoRoot).PSDrive
+$freeGb = [math]::Round($repoDrive.Free / 1GB, 1)
+Write-Host "  - disk:     $freeGb GB free on $($repoDrive.Name):\"
+if ($freeGb -lt $MinFreeSpaceGb) {
+  throw "Only $freeGb GB free on $($repoDrive.Name):\ but the build requires at least $MinFreeSpaceGb GB."
+}
 
 # ── Build ──────────────────────────────────────────────────────────────────
-Write-Step "Building gitcomet ($Features)..."
-Write-Host "This is a large GpUI application; a first Release build can take several minutes."
+Write-Step "Building gitcomet ($(if ($Features) { $Features } else { 'default features' }))..."
+Write-Host "This is a large GpUI application; a first Release build can take 20-40 minutes."
 
 # scripts/windows/msvc-linker.cmd reads this to pick the MSVC/SDK architecture.
 $env:GITCOMET_TARGET_ARCH = $linkerArch
 
-$cargoArgs = @("build", "-p", "gitcomet", "--bin", "gitcomet", "--features", $Features)
+$cargoArgs = @("build", "-p", "gitcomet", "--bin", "gitcomet")
+if ($Features) {
+  $cargoArgs += "--features", $Features
+}
 switch ($Configuration) {
-  "Release"         { $cargoArgs += "--release" }
+  "Release"          { $cargoArgs += "--release" }
   "ReleaseWithDebug" { $cargoArgs += "--profile", "release-with-debug" }
-  "Debug"           { } # default dev profile
+  "Debug"            { } # default dev profile
 }
 if (-not $SkipLocked) {
   $cargoArgs += "--locked"
@@ -160,13 +208,20 @@ Write-Host ""
 Write-Host "> cargo $($cargoArgs -join ' ')" -ForegroundColor DarkGray
 & cargo @cargoArgs
 if ($LASTEXITCODE -ne 0) {
+  Write-Host ""
+  Write-Host "cargo build failed with exit code $LASTEXITCODE." -ForegroundColor Red
+  Write-Host "Common causes on Windows:" -ForegroundColor Yellow
+  Write-Host "  - MSVC/SDK components missing: run 'Visual Studio Installer' > Modify and check 'Desktop development with C++'."
+  Write-Host "  - MSVC linker misconfigured: run scripts\windows\msvc-linker.cmd manually and inspect its error."
+  Write-Host "  - GNU tools (Git Bash) shadowing Windows tools: launch from a plain PowerShell/CMD, or ensure System32 precedes Git's bin dirs on PATH."
+  Write-Host "  - Out of disk space: the build needs several GB under target\."
   throw "cargo build failed with exit code $LASTEXITCODE."
 }
 
 $profileDir = switch ($Configuration) {
-  "Release"         { "release" }
+  "Release"          { "release" }
   "ReleaseWithDebug" { "release-with-debug" }
-  "Debug"           { "debug" }
+  "Debug"            { "debug" }
 }
 if ($cargoTarget) {
   $binaryPath = Join-Path $targetDir (Join-Path $cargoTarget (Join-Path $profileDir "gitcomet.exe"))
@@ -178,9 +233,19 @@ if (-not (Test-Path -LiteralPath $binaryPath)) {
   throw "Expected binary not found at '$binaryPath'."
 }
 
+# ── Verify output ──────────────────────────────────────────────────────────
 $sizeMb = [math]::Round((Get-Item -LiteralPath $binaryPath).Length / 1MB, 1)
+$binaryHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $binaryPath).Hash
+$binaryVersion = (& $binaryPath --version 2>$null | Select-Object -First 1)
+if ([string]::IsNullOrWhiteSpace($binaryVersion)) {
+  $binaryVersion = "(version check failed)"
+}
+
 Write-Host ""
-Write-Host "Build succeeded: $binaryPath ($sizeMb MiB)" -ForegroundColor Green
+Write-Host "Build succeeded:" -ForegroundColor Green
+Write-Host "  - binary:  $binaryPath ($sizeMb MiB)"
+Write-Host "  - version: $binaryVersion"
+Write-Host "  - sha256:  $binaryHash"
 
 # ── Optional portable packaging ────────────────────────────────────────────
 if ($Package) {
@@ -209,9 +274,15 @@ if ($Package) {
   }
   Compress-Archive -Path (Join-Path $portableDir "*") -DestinationPath $zipPath
 
+  $zipMb = [math]::Round((Get-Item -LiteralPath $zipPath).Length / 1MB, 1)
+  $zipHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zipPath).Hash
   Write-Host ""
-  Write-Host "Packaged: $zipPath" -ForegroundColor Green
+  Write-Host "Packaged:  $zipPath ($zipMb MiB)" -ForegroundColor Green
+  Write-Host "  - sha256: $zipHash"
 }
 
+# ── Summary ────────────────────────────────────────────────────────────────
+$stopwatch.Stop()
+$elapsed = $stopwatch.Elapsed
 Write-Host ""
-Write-Host "Done." -ForegroundColor Green
+Write-Host "Done in $([math]::Round($elapsed.TotalMinutes, 1)) minutes." -ForegroundColor Green

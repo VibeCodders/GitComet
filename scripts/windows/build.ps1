@@ -48,6 +48,10 @@
   Minimum free disk space (GB) required on the drive hosting the repo before
   the build starts. Defaults to 10.
 
+.PARAMETER InstallVersion
+  Overrides the version embedded in the MSI (cargo-wix --install-version)
+  without touching Cargo.toml. Useful for pre-release/upgrade testing.
+
 .EXAMPLE
   .\scripts\windows\build.ps1
 
@@ -81,7 +85,9 @@ param(
 
   [switch]$SkipLocked,
 
-  [int]$MinFreeSpaceGb = 10
+  [int]$MinFreeSpaceGb = 10,
+
+  [string]$InstallVersion = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -377,6 +383,11 @@ if ($Msi) {
 
   $msiName = "gitcomet-v${version}-windows-${archLabel}.msi"
   $msiPath = Join-Path $distDir $msiName
+  if ($InstallVersion) {
+    # Override the version embedded in the MSI without touching Cargo.toml.
+    $msiName = "gitcomet-v${InstallVersion}-windows-${archLabel}.msi"
+    $msiPath = Join-Path $distDir $msiName
+  }
   if (Test-Path -LiteralPath $msiPath) {
     Remove-Item -LiteralPath $msiPath -Force
   }
@@ -389,6 +400,9 @@ if ($Msi) {
     "Debug"            { "debug" }
   }
   $wixArgs = @("--package", "gitcomet", "--profile", $wixProfile, "--nocapture", "--no-build")
+  if ($InstallVersion) {
+    $wixArgs += "--install-version", $InstallVersion
+  }
   if ($cargoTarget) {
     $wixArgs += "--target", $cargoTarget
     $wixArgs += "--target-bin-dir", (Split-Path $binaryPath -Parent)

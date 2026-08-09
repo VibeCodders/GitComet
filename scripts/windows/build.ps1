@@ -35,6 +35,12 @@
   Also create the portable ZIP under dist/ (gitcomet-v<version>-windows-<arch>
   -portable.zip) with the binary, README, LICENSE, and NOTICE.
 
+.PARAMETER Msi
+  Also build the WiX MSI installer under dist/
+  (gitcomet-v<version>-windows-<arch>.msi). Installs cargo-wix and the WiX
+  Toolset automatically when missing (WiX installs machine-wide and may
+  prompt for elevation).
+
 .PARAMETER SkipLocked
   Do not pass --locked to cargo (use this if Cargo.lock is out of date).
 
@@ -51,6 +57,12 @@
   .\scripts\windows\build.ps1 -Package -Arch arm64
 
   Cross-compile for ARM64 and emit the portable ZIP.
+
+.EXAMPLE
+  .\scripts\windows\build.ps1 -Package -Msi
+
+  Build the release binary plus the portable ZIP and the MSI installer,
+  matching the CI release artifacts.
 #>
 [CmdletBinding()]
 param(
@@ -64,6 +76,8 @@ param(
   [string]$Features = "ui-gpui,gix",
 
   [switch]$Package,
+
+  [switch]$Msi,
 
   [switch]$SkipLocked,
 
@@ -183,7 +197,7 @@ if ($freeGb -lt $MinFreeSpaceGb) {
 
 # ── Build ──────────────────────────────────────────────────────────────────
 Write-Step "Building gitcomet ($(if ($Features) { $Features } else { 'default features' }))..."
-Write-Host "This is a large GpUI application; a first Release build can take 20-40 minutes."
+Write-Host "  This is a large GpUI application; a first Release build can take 20-40 minutes."
 
 # scripts/windows/msvc-linker.cmd reads this to pick the MSVC/SDK architecture.
 $env:GITCOMET_TARGET_ARCH = $linkerArch
@@ -248,9 +262,7 @@ Write-Host "  - version: $binaryVersion"
 Write-Host "  - sha256:  $binaryHash"
 
 # ── Optional portable packaging ────────────────────────────────────────────
-if ($Package) {
-  Write-Step "Packaging portable ZIP..."
-
+if ($Package -or $Msi) {
   $cargoToml = Get-Content -Raw (Join-Path $repoRoot "Cargo.toml")
   $versionMatch = [regex]::Match($cargoToml, '(?ms)\[workspace\.package\][^\[]*?version\s*=\s*"([^"]+)"')
   if (-not $versionMatch.Success) {
@@ -259,6 +271,11 @@ if ($Package) {
   $version = $versionMatch.Groups[1].Value
 
   $distDir = Join-Path $repoRoot "dist"
+}
+
+if ($Package) {
+  Write-Step "Packaging portable ZIP..."
+
   $portableDir = Join-Path $distDir "portable"
   $zipName = "gitcomet-v${version}-windows-${archLabel}-portable.zip"
   $zipPath = Join-Path $distDir $zipName
@@ -279,6 +296,123 @@ if ($Package) {
   Write-Host ""
   Write-Host "Packaged:  $zipPath ($zipMb MiB)" -ForegroundColor Green
   Write-Host "  - sha256: $zipHash"
+}
+
+# ── Optional MSI installer (WiX) ───────────────────────────────────────────
+if ($Msi) {
+  Write-Step "Building MSI installer (WiX)..."
+
+  # cargo-wix (matches the CI version from .github/workflows/build-release-artifacts.yml).
+  $cargoWixVersion = "0.3.9"
+  if (-not (Get-Command cargo-wix -ErrorAction SilentlyContinue)) {
+    Write-Host "cargo-wix not found; installing cargo-wix $cargoWixVersion (compiles from source, may take a few minutes)..."
+    & cargo install cargo-wix --version $cargoWixVersion --locked
+    if ($LASTEXITCODE -ne 0) {
+      throw "cargo install cargo-wix failed with exit code $LASTEXITCODE."
+    }
+    if (-not (Get-Command cargo-wix -ErrorAction SilentlyContinue)) {
+      throw "cargo-wix was installed but is not on PATH. Ensure ~\.cargo\bin is on PATH and re-run."
+    }
+  }
+
+  # Locate the WiX Toolset (candle.exe).
+  $wixBin = $null
+  $candle = Get-Command candle.exe -ErrorAction SilentlyContinue
+  if ($candle) {
+    $wixBin = Split-Path $candle.Source -Parent
+  }
+  if (-not $wixBin) {
+    $wixMachine = [Environment]::GetEnvironmentVariable("WIX", "Machine")
+    if ($wixMachine) {
+      foreach ($c in @((Join-Path $wixMachine "bin\candle.exe"), (Join-Path $wixMachine "candle.exe"))) {
+        if (Test-Path -LiteralPath $c) { $wixBin = Split-Path $c -Parent; break }
+      }
+    }
+  }
+  if (-not $wixBin) {
+    foreach ($root in @(${env:ProgramFiles(x86)}, $env:ProgramFiles)) {
+      if (-not $root) { continue }
+      $c = Join-Path $root "WiX Toolset v3.14\bin\candle.exe"
+      if (Test-Path -LiteralPath $c) { $wixBin = Split-Path $c -Parent; break }
+    }
+  }
+
+  # Not found: try to install it (winget prefers, choco as fallback).
+  if (-not $wixBin) {
+    Write-Host "WiX Toolset not found. Attempting to install it..." -ForegroundColor Yellow
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
+      # winget may prompt for elevation (UAC) since WiX installs machine-wide.
+      & winget install --id WiXToolset.WiXToolset --exact --silent --accept-package-agreements --accept-source-agreements
+      if ($LASTEXITCODE -ne 0) {
+        throw "winget failed to install WiX Toolset (exit code $LASTEXITCODE). Install 'WiX Toolset 3.14' manually from https://wixtoolset.org/releases/ or run this script elevated."
+      }
+    } elseif (Get-Command choco -ErrorAction SilentlyContinue) {
+      & choco install wixtoolset --version 3.14.1.20250415 --yes --no-progress
+      if ($LASTEXITCODE -ne 0) {
+        throw "choco failed to install WiX Toolset (exit code $LASTEXITCODE)."
+      }
+    } else {
+      throw "WiX Toolset 3.14 is required for MSI builds but was not found, and neither winget nor choco is available. Install it manually from https://wixtoolset.org/releases/."
+    }
+    $wixBin = $null
+    $candle = Get-Command candle.exe -ErrorAction SilentlyContinue
+    if ($candle) { $wixBin = Split-Path $candle.Source -Parent }
+    if (-not $wixBin) {
+      throw "WiX Toolset was installed but candle.exe could not be located. Reopen your shell so the updated PATH takes effect, then re-run."
+    }
+  }
+
+  $env:WIX = Split-Path $wixBin -Parent
+  $env:PATH = "$wixBin;$env:PATH"
+  Write-Host "  - WiX:       $wixBin"
+
+  $wxsPath = Join-Path $repoRoot "crates\gitcomet\wix\main.wxs"
+  if (-not (Test-Path -LiteralPath $wxsPath)) {
+    Write-Host "wix\main.wxs missing; running 'cargo wix init'..."
+    & cargo-wix init --package gitcomet
+    if ($LASTEXITCODE -ne 0) {
+      throw "cargo wix init failed with exit code $LASTEXITCODE."
+    }
+  }
+
+  $msiName = "gitcomet-v${version}-windows-${archLabel}.msi"
+  $msiPath = Join-Path $distDir $msiName
+  if (Test-Path -LiteralPath $msiPath) {
+    Remove-Item -LiteralPath $msiPath -Force
+  }
+
+  # The binary lives under target\<triple>\<profile> because the build above
+  # passes --target; tell cargo-wix exactly where so --no-build finds it.
+  $wixProfile = switch ($Configuration) {
+    "Release"          { "release" }
+    "ReleaseWithDebug" { "release-with-debug" }
+    "Debug"            { "debug" }
+  }
+  $wixArgs = @("--package", "gitcomet", "--profile", $wixProfile, "--nocapture", "--no-build")
+  if ($cargoTarget) {
+    $wixArgs += "--target", $cargoTarget
+    $wixArgs += "--target-bin-dir", (Split-Path $binaryPath -Parent)
+  }
+  $wixArgs += "--bin-path", $wixBin
+  $wixArgs += "--output", $msiPath
+
+  Write-Host ""
+  Write-Host "> cargo wix $($wixArgs -join ' ')" -ForegroundColor DarkGray
+  # cargo-wix must be invoked as the 'cargo wix' subcommand: its binary only
+  # accepts arguments when routed through cargo.
+  & cargo wix @wixArgs
+  if ($LASTEXITCODE -ne 0) {
+    throw "cargo wix failed with exit code $LASTEXITCODE."
+  }
+  if (-not (Test-Path -LiteralPath $msiPath)) {
+    throw "MSI was not produced at '$msiPath'."
+  }
+
+  $msiMb = [math]::Round((Get-Item -LiteralPath $msiPath).Length / 1MB, 1)
+  $msiHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $msiPath).Hash
+  Write-Host ""
+  Write-Host "MSI:        $msiPath ($msiMb MiB)" -ForegroundColor Green
+  Write-Host "  - sha256:  $msiHash"
 }
 
 # ── Summary ────────────────────────────────────────────────────────────────

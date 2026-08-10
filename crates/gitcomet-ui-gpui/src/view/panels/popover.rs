@@ -249,6 +249,7 @@ pub(in super::super) struct PopoverHost {
     cherry_pick_source_target: String,
     cherry_pick_range_target: String,
     cherry_pick_base_target: String,
+<<<<<<< New base: Add Cherry-pick onto new branch action to the branch context menu with prefilled
 ||||||| Common ancestor
 =======
     cherry_pick_source_search_input: Option<Entity<components::TextInput>>,
@@ -259,6 +260,12 @@ pub(in super::super) struct PopoverHost {
     cherry_pick_source_target: String,
     cherry_pick_base_target: String,
 >>>>>>> Current commit: Add cherry-pick branch A onto B as new branch C from the action bar
+||||||| Common ancestor
+=======
+    /// The (range, source) pair whose commit preview was last requested, so
+    /// the dialog does not re-dispatch the load on every keystroke.
+    cherry_pick_preview_requested: Option<(String, String)>,
+>>>>>>> Current commit: Preview the B..A commits to cherry-pick in the Cherry-pick dialog
     worktree_ref_source_target: String,
     suppress_worktree_submit_after_ref_enter: bool,
     create_branch_from_ref_checkout_focus_handle: FocusHandle,
@@ -1637,6 +1644,7 @@ impl PopoverHost {
             cherry_pick_source_target: String::new(),
             cherry_pick_range_target: String::new(),
             cherry_pick_base_target: String::new(),
+<<<<<<< New base: Add Cherry-pick onto new branch action to the branch context menu with prefilled
 ||||||| Common ancestor
 =======
             cherry_pick_source_search_input: None,
@@ -1647,6 +1655,10 @@ impl PopoverHost {
             cherry_pick_source_target: String::new(),
             cherry_pick_base_target: String::new(),
 >>>>>>> Current commit: Add cherry-pick branch A onto B as new branch C from the action bar
+||||||| Common ancestor
+=======
+            cherry_pick_preview_requested: None,
+>>>>>>> Current commit: Preview the B..A commits to cherry-pick in the Cherry-pick dialog
             worktree_ref_source_target: String::new(),
             suppress_worktree_submit_after_ref_enter: false,
             create_branch_from_ref_checkout_focus_handle,
@@ -2612,6 +2624,7 @@ impl PopoverHost {
         self.dismiss_inline_popover(window, cx);
     }
 
+<<<<<<< New base: Add Cherry-pick onto new branch action to the branch context menu with prefilled
 ||||||| Common ancestor
 =======
     fn ensure_cherry_pick_search_input(
@@ -2735,6 +2748,47 @@ impl PopoverHost {
     }
 
 >>>>>>> Current commit: Add cherry-pick branch A onto B as new branch C from the action bar
+||||||| Common ancestor
+=======
+    /// Loads the `range..source` commit preview whenever the source/range
+    /// pair is complete and differs from the last requested (or already
+    /// loaded) pair. Called from the picker subscriptions and on popover open.
+    fn refresh_cherry_pick_range_preview(&mut self, _cx: &mut gpui::Context<Self>) {
+        let Some(PopoverKind::CherryPickRangePrompt { repo_id, .. }) = self.popover.clone() else {
+            return;
+        };
+        let source = self.cherry_pick_source_target.trim().to_string();
+        let range = self.cherry_pick_range_target.trim().to_string();
+        if source.is_empty() || range.is_empty() || source == range {
+            return;
+        }
+        if self.cherry_pick_preview_requested.as_ref() == Some(&(range.clone(), source.clone())) {
+            return;
+        }
+        self.cherry_pick_preview_requested = Some((range.clone(), source.clone()));
+        // A preview for this pair may already be loaded in state (e.g. the
+        // dialog was reopened with the same refs); avoid a pointless reload.
+        let already_loaded = self
+            .state
+            .repos
+            .iter()
+            .find(|r| r.id == repo_id)
+            .and_then(|r| r.cherry_pick_range_preview.as_ref())
+            .is_some_and(|preview| {
+                preview.range == range
+                    && preview.source == source
+                    && matches!(preview.commits, Loadable::Ready(_))
+            });
+        if !already_loaded {
+            self.store.dispatch(Msg::LoadCherryPickRangePreview {
+                repo_id,
+                range,
+                source,
+            });
+        }
+    }
+
+>>>>>>> Current commit: Preview the B..A commits to cherry-pick in the Cherry-pick dialog
     fn can_submit_rename_branch(&self, cx: &mut gpui::Context<Self>) -> bool {
         let Some(PopoverKind::RenameBranchPrompt { name, .. }) = &self.popover else {
             return false;
@@ -3275,6 +3329,7 @@ impl PopoverHost {
                                     this.popover,
                                     Some(PopoverKind::CherryPickRangePrompt { .. })
                                 ) {
+                                    this.refresh_cherry_pick_range_preview(cx);
                                     cx.notify();
                                 }
                             },
@@ -3289,6 +3344,7 @@ impl PopoverHost {
                                     this.popover,
                                     Some(PopoverKind::CherryPickRangePrompt { .. })
                                 ) {
+                                    this.refresh_cherry_pick_range_preview(cx);
                                     cx.notify();
                                 }
                             },
@@ -3328,6 +3384,7 @@ impl PopoverHost {
                     });
                     let focus = source_input.read_with(cx, |i, _| i.focus_handle());
                     window.focus(&focus, cx);
+                    self.refresh_cherry_pick_range_preview(cx);
                 }
 ||||||| Common ancestor
 =======

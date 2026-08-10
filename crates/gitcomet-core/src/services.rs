@@ -671,6 +671,18 @@ pub trait GitRepository: Send + Sync {
             "cherry-picking a branch range onto a new branch is not implemented for this backend",
         )))
     }
+    /// Lists the commits `range..source` would cherry-pick (oldest first,
+    /// merge commits skipped) as a preview. Errors when `range` is not an
+    /// ancestor of `source`.
+    fn cherry_pick_range_commits(
+        &self,
+        _range: &str,
+        _source: &str,
+    ) -> Result<Vec<CommitRefSummary>> {
+        Err(Error::new(ErrorKind::Unsupported(
+            "listing a cherry-pick range is not implemented for this backend",
+        )))
+    }
 
 ||||||| Common ancestor
 =======

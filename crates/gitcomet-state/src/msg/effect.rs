@@ -127,6 +127,11 @@ pub enum Effect {
         limit: usize,
         request_rev: u64,
     },
+    LoadCherryPickRangePreview {
+        repo_id: RepoId,
+        range: String,
+        source: String,
+    },
     LoadFileHistory {
         repo_id: RepoId,
         path: PathBuf,

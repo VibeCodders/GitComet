@@ -108,6 +108,7 @@ pub(crate) fn msg_requires_available_git(msg: &Msg) -> bool {
             | Msg::LoadConflictFile { .. }
             | Msg::LoadReflog { .. }
             | Msg::LoadRecentCommitMessages { .. }
+            | Msg::LoadCherryPickRangePreview { .. }
             | Msg::LoadFileHistory { .. }
             | Msg::LoadBlame { .. }
             | Msg::LoadWorktrees { .. }
@@ -1022,6 +1023,11 @@ fn reduce_inner(
         Msg::LoadRecentCommitMessages { repo_id, limit } => {
             effects::load_recent_commit_messages(state, repo_id, limit)
         }
+        Msg::LoadCherryPickRangePreview {
+            repo_id,
+            range,
+            source,
+        } => effects::load_cherry_pick_range_preview(state, repo_id, range, source),
         Msg::LoadFileHistory {
             repo_id,
             path,
@@ -2058,6 +2064,12 @@ fn reduce_inner(
             request_rev,
             result,
         }) => effects::recent_commit_messages_loaded(state, repo_id, request_rev, result),
+        Msg::Internal(crate::msg::InternalMsg::CherryPickRangePreviewLoaded {
+            repo_id,
+            range,
+            source,
+            result,
+        }) => effects::cherry_pick_range_preview_loaded(state, repo_id, range, source, result),
         Msg::Internal(crate::msg::InternalMsg::DiffLoaded {
             repo_id,
             target,

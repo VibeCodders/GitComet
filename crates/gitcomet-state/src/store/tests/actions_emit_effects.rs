@@ -2056,6 +2056,7 @@ fn additional_routing_messages_emit_effects_and_update_counters() {
         &mut repos,
         &id_alloc,
         &mut state,
+<<<<<<< New base: Support explicit commit ranges when cherry-picking onto a new branch (#17)
         Msg::CherryPickRangeOntoNewBranch {
             repo_id,
             base: "main".to_string(),
@@ -2079,6 +2080,30 @@ fn additional_routing_messages_emit_effects_and_update_counters() {
         &mut repos,
         &id_alloc,
         &mut state,
+||||||| Common ancestor
+=======
+        Msg::CherryPickRangeOntoNewBranch {
+            repo_id,
+            base: "main".to_string(),
+            source: "feature".to_string(),
+            new_branch: "feature-copy".to_string(),
+        },
+    );
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::CherryPickRangeOntoNewBranch {
+            repo_id: RepoId(1),
+            base,
+            source,
+            new_branch,
+        }] if base == "main" && source == "feature" && new_branch == "feature-copy"
+    ));
+
+    let effects = reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+>>>>>>> Current commit: Add cherry-pick branch A onto B as new branch C from the action bar
         Msg::CreateBranchAndCheckout {
             repo_id,
             name: "feature/new".to_string(),

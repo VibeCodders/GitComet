@@ -786,7 +786,8 @@ pub(in super::super) fn popover_width_spec(kind: &PopoverKind) -> Option<Popover
         | PopoverKind::FileHistory { .. }
         | PopoverKind::ReflogPrompt { .. }
         | PopoverKind::VirtualBranchesPrompt { .. }
-        | PopoverKind::VirtualBranchPicker { .. } => Some(LARGE_PICKER_WIDTH),
+        | PopoverKind::VirtualBranchPicker { .. }
+        | PopoverKind::VirtualBranchMovePicker { .. } => Some(LARGE_PICKER_WIDTH),
         PopoverKind::AppMenu => Some(APP_MENU_WIDTH),
         PopoverKind::AddRepoMenu => Some(DEFAULT_CONTEXT_MENU_WIDTH),
         PopoverKind::TerminalShutdownConfirm(_) => Some(DIALOG_440_WIDTH),
@@ -2957,7 +2958,8 @@ impl PopoverHost {
                         .read_with(cx, |input, _| input.focus_handle());
                     window.focus(&focus, cx);
                 }
-                PopoverKind::VirtualBranchPicker { .. } => {}
+                PopoverKind::VirtualBranchPicker { .. }
+                | PopoverKind::VirtualBranchMovePicker { .. } => {}
                 PopoverKind::CloneRepo => {
                     let theme = self.theme;
                     let url_text = self
@@ -3717,6 +3719,11 @@ impl PopoverHost {
             PopoverKind::VirtualBranchPicker { repo_id, path } => {
                 virtual_branch_picker::panel(self, repo_id, path, cx)
             }
+            PopoverKind::VirtualBranchMovePicker {
+                repo_id,
+                patch,
+                path,
+            } => virtual_branch_picker::move_panel(self, repo_id, patch, path, cx),
             PopoverKind::PushSetUpstreamPrompt { repo_id, remote } => {
                 push_set_upstream_prompt::panel(self, repo_id, remote, cx)
             }

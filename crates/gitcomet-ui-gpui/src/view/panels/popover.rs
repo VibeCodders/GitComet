@@ -248,6 +248,9 @@ pub(in super::super) struct PopoverHost {
     cherry_pick_source_target: String,
     cherry_pick_range_target: String,
     cherry_pick_base_target: String,
+    /// The (range, source) pair whose commit preview was last requested, so
+    /// the dialog does not re-dispatch the load on every keystroke.
+    cherry_pick_preview_requested: Option<(String, String)>,
     worktree_ref_source_target: String,
     suppress_worktree_submit_after_ref_enter: bool,
     create_branch_from_ref_checkout_focus_handle: FocusHandle,
@@ -1625,6 +1628,7 @@ impl PopoverHost {
             cherry_pick_source_target: String::new(),
             cherry_pick_range_target: String::new(),
             cherry_pick_base_target: String::new(),
+            cherry_pick_preview_requested: None,
             worktree_ref_source_target: String::new(),
             suppress_worktree_submit_after_ref_enter: false,
             create_branch_from_ref_checkout_focus_handle,
@@ -2564,7 +2568,7 @@ impl PopoverHost {
     }
 
     fn submit_cherry_pick_range(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) {
-        let Some(PopoverKind::CherryPickRangePrompt { repo_id }) = self.popover.clone() else {
+        let Some(PopoverKind::CherryPickRangePrompt { repo_id, .. }) = self.popover.clone() else {
             return;
         };
         if !self.cherry_pick_can_submit(cx) {
@@ -2587,6 +2591,44 @@ impl PopoverHost {
             new_branch,
         });
         self.dismiss_inline_popover(window, cx);
+    }
+
+    /// Loads the `range..source` commit preview whenever the source/range
+    /// pair is complete and differs from the last requested (or already
+    /// loaded) pair. Called from the picker subscriptions and on popover open.
+    fn refresh_cherry_pick_range_preview(&mut self, _cx: &mut gpui::Context<Self>) {
+        let Some(PopoverKind::CherryPickRangePrompt { repo_id, .. }) = self.popover.clone() else {
+            return;
+        };
+        let source = self.cherry_pick_source_target.trim().to_string();
+        let range = self.cherry_pick_range_target.trim().to_string();
+        if source.is_empty() || range.is_empty() || source == range {
+            return;
+        }
+        if self.cherry_pick_preview_requested.as_ref() == Some(&(range.clone(), source.clone())) {
+            return;
+        }
+        self.cherry_pick_preview_requested = Some((range.clone(), source.clone()));
+        // A preview for this pair may already be loaded in state (e.g. the
+        // dialog was reopened with the same refs); avoid a pointless reload.
+        let already_loaded = self
+            .state
+            .repos
+            .iter()
+            .find(|r| r.id == repo_id)
+            .and_then(|r| r.cherry_pick_range_preview.as_ref())
+            .is_some_and(|preview| {
+                preview.range == range
+                    && preview.source == source
+                    && matches!(preview.commits, Loadable::Ready(_))
+            });
+        if !already_loaded {
+            self.store.dispatch(Msg::LoadCherryPickRangePreview {
+                repo_id,
+                range,
+                source,
+            });
+        }
     }
 
     fn can_submit_rename_branch(&self, cx: &mut gpui::Context<Self>) -> bool {
@@ -3071,10 +3113,16 @@ impl PopoverHost {
                         .read_with(cx, |i, _| i.focus_handle());
                     window.focus(&focus, cx);
                 }
-                PopoverKind::CherryPickRangePrompt { .. } => {
+                PopoverKind::CherryPickRangePrompt {
+                    prefill_source,
+                    prefill_range,
+                    prefill_base,
+                    ..
+                } => {
                     let theme = self.theme;
                     // D defaults to the current branch: C usually starts from
-                    // where the user is standing.
+                    // where the user is standing. A context-menu open may
+                    // prefill all three pickers instead.
                     let current_branch = self
                         .active_repo()
                         .and_then(|repo| match &repo.head_branch {
@@ -3082,9 +3130,12 @@ impl PopoverHost {
                             _ => None,
                         })
                         .unwrap_or_default();
-                    self.cherry_pick_source_target = String::new();
-                    self.cherry_pick_range_target = String::new();
-                    self.cherry_pick_base_target = current_branch.clone();
+                    let source_prefill = prefill_source.clone().unwrap_or_default();
+                    let range_prefill = prefill_range.clone().unwrap_or_default();
+                    let base_prefill = prefill_base.clone().unwrap_or(current_branch);
+                    self.cherry_pick_source_target = source_prefill.clone();
+                    self.cherry_pick_range_target = range_prefill.clone();
+                    self.cherry_pick_base_target = base_prefill.clone();
                     let source_input =
                         Self::ensure_cherry_pick_search_input(
                             &mut self.cherry_pick_source_search_input,
@@ -3113,6 +3164,7 @@ impl PopoverHost {
                                     this.popover,
                                     Some(PopoverKind::CherryPickRangePrompt { .. })
                                 ) {
+                                    this.refresh_cherry_pick_range_preview(cx);
                                     cx.notify();
                                 }
                             },
@@ -3127,6 +3179,7 @@ impl PopoverHost {
                                     this.popover,
                                     Some(PopoverKind::CherryPickRangePrompt { .. })
                                 ) {
+                                    this.refresh_cherry_pick_range_preview(cx);
                                     cx.notify();
                                 }
                             },
@@ -3146,21 +3199,18 @@ impl PopoverHost {
                             },
                         ));
                     }
-                    for input in [&source_input, &range_input] {
+                    for (input, text) in [
+                        (&source_input, source_prefill.clone()),
+                        (&range_input, range_prefill.clone()),
+                        (&base_input, base_prefill.clone()),
+                    ] {
                         input.update(cx, |input, cx| {
                             input.clear_transient_key_presses();
                             input.set_theme(theme, cx);
-                            input.set_text("", cx);
+                            input.set_text(text, cx);
                             cx.notify();
                         });
                     }
-                    // The base input keeps its prefill.
-                    base_input.update(cx, |input, cx| {
-                        input.clear_transient_key_presses();
-                        input.set_theme(theme, cx);
-                        input.set_text(current_branch, cx);
-                        cx.notify();
-                    });
                     self.cherry_pick_name_input.update(cx, |input, cx| {
                         input.clear_transient_key_presses();
                         input.set_theme(theme, cx);
@@ -3169,6 +3219,7 @@ impl PopoverHost {
                     });
                     let focus = source_input.read_with(cx, |i, _| i.focus_handle());
                     window.focus(&focus, cx);
+                    self.refresh_cherry_pick_range_preview(cx);
                 }
                 PopoverKind::RenameBranchPrompt { name, .. } => {
                     let theme = self.theme;
@@ -4030,7 +4081,7 @@ impl PopoverHost {
             PopoverKind::CherryPickCommitConfirm { repo_id, commit_id } => {
                 cherry_pick_commit_confirm::panel(self, repo_id, commit_id, cx)
             }
-            PopoverKind::CherryPickRangePrompt { repo_id } => {
+            PopoverKind::CherryPickRangePrompt { repo_id, .. } => {
                 cherry_pick_range_prompt::panel(self, repo_id, window, cx)
             }
             PopoverKind::MergeAbortConfirm { repo_id } => {

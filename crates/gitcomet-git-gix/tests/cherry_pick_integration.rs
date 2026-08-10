@@ -1472,3 +1472,31 @@ fn cherry_pick_range_onto_new_branch_rejects_non_ancestor_range() {
     assert_eq!(git_stdout(&repo, &["branch", "--list", "branch_c"]), "");
     assert_eq!(git_stdout(&repo, &["branch", "--show-current"]), "branch_a");
 }
+
+#[test]
+fn cherry_pick_range_commits_lists_range_oldest_first_and_skips_merges() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let repo = dir.path().join("repo");
+    init_repo(&repo);
+    let base = commit_file(&repo, "base.txt", "base\n", "base");
+    run_git(&repo, &["checkout", "-b", "branch_d", &base]);
+    commit_file(&repo, "d.txt", "d\n", "d work");
+    run_git(&repo, &["checkout", "-b", "branch_a", &base]);
+    commit_file(&repo, "a1.txt", "a1\n", "a one");
+    commit_file(&repo, "a2.txt", "a2\n", "a two");
+    run_git(&repo, &["checkout", "main"]);
+    commit_file(&repo, "main.txt", "main\n", "main change");
+    run_git(&repo, &["merge", "--no-edit", "branch_a"]);
+
+    let commits = open_backend(&repo)
+        .cherry_pick_range_commits(&base, "main")
+        .expect("list cherry-pick range");
+    let subjects: Vec<&str> = commits.iter().map(|c| c.summary.as_ref()).collect();
+    assert_eq!(subjects, ["main change", "a one", "a two"]);
+
+    // A non-ancestor range is rejected instead of listing diverged history.
+    let error = open_backend(&repo)
+        .cherry_pick_range_commits("branch_d", "branch_a")
+        .expect_err("non-ancestor range must be rejected");
+    assert!(error.to_string().contains("ancestor"), "{error}");
+}

@@ -3,7 +3,7 @@ use crate::util::{
     bytes_to_text_preserving_utf8, git_command_failed_error, run_git_capture, run_git_raw_output,
     run_git_with_output, validate_hex_commit_id, validate_ref_like_arg,
 };
-use gitcomet_core::domain::CommitId;
+use gitcomet_core::domain::{CommitId, CommitRefSummary};
 use gitcomet_core::error::{Error, ErrorKind};
 use gitcomet_core::services::{
     CommandOutput, InteractiveRebaseAction, InteractiveRebaseEntry, ResetMode, Result,
@@ -1157,6 +1157,84 @@ impl GixRepo {
         // error that only `--skip` moves past, and the UI exposes no skip
         // control — advance automatically so the remaining picks land.
         self.run_cherry_pick_step_output(cmd, &label)
+    }
+
+    /// Lists `range..source` commits (oldest first, merge commits skipped) for
+    /// the cherry-pick preview. Rejects a `range` that is not an ancestor of
+    /// `source` so the preview never shows diverged history.
+    pub(super) fn cherry_pick_range_commits_impl(
+        &self,
+        range: &str,
+        source: &str,
+    ) -> Result<Vec<CommitRefSummary>> {
+        validate_ref_like_arg(range, "range reference")?;
+        validate_ref_like_arg(source, "source reference")?;
+
+        let mut cmd = self.git_workdir_cmd();
+        cmd.arg("merge-base").arg("--is-ancestor").arg(range).arg(source);
+        let ancestor_label = format!("git merge-base --is-ancestor {range} {source}");
+        match run_git_raw_output(cmd, &ancestor_label) {
+            Ok(output) if output.status.success() => {}
+            Ok(output) if output.status.code() == Some(1) => {
+                return Err(Error::new(ErrorKind::Backend(format!(
+                    "{range} is not an ancestor of {source}; the range {range}..{source} would \
+                     include unrelated history — pick a range reference that is an ancestor"
+                ))));
+            }
+            Ok(output) => {
+                return Err(Error::new(ErrorKind::Backend(format!(
+                    "failed to check whether {range} is an ancestor of {source}: {}",
+                    bytes_to_text_preserving_utf8(&output.stderr).trim()
+                ))));
+            }
+            Err(e) => {
+                return Err(Error::new(ErrorKind::Backend(format!(
+                    "failed to check whether {range} is an ancestor of {source}: {e}"
+                ))));
+            }
+        }
+
+        let range_arg = format!("{range}..{source}");
+        let mut cmd = self.git_workdir_cmd();
+        // NUL-framed sha + single-line subject records (`-z`), oldest first,
+        // merges skipped: the exact set the range cherry-pick applies.
+        cmd.args([
+            "log",
+            "-z",
+            "--format=%H%x00%s",
+            "--reverse",
+            "--topo-order",
+            "--no-merges",
+            &range_arg,
+        ]);
+        let output = run_git_capture(cmd, &format!("git log {range_arg}"))?;
+        let mut fields: Vec<&str> = output.split('\0').collect();
+        if fields.last() == Some(&"") {
+            fields.pop();
+        }
+        if !fields.len().is_multiple_of(2) {
+            return Err(Error::new(ErrorKind::Backend(
+                "unexpected git log output while listing the cherry-pick range".to_string(),
+            )));
+        }
+        fields
+            .chunks_exact(2)
+            .map(|record| {
+                let (sha, summary) = (record[0], record[1]);
+                let full_hex_id =
+                    (sha.len() == 40 || sha.len() == 64) && sha.bytes().all(|b| b.is_ascii_hexdigit());
+                if !full_hex_id {
+                    return Err(Error::new(ErrorKind::Backend(format!(
+                        "unexpected commit id {sha:?} in git log output while listing the \
+                         cherry-pick range"
+                    ))));
+                }
+                Ok(CommitRefSummary {
+                    id: CommitId(sha.into()),
+                    summary: summary.into(),
+                })
+            })
+            .collect()
     }
 
     pub(super) fn merge_commit_message_impl(&self) -> Result<Option<String>> {

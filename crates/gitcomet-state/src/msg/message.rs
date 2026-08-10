@@ -295,6 +295,13 @@ pub enum Msg {
         repo_id: RepoId,
         limit: usize,
     },
+    /// Loads the `range..source` commit list shown as the Cherry-pick dialog
+    /// preview.
+    LoadCherryPickRangePreview {
+        repo_id: RepoId,
+        range: String,
+        source: String,
+    },
     LoadFileHistory {
         repo_id: RepoId,
         path: PathBuf,
@@ -986,6 +993,12 @@ pub enum InternalMsg {
         repo_id: RepoId,
         request_rev: u64,
         result: Result<Vec<RecentCommitMessage>, Error>,
+    },
+    CherryPickRangePreviewLoaded {
+        repo_id: RepoId,
+        range: String,
+        source: String,
+        result: Result<Vec<CommitRefSummary>, Error>,
     },
     RebaseStateLoaded {
         repo_id: RepoId,

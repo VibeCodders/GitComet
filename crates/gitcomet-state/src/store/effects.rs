@@ -342,6 +342,18 @@ fn send_unavailable_git_effect_result(
                 result: Err(git_unavailable_error(runtime)),
             },
         )),
+        Effect::LoadCherryPickRangePreview {
+            repo_id,
+            range,
+            source,
+        } => send(Msg::Internal(
+            crate::msg::InternalMsg::CherryPickRangePreviewLoaded {
+                repo_id,
+                range,
+                source,
+                result: Err(git_unavailable_error(runtime)),
+            },
+        )),
         Effect::SaveWorktreeFile {
             repo_id,
             path,
@@ -1841,6 +1853,15 @@ pub(super) fn schedule_effect(
                 repo_id,
                 limit,
                 request_rev,
+            );
+        }
+        Effect::LoadCherryPickRangePreview {
+            repo_id,
+            range,
+            source,
+        } => {
+            repo_load::schedule_load_cherry_pick_range_preview(
+                executor, repos, msg_tx, repo_id, range, source,
             );
         }
         Effect::LoadCommitDetails { repo_id, commit_id } => {

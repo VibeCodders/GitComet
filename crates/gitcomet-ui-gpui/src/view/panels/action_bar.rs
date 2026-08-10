@@ -715,7 +715,12 @@ impl Render for ActionBarView {
                 this.activate_context_menu_invoker(cherry_pick_range_invoker.clone(), cx);
                 if let Some(repo_id) = this.state.active_repo {
                     this.open_popover_for_bounds(
-                        PopoverKind::CherryPickRangePrompt { repo_id },
+                        PopoverKind::CherryPickRangePrompt {
+                            repo_id,
+                            prefill_source: None,
+                            prefill_range: None,
+                            prefill_base: None,
+                        },
                         bounds,
                         window,
                         cx,

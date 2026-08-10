@@ -435,9 +435,17 @@ fn hash_popover_kind<H: Hasher>(kind: &PopoverKind, hasher: &mut H) {
             target.hash(hasher);
             source_selectable.hash(hasher);
         }
-        PopoverKind::CherryPickRangePrompt { repo_id } => {
+        PopoverKind::CherryPickRangePrompt {
+            repo_id,
+            prefill_source,
+            prefill_range,
+            prefill_base,
+        } => {
             103u8.hash(hasher);
             repo_id.hash(hasher);
+            prefill_source.hash(hasher);
+            prefill_range.hash(hasher);
+            prefill_base.hash(hasher);
         }
         PopoverKind::RenameBranchPrompt {
             repo_id,

@@ -3753,6 +3753,9 @@ pub(super) enum PopoverKind {
         repo_id: RepoId,
         path: std::path::PathBuf,
     },
+    ReflogPrompt {
+        repo_id: RepoId,
+    },
     PushSetUpstreamPrompt {
         repo_id: RepoId,
         remote: String,

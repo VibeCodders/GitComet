@@ -192,7 +192,9 @@ fn repo_for_popover<'a>(state: &'a AppState, popover: &PopoverKind) -> Option<&'
         | PopoverKind::TagRefMenu { repo_id, .. }
         | PopoverKind::HistoryBranchFilter { repo_id }
         | PopoverKind::HistoryAuthorFilter { repo_id }
-        | PopoverKind::ReflogPrompt { repo_id } => Some(*repo_id),
+        | PopoverKind::ReflogPrompt { repo_id }
+        | PopoverKind::VirtualBranchesPrompt { repo_id }
+        | PopoverKind::VirtualBranchPicker { repo_id, .. } => Some(*repo_id),
     }?;
 
     state.repos.iter().find(|r| r.id == repo_id)
@@ -374,6 +376,21 @@ fn hash_repo_for_popover<H: Hasher>(repo: &RepoState, popover: &PopoverKind, has
                     entry.selector.hash(hasher);
                     entry.message.hash(hasher);
                 }
+            }
+        }
+
+        PopoverKind::VirtualBranchesPrompt { .. } | PopoverKind::VirtualBranchPicker { .. } => {
+            repo.virtual_branches.len().hash(hasher);
+            for branch in repo.virtual_branches.iter() {
+                branch.id.hash(hasher);
+                branch.name.hash(hasher);
+                branch.applied.hash(hasher);
+                branch.pending.hash(hasher);
+                branch.paths.len().hash(hasher);
+                for path in branch.paths.iter() {
+                    path.hash(hasher);
+                }
+                branch.stored_patch.as_ref().map(|p| p.len()).hash(hasher);
             }
         }
     }
@@ -780,6 +797,15 @@ fn hash_popover_kind<H: Hasher>(kind: &PopoverKind, hasher: &mut H) {
         PopoverKind::ReflogPrompt { repo_id } => {
             98u8.hash(hasher);
             repo_id.hash(hasher);
+        }
+        PopoverKind::VirtualBranchesPrompt { repo_id } => {
+            99u8.hash(hasher);
+            repo_id.hash(hasher);
+        }
+        PopoverKind::VirtualBranchPicker { repo_id, path } => {
+            100u8.hash(hasher);
+            repo_id.hash(hasher);
+            path.hash(hasher);
         }
     }
 }

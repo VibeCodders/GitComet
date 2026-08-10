@@ -330,6 +330,19 @@ pub(super) fn model(
             action: Box::new(ContextMenuAction::CopyText { text: permalink }),
         });
     }
+    items.push(ContextMenuItem::Separator);
+    items.push(ContextMenuItem::Entry {
+        label: "Assign to virtual branch…".into(),
+        icon: Some("icons/git_branch.svg".into()),
+        shortcut: None,
+        disabled: false,
+        action: Box::new(ContextMenuAction::OpenPopover {
+            kind: PopoverKind::VirtualBranchPicker {
+                repo_id,
+                path: path.to_path_buf(),
+            },
+        }),
+    });
     items.push(ContextMenuItem::Entry {
         label: "Copy path".into(),
         icon: Some("icons/copy.svg".into()),

@@ -1943,6 +1943,7 @@ fn is_section_header(row: &BranchSidebarRow) -> bool {
             | BranchSidebarRow::WorktreesHeader { .. }
             | BranchSidebarRow::SubmodulesHeader { .. }
             | BranchSidebarRow::StashHeader { .. }
+            | BranchSidebarRow::VirtualBranchesHeader { .. }
     )
 }
 

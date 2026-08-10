@@ -6,6 +6,7 @@ mod app_menu;
 mod branch_picker;
 mod checkout_remote_branch_prompt;
 mod cherry_pick_commit_confirm;
+mod cherry_pick_range_prompt;
 mod clone_repo;
 mod commit_prompt;
 mod conflict_save_stage_confirm;
@@ -237,6 +238,13 @@ pub(in super::super) struct PopoverHost {
     create_branch_input: Entity<components::TextInput>,
     create_branch_checkout_enabled: bool,
     create_branch_source_target: String,
+    cherry_pick_source_search_input: Option<Entity<components::TextInput>>,
+    cherry_pick_base_search_input: Option<Entity<components::TextInput>>,
+    cherry_pick_name_input: Entity<components::TextInput>,
+    _cherry_pick_source_search_subscription: Option<gpui::Subscription>,
+    _cherry_pick_base_search_subscription: Option<gpui::Subscription>,
+    cherry_pick_source_target: String,
+    cherry_pick_base_target: String,
     worktree_ref_source_target: String,
     suppress_worktree_submit_after_ref_enter: bool,
     create_branch_from_ref_checkout_focus_handle: FocusHandle,
@@ -716,6 +724,7 @@ pub(in super::super) fn popover_width_spec(kind: &PopoverKind) -> Option<Popover
         | PopoverKind::CreateTagPrompt { .. }
         | PopoverKind::SquashPrompt { .. } => Some(DIALOG_420_WIDTH),
         PopoverKind::CreateBranchFromRefPrompt { .. }
+        | PopoverKind::CherryPickRangePrompt { .. }
         | PopoverKind::RenameBranchPrompt { .. }
         | PopoverKind::CheckoutRemoteBranchPrompt { .. } => Some(DIALOG_540_WIDTH),
         PopoverKind::StashDropConfirm { .. }
@@ -1151,6 +1160,17 @@ impl PopoverHost {
             )
         });
 
+        let cherry_pick_name_input = cx.new(|cx| {
+            components::TextInput::new(
+                components::TextInputOptions {
+                    placeholder: "branch-name".into(),
+                    ..Default::default()
+                },
+                window,
+                cx,
+            )
+        });
+
         let stash_message_input = cx.new(|cx| {
             components::TextInput::new(
                 components::TextInputOptions {
@@ -1381,6 +1401,13 @@ impl PopoverHost {
             },
         ));
         prompt_input_subscriptions.push(Self::prompt_enter_subscription(
+            &cherry_pick_name_input,
+            window,
+            cx,
+            |this| matches!(this.popover, Some(PopoverKind::CherryPickRangePrompt { .. })),
+            |this, window, cx| this.submit_cherry_pick_range(window, cx),
+        ));
+        prompt_input_subscriptions.push(Self::prompt_enter_subscription(
             &stash_message_input,
             window,
             cx,
@@ -1585,6 +1612,13 @@ impl PopoverHost {
             create_branch_input,
             create_branch_checkout_enabled: true,
             create_branch_source_target: String::new(),
+            cherry_pick_source_search_input: None,
+            cherry_pick_base_search_input: None,
+            cherry_pick_name_input,
+            _cherry_pick_source_search_subscription: None,
+            _cherry_pick_base_search_subscription: None,
+            cherry_pick_source_target: String::new(),
+            cherry_pick_base_target: String::new(),
             worktree_ref_source_target: String::new(),
             suppress_worktree_submit_after_ref_enter: false,
             create_branch_from_ref_checkout_focus_handle,
@@ -2398,6 +2432,126 @@ impl PopoverHost {
         self.dismiss_inline_popover(window, cx);
     }
 
+    fn ensure_cherry_pick_search_input(
+        slot: &mut Option<Entity<components::TextInput>>,
+        placeholder: &str,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> Entity<components::TextInput> {
+        if let Some(input) = slot {
+            return input.clone();
+        }
+        let input = cx.new(|cx| {
+            components::TextInput::new(
+                components::TextInputOptions {
+                    placeholder: placeholder.into(),
+                    ..Default::default()
+                },
+                window,
+                cx,
+            )
+        });
+        input.update(cx, |input, cx| {
+            input.set_chromeless(false, cx);
+            input.set_leading_icon(None, cx);
+        });
+        *slot = Some(input.clone());
+        input
+    }
+
+    fn handle_cherry_pick_source_select(
+        &mut self,
+        name: String,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if !matches!(self.popover, Some(PopoverKind::CherryPickRangePrompt { .. })) {
+            return;
+        }
+        self.cherry_pick_source_target = name;
+        if let Some(input) = &self.cherry_pick_source_search_input {
+            let theme = self.theme;
+            input.update(cx, |input, cx| {
+                input.clear_transient_key_presses();
+                input.set_theme(theme, cx);
+                input.set_text(self.cherry_pick_source_target.clone(), cx);
+                cx.notify();
+            });
+        }
+        self.branch_picker_selected_index = None;
+        // Move on to the base picker.
+        if let Some(base) = &self.cherry_pick_base_search_input {
+            let focus = base.read_with(cx, |input, _| input.focus_handle());
+            window.focus(&focus, cx);
+        }
+        cx.notify();
+    }
+
+    fn handle_cherry_pick_base_select(
+        &mut self,
+        name: String,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if !matches!(self.popover, Some(PopoverKind::CherryPickRangePrompt { .. })) {
+            return;
+        }
+        self.cherry_pick_base_target = name;
+        if let Some(input) = &self.cherry_pick_base_search_input {
+            let theme = self.theme;
+            input.update(cx, |input, cx| {
+                input.clear_transient_key_presses();
+                input.set_theme(theme, cx);
+                input.set_text(self.cherry_pick_base_target.clone(), cx);
+                cx.notify();
+            });
+        }
+        self.branch_picker_selected_index = None;
+        // Move on to the new branch name.
+        let focus = self
+            .cherry_pick_name_input
+            .read_with(cx, |input, _| input.focus_handle());
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    fn cherry_pick_can_submit(&self, cx: &mut gpui::Context<Self>) -> bool {
+        if !matches!(self.popover, Some(PopoverKind::CherryPickRangePrompt { .. })) {
+            return false;
+        }
+        let source = self.cherry_pick_source_target.trim();
+        let base = self.cherry_pick_base_target.trim();
+        if source.is_empty() || base.is_empty() || source == base {
+            return false;
+        }
+        self.cherry_pick_name_input
+            .read_with(cx, |input, _| !input.text().trim().is_empty())
+    }
+
+    fn submit_cherry_pick_range(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) {
+        let Some(PopoverKind::CherryPickRangePrompt { repo_id }) = self.popover.clone() else {
+            return;
+        };
+        if !self.cherry_pick_can_submit(cx) {
+            return;
+        }
+        let base = self.cherry_pick_base_target.trim().to_string();
+        let source = self.cherry_pick_source_target.trim().to_string();
+        let new_branch = self
+            .cherry_pick_name_input
+            .read_with(cx, |input, _| input.text().trim().to_string());
+        if new_branch.is_empty() {
+            return;
+        }
+        self.store.dispatch(Msg::CherryPickRangeOntoNewBranch {
+            repo_id,
+            base,
+            source,
+            new_branch,
+        });
+        self.dismiss_inline_popover(window, cx);
+    }
+
     fn can_submit_rename_branch(&self, cx: &mut gpui::Context<Self>) -> bool {
         let Some(PopoverKind::RenameBranchPrompt { name, .. }) = &self.popover else {
             return false;
@@ -2878,6 +3032,68 @@ impl PopoverHost {
                     let focus = self
                         .create_branch_input
                         .read_with(cx, |i, _| i.focus_handle());
+                    window.focus(&focus, cx);
+                }
+                PopoverKind::CherryPickRangePrompt { .. } => {
+                    let theme = self.theme;
+                    self.cherry_pick_source_target = String::new();
+                    self.cherry_pick_base_target = String::new();
+                    let source_input =
+                        Self::ensure_cherry_pick_search_input(
+                            &mut self.cherry_pick_source_search_input,
+                            "branch",
+                            window,
+                            cx,
+                        );
+                    let base_input = Self::ensure_cherry_pick_search_input(
+                        &mut self.cherry_pick_base_search_input,
+                        "branch",
+                        window,
+                        cx,
+                    );
+                    if self._cherry_pick_source_search_subscription.is_none() {
+                        let input = source_input.clone();
+                        self._cherry_pick_source_search_subscription = Some(cx.observe(
+                            &input,
+                            |this, _input, cx| {
+                                if matches!(
+                                    this.popover,
+                                    Some(PopoverKind::CherryPickRangePrompt { .. })
+                                ) {
+                                    cx.notify();
+                                }
+                            },
+                        ));
+                    }
+                    if self._cherry_pick_base_search_subscription.is_none() {
+                        let input = base_input.clone();
+                        self._cherry_pick_base_search_subscription = Some(cx.observe(
+                            &input,
+                            |this, _input, cx| {
+                                if matches!(
+                                    this.popover,
+                                    Some(PopoverKind::CherryPickRangePrompt { .. })
+                                ) {
+                                    cx.notify();
+                                }
+                            },
+                        ));
+                    }
+                    for input in [&source_input, &base_input] {
+                        input.update(cx, |input, cx| {
+                            input.clear_transient_key_presses();
+                            input.set_theme(theme, cx);
+                            input.set_text("", cx);
+                            cx.notify();
+                        });
+                    }
+                    self.cherry_pick_name_input.update(cx, |input, cx| {
+                        input.clear_transient_key_presses();
+                        input.set_theme(theme, cx);
+                        input.set_text("", cx);
+                        cx.notify();
+                    });
+                    let focus = source_input.read_with(cx, |i, _| i.focus_handle());
                     window.focus(&focus, cx);
                 }
                 PopoverKind::RenameBranchPrompt { name, .. } => {
@@ -3739,6 +3955,9 @@ impl PopoverHost {
             } => prune_virtual_branches_confirm::panel(self, repo_id, branch_ids, cx),
             PopoverKind::CherryPickCommitConfirm { repo_id, commit_id } => {
                 cherry_pick_commit_confirm::panel(self, repo_id, commit_id, cx)
+            }
+            PopoverKind::CherryPickRangePrompt { repo_id } => {
+                cherry_pick_range_prompt::panel(self, repo_id, window, cx)
             }
             PopoverKind::MergeAbortConfirm { repo_id } => {
                 merge_abort_confirm::panel(self, repo_id, cx)

@@ -274,6 +274,12 @@ pub enum Effect {
         mainline: Option<usize>,
         summary: String,
     },
+    CherryPickRangeOntoNewBranch {
+        repo_id: RepoId,
+        base: String,
+        source: String,
+        new_branch: String,
+    },
     RevertCommit {
         repo_id: RepoId,
         commit_id: CommitId,

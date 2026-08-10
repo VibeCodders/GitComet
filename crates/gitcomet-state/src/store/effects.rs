@@ -690,6 +690,22 @@ fn send_unavailable_git_effect_result(
                 result: Err(git_unavailable_error(runtime)),
             },
         )),
+        Effect::CherryPickRangeOntoNewBranch {
+            repo_id,
+            base,
+            source,
+            new_branch,
+        } => send(Msg::Internal(
+            crate::msg::InternalMsg::RepoCommandFinished {
+                repo_id,
+                command: RepoCommandKind::CherryPickRangeOntoNewBranch {
+                    base,
+                    source,
+                    new_branch,
+                },
+                result: Err(git_unavailable_error(runtime)),
+            },
+        )),
         Effect::RevertCommit { repo_id, .. } => {
             send_repo_action_unavailable(repo_id, RepoActionKind::RevertCommit, runtime, &send)
         }
@@ -2079,6 +2095,16 @@ pub(super) fn schedule_effect(
         } => {
             repo_commands::schedule_cherry_pick_commit(
                 executor, repos, msg_tx, repo_id, commit_id, commit, mainline, summary,
+            );
+        }
+        Effect::CherryPickRangeOntoNewBranch {
+            repo_id,
+            base,
+            source,
+            new_branch,
+        } => {
+            repo_commands::schedule_cherry_pick_range_onto_new_branch(
+                executor, repos, msg_tx, repo_id, base, source, new_branch,
             );
         }
         Effect::RevertCommit { repo_id, commit_id } => {

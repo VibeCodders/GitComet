@@ -3704,6 +3704,12 @@ pub(super) enum PopoverKind {
         target: String,
         source_selectable: bool,
     },
+    /// Pick a source branch A, a base branch B, and a name for a new branch
+    /// C: C is created from B, checked out, and every commit unique to A
+    /// (relative to B, oldest first, merges skipped) is cherry-picked onto it.
+    CherryPickRangePrompt {
+        repo_id: RepoId,
+    },
     RenameBranchPrompt {
         repo_id: RepoId,
         name: String,

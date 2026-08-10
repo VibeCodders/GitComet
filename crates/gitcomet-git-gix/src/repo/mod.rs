@@ -590,6 +590,15 @@ impl GitRepository for GixRepo {
         self.revert_impl(id)
     }
 
+    fn cherry_pick_range_onto_new_branch(
+        &self,
+        base: &str,
+        source: &str,
+        new_branch: &str,
+    ) -> Result<CommandOutput> {
+        self.cherry_pick_range_onto_new_branch_impl(base, source, new_branch)
+    }
+
     fn stash_create(&self, message: &str, include_untracked: bool) -> Result<()> {
         self.stash_create_impl(message, include_untracked)
     }

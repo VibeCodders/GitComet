@@ -77,6 +77,7 @@ fn preview_section(
     theme: AppTheme,
     repo_id: RepoId,
     scaled_px: impl Fn(f32) -> gpui::Pixels + Copy,
+    cx: &mut gpui::Context<PopoverHost>,
 ) -> gpui::Div {
     let source = this.cherry_pick_source_target.trim().to_string();
     let range = this.cherry_pick_range_target.trim().to_string();
@@ -109,12 +110,31 @@ fn preview_section(
                         .as_ref()
                         .get(..7)
                         .unwrap_or(commit.id.as_ref());
+                    let commit_id = commit.id.clone();
+                    let row_debug_id =
+                        format!("cherry_pick_range_preview_row_{}", commit_id.as_ref());
                     rows = rows.child(
                         div()
+                            .id(SharedString::from(row_debug_id.clone()))
+                            .debug_selector(move || row_debug_id.clone())
                             .flex()
                             .items_center()
                             .gap(scaled_px(6.0))
                             .px_2()
+                            .rounded_md()
+                            .hover(move |style| style.bg(theme.hover_overlay()))
+                            .cursor_pointer()
+                            .on_click(cx.listener(
+                                move |this, _e: &gpui::ClickEvent, _w, cx| {
+                                    // Open the commit in the history/details
+                                    // panes, like a reflog entry click.
+                                    this.store.dispatch(Msg::SelectCommit {
+                                        repo_id,
+                                        commit_id: commit_id.clone(),
+                                    });
+                                    this.close_popover(cx);
+                                },
+                            ))
                             .child(
                                 div()
                                     .flex_none()
@@ -146,12 +166,15 @@ fn preview_section(
                             .text_color(theme.colors.text_muted)
                             .child(if more > 0 {
                                 format!(
-                                    "{} commits will be cherry-picked (showing first {})",
+                                    "{} commits will be cherry-picked (showing first {} — click one to open it)",
                                     commits.len(),
                                     shown.len()
                                 )
                             } else {
-                                format!("{} commits will be cherry-picked", commits.len())
+                                format!(
+                                    "{} commits will be cherry-picked — click one to open it",
+                                    commits.len()
+                                )
                             }),
                     )
                     .child(
@@ -268,7 +291,7 @@ pub(super) fn panel(
             window,
             cx,
         ))
-        .child(preview_section(this, theme, _repo_id, scaled_px))
+        .child(preview_section(this, theme, _repo_id, scaled_px, cx))
         .child(input_label(theme, "New branch name (C)"))
         .child(
             div()

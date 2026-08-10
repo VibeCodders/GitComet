@@ -207,6 +207,10 @@ pub(in super::super) struct SidebarPaneView {
     /// section as popover content instead of the full sidebar. The root view
     /// syncs this to its `sidebar_collapsed_popover` before embedding the pane.
     collapsed_popover_section: Option<CollapsedSidebarSection>,
+    /// Virtual branch row currently highlighted as a drop target while a worktree
+    /// file is dragged from the Changes panel. `None` when no drag hovers a
+    /// branch row.
+    pub(in super::super) virtual_branch_drop_hover: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -391,6 +395,7 @@ impl SidebarPaneView {
             file_browser_rows_cache: std::cell::RefCell::new(None),
             collapsed_popover_presentation: None,
             collapsed_popover_section: None,
+            virtual_branch_drop_hover: None,
         };
         this.dispatch_sidebar_data_request_if_needed(cx);
         // Reflect any already-active repo's stored search query on first mount.

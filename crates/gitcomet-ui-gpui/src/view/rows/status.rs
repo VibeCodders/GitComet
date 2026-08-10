@@ -611,6 +611,15 @@ fn status_row(
             }
         })
         .active(move |s| s.bg(theme.colors.active))
+        // Draggable onto virtual branch rows in the sidebar: dropping assigns
+        // the file to the branch (same as the context menu action).
+        .on_drag(
+            crate::view::dnd::StatusFileDrag {
+                repo_id,
+                path: (*path).clone(),
+            },
+            crate::view::dnd::status_file_drag_carrier,
+        )
         .on_mouse_down(
             MouseButton::Right,
             cx.listener(move |this, e: &MouseDownEvent, window, cx| {

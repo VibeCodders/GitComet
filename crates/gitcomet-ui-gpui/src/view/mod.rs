@@ -149,6 +149,7 @@ mod diff_preview;
 mod diff_text_model;
 mod diff_text_selection;
 mod diff_utils;
+mod dnd;
 mod file_diff_display;
 mod file_icons;
 mod fingerprint;

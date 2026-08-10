@@ -3756,6 +3756,16 @@ pub(super) enum PopoverKind {
     ReflogPrompt {
         repo_id: RepoId,
     },
+    /// Prototype virtual-branch workspace panel: lists virtual branches with
+    /// their assigned paths and apply/unapply/commit actions.
+    VirtualBranchesPrompt {
+        repo_id: RepoId,
+    },
+    /// Pick the virtual branch to assign a worktree path to.
+    VirtualBranchPicker {
+        repo_id: RepoId,
+        path: std::path::PathBuf,
+    },
     PushSetUpstreamPrompt {
         repo_id: RepoId,
         remote: String,

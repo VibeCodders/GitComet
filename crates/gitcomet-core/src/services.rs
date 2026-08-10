@@ -651,15 +651,18 @@ pub trait GitRepository: Send + Sync {
 
     /// Creates a new branch `new_branch` pointing at `base`'s tip, checks it
     /// out, and cherry-picks every commit reachable from `source` but not from
-    /// `base` (oldest first, merge commits skipped) onto it.
+    /// `range` (oldest first, merge commits skipped) onto it. `range` must be
+    /// an ancestor of `source`.
     ///
-    /// Errors without touching anything if `new_branch` already exists or the
-    /// range `base..source` is empty. A cherry-pick conflict stops the sequence
-    /// and leaves Git's sequencer state in progress on `new_branch`, exactly
-    /// like a regular multi-commit cherry-pick.
+    /// Errors without touching anything if `new_branch` already exists, the
+    /// range `range..source` is empty, or `range` is not an ancestor of
+    /// `source`. A cherry-pick conflict stops the sequence and leaves Git's
+    /// sequencer state in progress on `new_branch`, exactly like a regular
+    /// multi-commit cherry-pick.
     fn cherry_pick_range_onto_new_branch(
         &self,
         _base: &str,
+        _range: &str,
         _source: &str,
         _new_branch: &str,
     ) -> Result<CommandOutput> {

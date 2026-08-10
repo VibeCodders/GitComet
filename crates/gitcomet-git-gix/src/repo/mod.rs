@@ -593,10 +593,11 @@ impl GitRepository for GixRepo {
     fn cherry_pick_range_onto_new_branch(
         &self,
         base: &str,
+        range: &str,
         source: &str,
         new_branch: &str,
     ) -> Result<CommandOutput> {
-        self.cherry_pick_range_onto_new_branch_impl(base, source, new_branch)
+        self.cherry_pick_range_onto_new_branch_impl(base, range, source, new_branch)
     }
 
     fn stash_create(&self, message: &str, include_untracked: bool) -> Result<()> {

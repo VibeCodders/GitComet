@@ -77,13 +77,17 @@ pub(super) fn panel(
     let scaled_px = super::popover_scaled_px_fn(cx);
     let can_submit = this.cherry_pick_can_submit(cx);
     let source = this.cherry_pick_source_target.trim().to_string();
-    let base = this.cherry_pick_base_target.trim().to_string();
-    let same_branch_hint = !source.is_empty() && source == base;
+    let range = this.cherry_pick_range_target.trim().to_string();
+    let same_ref_hint = !source.is_empty() && source == range;
 
     let source_input = this
         .cherry_pick_source_search_input
         .clone()
         .expect("cherry_pick_source_search_input must be initialized");
+    let range_input = this
+        .cherry_pick_range_search_input
+        .clone()
+        .expect("cherry_pick_range_search_input must be initialized");
     let base_input = this
         .cherry_pick_base_search_input
         .clone()
@@ -102,13 +106,13 @@ pub(super) fn panel(
                 .text_sm()
                 .text_color(theme.colors.text_muted)
                 .child(
-                    "Creates a new branch C from B, checks it out, and cherry-picks every commit unique to A (oldest first, merge commits skipped).",
+                    "Creates a new branch C from D, checks it out, and cherry-picks every commit unique to A relative to B (B..A, oldest first, merge commits skipped). B must be an ancestor of A.",
                 ),
         )
         .child(picker_row(
             this,
             theme,
-            "Source branch (A)",
+            "Source ref (A)",
             &source_input,
             |this, name, _e, window, cx| {
                 this.handle_cherry_pick_source_select(name, window, cx);
@@ -119,7 +123,18 @@ pub(super) fn panel(
         .child(picker_row(
             this,
             theme,
-            "Base branch (B)",
+            "Range ref (B)",
+            &range_input,
+            |this, name, _e, window, cx| {
+                this.handle_cherry_pick_range_select(name, window, cx);
+            },
+            window,
+            cx,
+        ))
+        .child(picker_row(
+            this,
+            theme,
+            "Base branch (D)",
             &base_input,
             |this, name, _e, window, cx| {
                 this.handle_cherry_pick_base_select(name, window, cx);
@@ -136,14 +151,14 @@ pub(super) fn panel(
                 .min_w(px(0.0))
                 .child(this.cherry_pick_name_input.clone()),
         )
-        .when(same_branch_hint, |this| {
+        .when(same_ref_hint, |this| {
             this.child(
                 div()
                     .px_2()
                     .pb_1()
                     .text_sm()
                     .text_color(theme.colors.warning)
-                    .child("Source and base are the same — there is nothing to cherry-pick."),
+                    .child("Source and range are the same — there is nothing to cherry-pick."),
             )
         })
         .child(div().border_t_1().border_color(theme.colors.border))

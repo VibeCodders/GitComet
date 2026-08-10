@@ -422,11 +422,13 @@ pub enum Msg {
         summary: String,
     },
     /// Creates a new branch `new_branch` from `base`'s tip, checks it out,
-    /// and cherry-picks every commit unique to `source` (relative to `base`,
-    /// oldest first, merge commits skipped) onto it.
+    /// and cherry-picks every commit unique to `source` relative to `range`
+    /// (oldest first, merge commits skipped; `range` must be an ancestor of
+    /// `source`) onto it.
     CherryPickRangeOntoNewBranch {
         repo_id: RepoId,
         base: String,
+        range: String,
         source: String,
         new_branch: String,
     },

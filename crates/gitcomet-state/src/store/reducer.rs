@@ -1144,6 +1144,7 @@ fn reduce_inner(
         Msg::CherryPickRangeOntoNewBranch {
             repo_id,
             base,
+            range,
             source,
             new_branch,
         } => {
@@ -1151,7 +1152,9 @@ fn reduce_inner(
                 repo_state.set_detached_head_commit(None);
             }
             begin_head_changing_local_action(state, repo_id);
-            actions_emit_effects::cherry_pick_range_onto_new_branch(repo_id, base, source, new_branch)
+            actions_emit_effects::cherry_pick_range_onto_new_branch(
+                repo_id, base, range, source, new_branch,
+            )
         }
         Msg::RevertCommit { repo_id, commit_id } => {
             begin_head_changing_local_action(state, repo_id);

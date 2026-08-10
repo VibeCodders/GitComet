@@ -277,6 +277,7 @@ pub enum Effect {
     CherryPickRangeOntoNewBranch {
         repo_id: RepoId,
         base: String,
+        range: String,
         source: String,
         new_branch: String,
     },

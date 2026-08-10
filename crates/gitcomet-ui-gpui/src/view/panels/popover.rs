@@ -357,6 +357,7 @@ fn popover_is_context_menu(kind: &PopoverKind) -> bool {
             | PopoverKind::CommitOptionsMenu { .. }
             | PopoverKind::PreviousCommitMessagesMenu { .. }
             | PopoverKind::RepoTabMenu { .. }
+            | PopoverKind::MarkdownLinkMenu { .. }
             | PopoverKind::DiffActionMenu
             | PopoverKind::InteractiveRebaseActionMenu { .. }
             | PopoverKind::InteractiveRebaseAutosquashMenu
@@ -683,6 +684,7 @@ fn popover_anchor_corner(kind: &PopoverKind) -> Anchor {
         | PopoverKind::CommitOptionsMenu { .. }
         | PopoverKind::PreviousCommitMessagesMenu { .. }
         | PopoverKind::RepoTabMenu { .. }
+        | PopoverKind::MarkdownLinkMenu { .. }
         | PopoverKind::DiffActionMenu
         | PopoverKind::MergetoolSettingsMenu
         | PopoverKind::HistoryBranchFilter { .. }
@@ -779,7 +781,9 @@ pub(in super::super) fn popover_width_spec(kind: &PopoverKind) -> Option<Popover
         PopoverKind::AddRepoMenu => Some(DEFAULT_CONTEXT_MENU_WIDTH),
         PopoverKind::TerminalShutdownConfirm(_) => Some(DIALOG_440_WIDTH),
         PopoverKind::TerminalMenu { .. } => Some(DEFAULT_CONTEXT_MENU_WIDTH),
-        PopoverKind::DiffActionMenu => Some(DIFF_ACTION_MENU_WIDTH),
+        PopoverKind::MarkdownLinkMenu { .. } | PopoverKind::DiffActionMenu => {
+            Some(DIFF_ACTION_MENU_WIDTH)
+        }
         // "Browse repository at this point" needs more room than the default
         // context-menu width.
         PopoverKind::CommitMenu { .. } => Some(PopoverWidthSpec::range(300.0, 220.0, 400.0)),
@@ -1792,6 +1796,7 @@ impl PopoverHost {
             Some(
                 PopoverKind::ChangeTrackingSettings
                     | PopoverKind::DiffContentModeSettings
+                    | PopoverKind::MarkdownLinkMenu { .. }
                     | PopoverKind::DiffActionMenu
                     | PopoverKind::MergetoolSettingsMenu
                     | PopoverKind::DiffHunkMenu { .. }
@@ -3693,6 +3698,9 @@ impl PopoverHost {
                 pull_reconcile_prompt::panel(self, repo_id, cx)
             }
             PopoverKind::DiffActionMenu => self.context_menu_view(PopoverKind::DiffActionMenu, cx),
+            PopoverKind::MarkdownLinkMenu { url } => {
+                self.context_menu_view(PopoverKind::MarkdownLinkMenu { url }, cx)
+            }
             PopoverKind::MergetoolSettingsMenu => {
                 self.context_menu_view(PopoverKind::MergetoolSettingsMenu, cx)
             }

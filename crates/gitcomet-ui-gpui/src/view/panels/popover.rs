@@ -20,6 +20,7 @@ mod force_delete_branch_confirm;
 mod force_push_confirm;
 mod force_remove_worktree_confirm;
 mod merge_abort_confirm;
+mod prune_virtual_branches_confirm;
 mod picker_nav;
 mod pull_reconcile_prompt;
 mod push_set_upstream_prompt;
@@ -424,6 +425,7 @@ fn popover_is_confirm_dialog(kind: &PopoverKind) -> bool {
             | PopoverKind::ForceRemoveWorktreeConfirm { .. }
             | PopoverKind::DiscardChangesConfirm { .. }
             | PopoverKind::StageConflictMarkersConfirm { .. }
+            | PopoverKind::PruneVirtualBranchesConfirm { .. }
             | PopoverKind::ResetPrompt { .. }
             | PopoverKind::PullReconcilePrompt { .. }
             | PopoverKind::TerminalShutdownConfirm(_)
@@ -736,7 +738,8 @@ pub(in super::super) fn popover_width_spec(kind: &PopoverKind) -> Option<Popover
         | PopoverKind::ForcePushConfirm { .. }
         | PopoverKind::ForceDeleteBranchConfirm { .. }
         | PopoverKind::DiscardChangesConfirm { .. }
-        | PopoverKind::StageConflictMarkersConfirm { .. } => Some(DIALOG_420_WIDTH),
+        | PopoverKind::StageConflictMarkersConfirm { .. }
+        | PopoverKind::PruneVirtualBranchesConfirm { .. } => Some(DIALOG_420_WIDTH),
         PopoverKind::PushSetUpstreamPrompt { .. } => Some(DIALOG_320_WIDTH),
         PopoverKind::ResetPrompt { .. }
         | PopoverKind::RebaseOntoConfirm { .. }
@@ -3730,6 +3733,10 @@ impl PopoverHost {
             PopoverKind::ForcePushConfirm { repo_id } => {
                 force_push_confirm::panel(self, repo_id, cx)
             }
+            PopoverKind::PruneVirtualBranchesConfirm {
+                repo_id,
+                branch_ids,
+            } => prune_virtual_branches_confirm::panel(self, repo_id, branch_ids, cx),
             PopoverKind::CherryPickCommitConfirm { repo_id, commit_id } => {
                 cherry_pick_commit_confirm::panel(self, repo_id, commit_id, cx)
             }

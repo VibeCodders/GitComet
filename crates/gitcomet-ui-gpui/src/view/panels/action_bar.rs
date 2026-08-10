@@ -700,6 +700,32 @@ impl Render for ActionBarView {
             })
             .gitcomet_tooltip(theme, "Create branch".into());
 
+        let cherry_pick_range_invoker: SharedString = "cherry_pick_range_btn".into();
+        let cherry_pick_range_active = self
+            .active_context_menu_invoker
+            .as_ref()
+            .is_some_and(|id| id.as_ref() == cherry_pick_range_invoker.as_ref());
+        let cherry_pick_range = components::Button::new("cherry_pick_range", "")
+            .start_slot(icon("icons/copy.svg", icon_primary))
+            .style(components::ButtonStyle::Subtle)
+            .selected(cherry_pick_range_active)
+            .selected_bg(menu_selected_bg)
+            .on_click_with_bounds(theme, cx, move |this, _e, bounds, window, cx| {
+                this.activate_context_menu_invoker(cherry_pick_range_invoker.clone(), cx);
+                if let Some(repo_id) = this.state.active_repo {
+                    this.open_popover_for_bounds(
+                        PopoverKind::CherryPickRangePrompt { repo_id },
+                        bounds,
+                        window,
+                        cx,
+                    );
+                }
+            })
+            .gitcomet_tooltip(
+                theme,
+                "Cherry-pick branch A onto branch B as a new branch C".into(),
+            );
+
         div()
             .w_full()
             .h(action_bar_height)
@@ -814,6 +840,7 @@ impl Render for ActionBarView {
                     .child(push)
                     .child(terminal)
                     .child(create_branch)
+                    .child(cherry_pick_range)
                     .child(stash),
             )
     }

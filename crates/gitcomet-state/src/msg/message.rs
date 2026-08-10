@@ -421,6 +421,15 @@ pub enum Msg {
         mainline: Option<usize>,
         summary: String,
     },
+    /// Creates a new branch `new_branch` from `base`'s tip, checks it out,
+    /// and cherry-picks every commit unique to `source` (relative to `base`,
+    /// oldest first, merge commits skipped) onto it.
+    CherryPickRangeOntoNewBranch {
+        repo_id: RepoId,
+        base: String,
+        source: String,
+        new_branch: String,
+    },
     RevertCommit {
         repo_id: RepoId,
         commit_id: CommitId,

@@ -590,7 +590,6 @@ impl GitRepository for GixRepo {
         self.revert_impl(id)
     }
 
-<<<<<<< New base: Support explicit commit ranges when cherry-picking onto a new branch (#17)
     fn cherry_pick_range_onto_new_branch(
         &self,
         base: &str,
@@ -601,21 +600,6 @@ impl GitRepository for GixRepo {
         self.cherry_pick_range_onto_new_branch_impl(base, range, source, new_branch)
     }
 
-<<<<<<< New base: Add Cherry-pick onto new branch action to the branch context menu with prefilled
-||||||| Common ancestor
-=======
-    fn cherry_pick_range_onto_new_branch(
-        &self,
-        base: &str,
-        source: &str,
-        new_branch: &str,
-    ) -> Result<CommandOutput> {
-        self.cherry_pick_range_onto_new_branch_impl(base, source, new_branch)
-    }
-
->>>>>>> Current commit: Add cherry-pick branch A onto B as new branch C from the action bar
-||||||| Common ancestor
-=======
     fn cherry_pick_range_commits(
         &self,
         range: &str,
@@ -624,7 +608,6 @@ impl GitRepository for GixRepo {
         self.cherry_pick_range_commits_impl(range, source)
     }
 
->>>>>>> Current commit: Preview the B..A commits to cherry-pick in the Cherry-pick dialog
     fn stash_create(&self, message: &str, include_untracked: bool) -> Result<()> {
         self.stash_create_impl(message, include_untracked)
     }

@@ -238,7 +238,6 @@ pub(in super::super) struct PopoverHost {
     create_branch_input: Entity<components::TextInput>,
     create_branch_checkout_enabled: bool,
     create_branch_source_target: String,
-<<<<<<< New base: Support explicit commit ranges when cherry-picking onto a new branch (#17)
     cherry_pick_source_search_input: Option<Entity<components::TextInput>>,
     cherry_pick_range_search_input: Option<Entity<components::TextInput>>,
     cherry_pick_base_search_input: Option<Entity<components::TextInput>>,
@@ -249,23 +248,9 @@ pub(in super::super) struct PopoverHost {
     cherry_pick_source_target: String,
     cherry_pick_range_target: String,
     cherry_pick_base_target: String,
-<<<<<<< New base: Add Cherry-pick onto new branch action to the branch context menu with prefilled
-||||||| Common ancestor
-=======
-    cherry_pick_source_search_input: Option<Entity<components::TextInput>>,
-    cherry_pick_base_search_input: Option<Entity<components::TextInput>>,
-    cherry_pick_name_input: Entity<components::TextInput>,
-    _cherry_pick_source_search_subscription: Option<gpui::Subscription>,
-    _cherry_pick_base_search_subscription: Option<gpui::Subscription>,
-    cherry_pick_source_target: String,
-    cherry_pick_base_target: String,
->>>>>>> Current commit: Add cherry-pick branch A onto B as new branch C from the action bar
-||||||| Common ancestor
-=======
     /// The (range, source) pair whose commit preview was last requested, so
     /// the dialog does not re-dispatch the load on every keystroke.
     cherry_pick_preview_requested: Option<(String, String)>,
->>>>>>> Current commit: Preview the B..A commits to cherry-pick in the Cherry-pick dialog
     worktree_ref_source_target: String,
     suppress_worktree_submit_after_ref_enter: bool,
     create_branch_from_ref_checkout_focus_handle: FocusHandle,
@@ -1633,7 +1618,6 @@ impl PopoverHost {
             create_branch_input,
             create_branch_checkout_enabled: true,
             create_branch_source_target: String::new(),
-<<<<<<< New base: Support explicit commit ranges when cherry-picking onto a new branch (#17)
             cherry_pick_source_search_input: None,
             cherry_pick_range_search_input: None,
             cherry_pick_base_search_input: None,
@@ -1644,21 +1628,7 @@ impl PopoverHost {
             cherry_pick_source_target: String::new(),
             cherry_pick_range_target: String::new(),
             cherry_pick_base_target: String::new(),
-<<<<<<< New base: Add Cherry-pick onto new branch action to the branch context menu with prefilled
-||||||| Common ancestor
-=======
-            cherry_pick_source_search_input: None,
-            cherry_pick_base_search_input: None,
-            cherry_pick_name_input,
-            _cherry_pick_source_search_subscription: None,
-            _cherry_pick_base_search_subscription: None,
-            cherry_pick_source_target: String::new(),
-            cherry_pick_base_target: String::new(),
->>>>>>> Current commit: Add cherry-pick branch A onto B as new branch C from the action bar
-||||||| Common ancestor
-=======
             cherry_pick_preview_requested: None,
->>>>>>> Current commit: Preview the B..A commits to cherry-pick in the Cherry-pick dialog
             worktree_ref_source_target: String::new(),
             suppress_worktree_submit_after_ref_enter: false,
             create_branch_from_ref_checkout_focus_handle,
@@ -2472,7 +2442,6 @@ impl PopoverHost {
         self.dismiss_inline_popover(window, cx);
     }
 
-<<<<<<< New base: Support explicit commit ranges when cherry-picking onto a new branch (#17)
     fn ensure_cherry_pick_search_input(
         slot: &mut Option<Entity<components::TextInput>>,
         placeholder: &str,
@@ -2624,132 +2593,6 @@ impl PopoverHost {
         self.dismiss_inline_popover(window, cx);
     }
 
-<<<<<<< New base: Add Cherry-pick onto new branch action to the branch context menu with prefilled
-||||||| Common ancestor
-=======
-    fn ensure_cherry_pick_search_input(
-        slot: &mut Option<Entity<components::TextInput>>,
-        placeholder: &str,
-        window: &mut Window,
-        cx: &mut gpui::Context<Self>,
-    ) -> Entity<components::TextInput> {
-        if let Some(input) = slot {
-            return input.clone();
-        }
-        let input = cx.new(|cx| {
-            components::TextInput::new(
-                components::TextInputOptions {
-                    placeholder: placeholder.into(),
-                    ..Default::default()
-                },
-                window,
-                cx,
-            )
-        });
-        input.update(cx, |input, cx| {
-            input.set_chromeless(false, cx);
-            input.set_leading_icon(None, cx);
-        });
-        *slot = Some(input.clone());
-        input
-    }
-
-    fn handle_cherry_pick_source_select(
-        &mut self,
-        name: String,
-        window: &mut Window,
-        cx: &mut gpui::Context<Self>,
-    ) {
-        if !matches!(self.popover, Some(PopoverKind::CherryPickRangePrompt { .. })) {
-            return;
-        }
-        self.cherry_pick_source_target = name;
-        if let Some(input) = &self.cherry_pick_source_search_input {
-            let theme = self.theme;
-            input.update(cx, |input, cx| {
-                input.clear_transient_key_presses();
-                input.set_theme(theme, cx);
-                input.set_text(self.cherry_pick_source_target.clone(), cx);
-                cx.notify();
-            });
-        }
-        self.branch_picker_selected_index = None;
-        // Move on to the base picker.
-        if let Some(base) = &self.cherry_pick_base_search_input {
-            let focus = base.read_with(cx, |input, _| input.focus_handle());
-            window.focus(&focus, cx);
-        }
-        cx.notify();
-    }
-
-    fn handle_cherry_pick_base_select(
-        &mut self,
-        name: String,
-        window: &mut Window,
-        cx: &mut gpui::Context<Self>,
-    ) {
-        if !matches!(self.popover, Some(PopoverKind::CherryPickRangePrompt { .. })) {
-            return;
-        }
-        self.cherry_pick_base_target = name;
-        if let Some(input) = &self.cherry_pick_base_search_input {
-            let theme = self.theme;
-            input.update(cx, |input, cx| {
-                input.clear_transient_key_presses();
-                input.set_theme(theme, cx);
-                input.set_text(self.cherry_pick_base_target.clone(), cx);
-                cx.notify();
-            });
-        }
-        self.branch_picker_selected_index = None;
-        // Move on to the new branch name.
-        let focus = self
-            .cherry_pick_name_input
-            .read_with(cx, |input, _| input.focus_handle());
-        window.focus(&focus, cx);
-        cx.notify();
-    }
-
-    fn cherry_pick_can_submit(&self, cx: &mut gpui::Context<Self>) -> bool {
-        if !matches!(self.popover, Some(PopoverKind::CherryPickRangePrompt { .. })) {
-            return false;
-        }
-        let source = self.cherry_pick_source_target.trim();
-        let base = self.cherry_pick_base_target.trim();
-        if source.is_empty() || base.is_empty() || source == base {
-            return false;
-        }
-        self.cherry_pick_name_input
-            .read_with(cx, |input, _| !input.text().trim().is_empty())
-    }
-
-    fn submit_cherry_pick_range(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) {
-        let Some(PopoverKind::CherryPickRangePrompt { repo_id }) = self.popover.clone() else {
-            return;
-        };
-        if !self.cherry_pick_can_submit(cx) {
-            return;
-        }
-        let base = self.cherry_pick_base_target.trim().to_string();
-        let source = self.cherry_pick_source_target.trim().to_string();
-        let new_branch = self
-            .cherry_pick_name_input
-            .read_with(cx, |input, _| input.text().trim().to_string());
-        if new_branch.is_empty() {
-            return;
-        }
-        self.store.dispatch(Msg::CherryPickRangeOntoNewBranch {
-            repo_id,
-            base,
-            source,
-            new_branch,
-        });
-        self.dismiss_inline_popover(window, cx);
-    }
-
->>>>>>> Current commit: Add cherry-pick branch A onto B as new branch C from the action bar
-||||||| Common ancestor
-=======
     /// Loads the `range..source` commit preview whenever the source/range
     /// pair is complete and differs from the last requested (or already
     /// loaded) pair. Called from the picker subscriptions and on popover open.
@@ -2788,7 +2631,6 @@ impl PopoverHost {
         }
     }
 
->>>>>>> Current commit: Preview the B..A commits to cherry-pick in the Cherry-pick dialog
     fn can_submit_rename_branch(&self, cx: &mut gpui::Context<Self>) -> bool {
         let Some(PopoverKind::RenameBranchPrompt { name, .. }) = &self.popover else {
             return false;
@@ -3271,19 +3113,12 @@ impl PopoverHost {
                         .read_with(cx, |i, _| i.focus_handle());
                     window.focus(&focus, cx);
                 }
-<<<<<<< New base: Add cherry-pick branch A onto B as new branch C from the action bar
-<<<<<<< New base: Support explicit commit ranges when cherry-picking onto a new branch (#17)
-                PopoverKind::CherryPickRangePrompt { .. } => {
-||||||| Common ancestor
-                PopoverKind::CherryPickRangePrompt { .. } => {
-=======
                 PopoverKind::CherryPickRangePrompt {
                     prefill_source,
                     prefill_range,
                     prefill_base,
                     ..
                 } => {
->>>>>>> Current commit: Add Cherry-pick onto new branch action to the branch context menu with prefilled
                     let theme = self.theme;
                     // D defaults to the current branch: C usually starts from
                     // where the user is standing. A context-menu open may
@@ -3386,71 +3221,6 @@ impl PopoverHost {
                     window.focus(&focus, cx);
                     self.refresh_cherry_pick_range_preview(cx);
                 }
-||||||| Common ancestor
-=======
-                PopoverKind::CherryPickRangePrompt { .. } => {
-                    let theme = self.theme;
-                    self.cherry_pick_source_target = String::new();
-                    self.cherry_pick_base_target = String::new();
-                    let source_input =
-                        Self::ensure_cherry_pick_search_input(
-                            &mut self.cherry_pick_source_search_input,
-                            "branch",
-                            window,
-                            cx,
-                        );
-                    let base_input = Self::ensure_cherry_pick_search_input(
-                        &mut self.cherry_pick_base_search_input,
-                        "branch",
-                        window,
-                        cx,
-                    );
-                    if self._cherry_pick_source_search_subscription.is_none() {
-                        let input = source_input.clone();
-                        self._cherry_pick_source_search_subscription = Some(cx.observe(
-                            &input,
-                            |this, _input, cx| {
-                                if matches!(
-                                    this.popover,
-                                    Some(PopoverKind::CherryPickRangePrompt { .. })
-                                ) {
-                                    cx.notify();
-                                }
-                            },
-                        ));
-                    }
-                    if self._cherry_pick_base_search_subscription.is_none() {
-                        let input = base_input.clone();
-                        self._cherry_pick_base_search_subscription = Some(cx.observe(
-                            &input,
-                            |this, _input, cx| {
-                                if matches!(
-                                    this.popover,
-                                    Some(PopoverKind::CherryPickRangePrompt { .. })
-                                ) {
-                                    cx.notify();
-                                }
-                            },
-                        ));
-                    }
-                    for input in [&source_input, &base_input] {
-                        input.update(cx, |input, cx| {
-                            input.clear_transient_key_presses();
-                            input.set_theme(theme, cx);
-                            input.set_text("", cx);
-                            cx.notify();
-                        });
-                    }
-                    self.cherry_pick_name_input.update(cx, |input, cx| {
-                        input.clear_transient_key_presses();
-                        input.set_theme(theme, cx);
-                        input.set_text("", cx);
-                        cx.notify();
-                    });
-                    let focus = source_input.read_with(cx, |i, _| i.focus_handle());
-                    window.focus(&focus, cx);
-                }
->>>>>>> Current commit: Add cherry-pick branch A onto B as new branch C from the action bar
                 PopoverKind::RenameBranchPrompt { name, .. } => {
                     let theme = self.theme;
                     self.create_branch_input.update(cx, |input, cx| {

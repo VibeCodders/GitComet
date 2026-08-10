@@ -66,12 +66,14 @@ pub(super) fn cherry_pick_commit(
 pub(super) fn cherry_pick_range_onto_new_branch(
     repo_id: RepoId,
     base: String,
+    range: String,
     source: String,
     new_branch: String,
 ) -> Vec<Effect> {
     vec![Effect::CherryPickRangeOntoNewBranch {
         repo_id,
         base,
+        range,
         source,
         new_branch,
     }]

@@ -239,11 +239,14 @@ pub(in super::super) struct PopoverHost {
     create_branch_checkout_enabled: bool,
     create_branch_source_target: String,
     cherry_pick_source_search_input: Option<Entity<components::TextInput>>,
+    cherry_pick_range_search_input: Option<Entity<components::TextInput>>,
     cherry_pick_base_search_input: Option<Entity<components::TextInput>>,
     cherry_pick_name_input: Entity<components::TextInput>,
     _cherry_pick_source_search_subscription: Option<gpui::Subscription>,
+    _cherry_pick_range_search_subscription: Option<gpui::Subscription>,
     _cherry_pick_base_search_subscription: Option<gpui::Subscription>,
     cherry_pick_source_target: String,
+    cherry_pick_range_target: String,
     cherry_pick_base_target: String,
     worktree_ref_source_target: String,
     suppress_worktree_submit_after_ref_enter: bool,
@@ -1613,11 +1616,14 @@ impl PopoverHost {
             create_branch_checkout_enabled: true,
             create_branch_source_target: String::new(),
             cherry_pick_source_search_input: None,
+            cherry_pick_range_search_input: None,
             cherry_pick_base_search_input: None,
             cherry_pick_name_input,
             _cherry_pick_source_search_subscription: None,
+            _cherry_pick_range_search_subscription: None,
             _cherry_pick_base_search_subscription: None,
             cherry_pick_source_target: String::new(),
+            cherry_pick_range_target: String::new(),
             cherry_pick_base_target: String::new(),
             worktree_ref_source_target: String::new(),
             suppress_worktree_submit_after_ref_enter: false,
@@ -2479,6 +2485,34 @@ impl PopoverHost {
             });
         }
         self.branch_picker_selected_index = None;
+        // Move on to the range picker.
+        if let Some(range) = &self.cherry_pick_range_search_input {
+            let focus = range.read_with(cx, |input, _| input.focus_handle());
+            window.focus(&focus, cx);
+        }
+        cx.notify();
+    }
+
+    fn handle_cherry_pick_range_select(
+        &mut self,
+        name: String,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if !matches!(self.popover, Some(PopoverKind::CherryPickRangePrompt { .. })) {
+            return;
+        }
+        self.cherry_pick_range_target = name;
+        if let Some(input) = &self.cherry_pick_range_search_input {
+            let theme = self.theme;
+            input.update(cx, |input, cx| {
+                input.clear_transient_key_presses();
+                input.set_theme(theme, cx);
+                input.set_text(self.cherry_pick_range_target.clone(), cx);
+                cx.notify();
+            });
+        }
+        self.branch_picker_selected_index = None;
         // Move on to the base picker.
         if let Some(base) = &self.cherry_pick_base_search_input {
             let focus = base.read_with(cx, |input, _| input.focus_handle());
@@ -2520,8 +2554,9 @@ impl PopoverHost {
             return false;
         }
         let source = self.cherry_pick_source_target.trim();
+        let range = self.cherry_pick_range_target.trim();
         let base = self.cherry_pick_base_target.trim();
-        if source.is_empty() || base.is_empty() || source == base {
+        if source.is_empty() || range.is_empty() || base.is_empty() || source == range {
             return false;
         }
         self.cherry_pick_name_input
@@ -2536,6 +2571,7 @@ impl PopoverHost {
             return;
         }
         let base = self.cherry_pick_base_target.trim().to_string();
+        let range = self.cherry_pick_range_target.trim().to_string();
         let source = self.cherry_pick_source_target.trim().to_string();
         let new_branch = self
             .cherry_pick_name_input
@@ -2546,6 +2582,7 @@ impl PopoverHost {
         self.store.dispatch(Msg::CherryPickRangeOntoNewBranch {
             repo_id,
             base,
+            range,
             source,
             new_branch,
         });
@@ -3036,8 +3073,18 @@ impl PopoverHost {
                 }
                 PopoverKind::CherryPickRangePrompt { .. } => {
                     let theme = self.theme;
+                    // D defaults to the current branch: C usually starts from
+                    // where the user is standing.
+                    let current_branch = self
+                        .active_repo()
+                        .and_then(|repo| match &repo.head_branch {
+                            Loadable::Ready(head) => Some(head.to_string()),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
                     self.cherry_pick_source_target = String::new();
-                    self.cherry_pick_base_target = String::new();
+                    self.cherry_pick_range_target = String::new();
+                    self.cherry_pick_base_target = current_branch.clone();
                     let source_input =
                         Self::ensure_cherry_pick_search_input(
                             &mut self.cherry_pick_source_search_input,
@@ -3045,6 +3092,12 @@ impl PopoverHost {
                             window,
                             cx,
                         );
+                    let range_input = Self::ensure_cherry_pick_search_input(
+                        &mut self.cherry_pick_range_search_input,
+                        "branch",
+                        window,
+                        cx,
+                    );
                     let base_input = Self::ensure_cherry_pick_search_input(
                         &mut self.cherry_pick_base_search_input,
                         "branch",
@@ -3054,6 +3107,20 @@ impl PopoverHost {
                     if self._cherry_pick_source_search_subscription.is_none() {
                         let input = source_input.clone();
                         self._cherry_pick_source_search_subscription = Some(cx.observe(
+                            &input,
+                            |this, _input, cx| {
+                                if matches!(
+                                    this.popover,
+                                    Some(PopoverKind::CherryPickRangePrompt { .. })
+                                ) {
+                                    cx.notify();
+                                }
+                            },
+                        ));
+                    }
+                    if self._cherry_pick_range_search_subscription.is_none() {
+                        let input = range_input.clone();
+                        self._cherry_pick_range_search_subscription = Some(cx.observe(
                             &input,
                             |this, _input, cx| {
                                 if matches!(
@@ -3079,7 +3146,7 @@ impl PopoverHost {
                             },
                         ));
                     }
-                    for input in [&source_input, &base_input] {
+                    for input in [&source_input, &range_input] {
                         input.update(cx, |input, cx| {
                             input.clear_transient_key_presses();
                             input.set_theme(theme, cx);
@@ -3087,6 +3154,13 @@ impl PopoverHost {
                             cx.notify();
                         });
                     }
+                    // The base input keeps its prefill.
+                    base_input.update(cx, |input, cx| {
+                        input.clear_transient_key_presses();
+                        input.set_theme(theme, cx);
+                        input.set_text(current_branch, cx);
+                        cx.notify();
+                    });
                     self.cherry_pick_name_input.update(cx, |input, cx| {
                         input.clear_transient_key_presses();
                         input.set_theme(theme, cx);

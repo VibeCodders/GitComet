@@ -2059,6 +2059,7 @@ fn additional_routing_messages_emit_effects_and_update_counters() {
         Msg::CherryPickRangeOntoNewBranch {
             repo_id,
             base: "main".to_string(),
+            range: "main".to_string(),
             source: "feature".to_string(),
             new_branch: "feature-copy".to_string(),
         },
@@ -2068,9 +2069,10 @@ fn additional_routing_messages_emit_effects_and_update_counters() {
         [Effect::CherryPickRangeOntoNewBranch {
             repo_id: RepoId(1),
             base,
+            range,
             source,
             new_branch,
-        }] if base == "main" && source == "feature" && new_branch == "feature-copy"
+        }] if base == "main" && range == "main" && source == "feature" && new_branch == "feature-copy"
     ));
 
     let effects = reduce(

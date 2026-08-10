@@ -693,6 +693,7 @@ fn send_unavailable_git_effect_result(
         Effect::CherryPickRangeOntoNewBranch {
             repo_id,
             base,
+            range,
             source,
             new_branch,
         } => send(Msg::Internal(
@@ -700,6 +701,7 @@ fn send_unavailable_git_effect_result(
                 repo_id,
                 command: RepoCommandKind::CherryPickRangeOntoNewBranch {
                     base,
+                    range,
                     source,
                     new_branch,
                 },
@@ -2100,11 +2102,12 @@ pub(super) fn schedule_effect(
         Effect::CherryPickRangeOntoNewBranch {
             repo_id,
             base,
+            range,
             source,
             new_branch,
         } => {
             repo_commands::schedule_cherry_pick_range_onto_new_branch(
-                executor, repos, msg_tx, repo_id, base, source, new_branch,
+                executor, repos, msg_tx, repo_id, base, range, source, new_branch,
             );
         }
         Effect::RevertCommit { repo_id, commit_id } => {

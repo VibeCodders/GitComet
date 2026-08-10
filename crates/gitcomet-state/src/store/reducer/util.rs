@@ -1357,6 +1357,7 @@ fn summarize_command(
             source,
             base,
             new_branch,
+            ..
         } => {
             let state = if sequencer_paused(output) {
                 "Paused at a conflict"
@@ -2517,6 +2518,7 @@ mod tests {
         let (_, range_summary) = summarize_command(
             &RepoCommandKind::CherryPickRangeOntoNewBranch {
                 base: "main".into(),
+                range: "main".into(),
                 source: "feature".into(),
                 new_branch: "feature-copy".into(),
             },

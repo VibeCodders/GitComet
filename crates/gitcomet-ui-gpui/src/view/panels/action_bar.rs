@@ -723,7 +723,7 @@ impl Render for ActionBarView {
             })
             .gitcomet_tooltip(
                 theme,
-                "Cherry-pick branch A onto branch B as a new branch C".into(),
+                "Cherry-pick ref A onto a new branch C created from D (range B..A)".into(),
             );
 
         div()

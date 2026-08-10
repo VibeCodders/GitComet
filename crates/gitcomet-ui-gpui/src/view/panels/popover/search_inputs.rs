@@ -513,10 +513,76 @@ impl PopoverHost {
         self.reset_picker_search_input(&input, window, cx);
         input
     }
+
+    pub(super) fn ensure_reflog_search_input(
+        &mut self,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> Entity<components::TextInput> {
+        let input = Self::ensure_search_input_entity(
+            &mut self.reflog_search_input,
+            "Filter reflog entries",
+            window,
+            cx,
+        );
+        if self._reflog_search_input_subscription.is_none() {
+            self._reflog_search_input_subscription = Some(Self::picker_search_subscription(
+                &input,
+                window,
+                cx,
+                |this| matches!(this.popover, Some(PopoverKind::ReflogPrompt { .. })),
+                |this| &mut this.reflog_selected_index,
+                |this, query, _cx| {
+                    let Some(PopoverKind::ReflogPrompt { repo_id }) = &this.popover else {
+                        return None;
+                    };
+                    let repo = this.state.repos.iter().find(|r| r.id == *repo_id)?;
+                    let Loadable::Ready(entries) = &repo.reflog else {
+                        return None;
+                    };
+                    Some(filter_by_query(
+                        entries.iter().map(|e| (e.index, reflog_match_text(e))),
+                        query,
+                    ))
+                },
+                |this, cx| this.close_popover(cx),
+                Self::scroll_picker_prompt_to_item,
+                |this, payload, _query, _window, cx| {
+                    let Some(entry_index) = payload else {
+                        return;
+                    };
+                    let Some(PopoverKind::ReflogPrompt { repo_id }) = this.popover.clone() else {
+                        return;
+                    };
+                    let Some(entry) = this
+                        .state
+                        .repos
+                        .iter()
+                        .find(|r| r.id == repo_id)
+                        .and_then(|r| match &r.reflog {
+                            Loadable::Ready(entries) => {
+                                entries.iter().find(|e| e.index == entry_index).cloned()
+                            }
+                            _ => None,
+                        })
+                    else {
+                        return;
+                    };
+                    this.store.dispatch(Msg::SelectCommit {
+                        repo_id,
+                        commit_id: entry.new_id,
+                    });
+                    this.close_popover(cx);
+                },
+            ));
+        }
+        self.reset_picker_search_input(&input, window, cx);
+        input
+    }
 }
 
-/// True when the branch picker should offer refs beyond branches (HEAD, tags)
-/// and accept a free-form ref typed into the search box.
+    /// True when the branch picker should offer refs beyond branches (HEAD, tags)
+    /// and accept a free-form ref typed into the search box.
 fn branch_picker_offers_refs(this: &PopoverHost) -> bool {
     matches!(
         this.popover,
@@ -558,6 +624,12 @@ fn file_history_match_text(commit: &gitcomet_core::domain::Commit) -> String {
     let sha = commit.id.as_ref();
     let short = sha.get(0..8).unwrap_or(sha);
     format!("{}{}", short, commit.summary)
+}
+
+fn reflog_match_text(entry: &gitcomet_core::domain::ReflogEntry) -> String {
+    let sha = entry.new_id.as_ref();
+    let short = sha.get(0..8).unwrap_or(sha);
+    format!("{} {} {}", entry.selector, short, entry.message)
 }
 
 /// Case-insensitive substring filter over `(payload, match_text)` pairs,

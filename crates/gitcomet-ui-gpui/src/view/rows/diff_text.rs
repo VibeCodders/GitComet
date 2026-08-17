@@ -18,14 +18,25 @@ pub(in crate::view) use build::PreparedDocumentByteRangeHighlights;
 pub(super) use build::build_cached_diff_styled_text_with_palette;
 pub(in crate::view::rows) use build::hash_rgba_bits;
 pub(in crate::view) use build::syntax_highlights_for_line;
+pub(in crate::view::rows) use build::word_highlight_colors;
 pub(super) use build::{
     build_cached_diff_query_overlay_styled_text, build_cached_diff_styled_text,
     build_cached_diff_styled_text_from_relative_highlights,
     build_cached_diff_styled_text_with_source_identity, diff_line_colors,
     selectable_cached_diff_text,
 };
+/// Neither is the "are chunks still building?" query: only the resolved output
+/// ever polled it, and the live engine has no pending state to poll.
+#[cfg(any(test, feature = "benchmarks"))]
+pub(in crate::view) use prepared::has_pending_prepared_diff_syntax_chunk_builds_for_document;
 #[cfg(any(test, feature = "benchmarks"))]
 pub(in crate::view) use prepared::prepare_diff_syntax_document_in_background_text;
+/// Line-range highlights are no longer a render path — the resolved output is
+/// the only view that ever asked for them, and it now goes through the live
+/// engine. Kept for the diff-scroll bench warmup and its own unit tests; the
+/// production request API is the byte-range one above.
+#[cfg(any(test, feature = "benchmarks"))]
+pub(in crate::view) use prepared::request_syntax_highlights_for_prepared_document_line_range;
 pub(super) use prepared::{
     PreparedDocumentLineStyledText,
     build_cached_diff_styled_text_for_prepared_document_line_nonblocking,
@@ -46,14 +57,11 @@ pub(in crate::view) use prepared::{
     build_cached_diff_styled_text_for_inline_syntax_only_rows_nonblocking,
     drain_completed_prepared_diff_syntax_chunk_builds,
     drain_completed_prepared_diff_syntax_chunk_builds_for_document,
-    has_pending_prepared_diff_syntax_chunk_builds,
-    has_pending_prepared_diff_syntax_chunk_builds_for_document,
-    inject_background_prepared_diff_syntax_document,
+    has_pending_prepared_diff_syntax_chunk_builds, inject_background_prepared_diff_syntax_document,
     prepare_diff_syntax_document_in_background_text_with_reuse,
     prepare_diff_syntax_document_with_budget_reuse_text,
     prepared_diff_syntax_line_for_inline_diff_row, prepared_diff_syntax_line_for_one_based_line,
     prepared_diff_syntax_reparse_seed, request_syntax_highlights_for_prepared_document_byte_range,
-    request_syntax_highlights_for_prepared_document_line_range,
 };
 #[cfg(test)]
 pub(in crate::view) use prepared::{
@@ -61,10 +69,11 @@ pub(in crate::view) use prepared::{
     syntax_highlights_for_prepared_document_byte_range,
 };
 pub(in crate::view) use syntax::{
-    DiffSyntaxBudget, DiffSyntaxEdit, DiffSyntaxLanguage, DiffSyntaxMode,
-    PREPARED_DIFF_SYNTAX_DOCUMENT_MAX_TEXT_BYTES, diff_syntax_language_for_code_fence_info,
-    diff_syntax_language_for_path,
+    DiffSyntaxBudget, DiffSyntaxEdit, DiffSyntaxLanguage, DiffSyntaxMode, LiveSyntaxDocument,
+    LiveSyntaxSnapshot, LiveSyntaxSyncOutcome, PREPARED_DIFF_SYNTAX_DOCUMENT_MAX_TEXT_BYTES,
+    diff_syntax_language_for_code_fence_info, diff_syntax_language_for_path,
 };
+pub(in crate::view) use syntax::{live_syntax_document_supported, live_syntax_reparse};
 
 pub(super) fn syntax_highlights_for_streamed_line_slice_heuristic(
     theme: AppTheme,
@@ -465,7 +474,7 @@ fn hash_visible_highlights(highlights: &[(Range<usize>, gpui::HighlightStyle)]) 
     let mut hasher = FxHasher::default();
     for (range, style) in highlights {
         range.hash(&mut hasher);
-        style.hash(&mut hasher);
+        crate::text_runs::hash_highlight_style(style, &mut hasher);
     }
     hasher.finish()
 }
@@ -875,7 +884,7 @@ pub(super) struct DiffTextBuildRequest<'a> {
     pub(super) word_ranges: &'a [Range<usize>],
     pub(super) query: &'a str,
     pub(super) syntax: DiffSyntaxConfig,
-    pub(super) word_color: Option<gpui::Rgba>,
+    pub(super) word_kind: Option<crate::theme::DiffColorKind>,
 }
 
 #[derive(Clone, Copy)]
@@ -910,6 +919,7 @@ pub(in crate::view) struct PreparedDiffSyntaxLine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use palette::IntoColor;
 
     fn query_overlay_for_test(
         theme: AppTheme,
@@ -1236,11 +1246,84 @@ mod tests {
             in_query: false,
             syntax: SyntaxTokenKind::None,
         }];
-        let (text, highlights) =
-            styled_text_for_diff_segments(theme, &segments, Some(theme.colors.diff_remove_text));
+        let (text, highlights) = styled_text_for_diff_segments(
+            theme,
+            &segments,
+            Some(crate::theme::DiffColorKind::Removed),
+        );
         assert_eq!(text.as_ref(), "x");
         assert_eq!(highlights.len(), 1);
         assert!(highlights[0].1.background_color.is_some());
+    }
+
+    #[test]
+    fn light_word_and_search_highlights_use_paired_foregrounds() {
+        let theme = AppTheme::gitcomet_light();
+        let segments = vec![CachedDiffTextSegment {
+            text: "removed".into(),
+            in_word: true,
+            in_query: false,
+            syntax: SyntaxTokenKind::None,
+        }];
+        let (_text, highlights) = styled_text_for_diff_segments(
+            theme,
+            &segments,
+            Some(crate::theme::DiffColorKind::Removed),
+        );
+        assert_eq!(
+            highlights[0].1.background_color,
+            Some(theme.colors.diff.removed.word_background.into_color())
+        );
+        assert_eq!(
+            highlights[0].1.color,
+            Some(theme.colors.diff.removed.foreground.into_color())
+        );
+
+        let query_segments = vec![CachedDiffTextSegment {
+            text: "match".into(),
+            in_word: false,
+            in_query: true,
+            syntax: SyntaxTokenKind::String,
+        }];
+        let (_text, query_highlights) = styled_text_for_diff_segments(theme, &query_segments, None);
+        assert_eq!(
+            query_highlights[0].1.background_color,
+            Some(theme.colors.editor.search_match_background.into_color())
+        );
+        assert_eq!(
+            query_highlights[0].1.color,
+            Some(theme.colors.editor.search_match_foreground.into_color())
+        );
+    }
+
+    /// The word wash is the theme's own token in both appearances, and it is
+    /// resolved from the diff kind the caller already knows rather than by
+    /// recognising a colour it was handed. Deriving it per renderer gave a line
+    /// past `STREAMED_DIFF_TEXT_MIN_BYTES` a different colour from its
+    /// neighbours; recognising it by colour paints removed words with the added
+    /// wash in any theme that reuses one hue for two kinds.
+    #[test]
+    fn word_highlights_come_from_the_diff_palettes_own_token() {
+        use crate::theme::DiffColorKind;
+
+        for theme in [AppTheme::gitcomet_dark(), AppTheme::gitcomet_light()] {
+            for (kind, set) in [
+                (DiffColorKind::Added, theme.colors.diff.added),
+                (DiffColorKind::Removed, theme.colors.diff.removed),
+                (DiffColorKind::Modified, theme.colors.diff.modified),
+            ] {
+                let (background, foreground) = word_highlight_colors(theme, kind);
+                assert_eq!(background, set.word_background, "{kind:?}");
+                // Dark carries the token as an alpha over the row and leaves the
+                // syntax colour alone; light carries it opaque, which would
+                // drown syntax colours, so the diff foreground is pinned.
+                assert_eq!(
+                    foreground,
+                    (!theme.is_dark).then_some(set.foreground),
+                    "{kind:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1256,7 +1339,10 @@ mod tests {
         let (_text, highlights) = styled_text_for_diff_segments(theme, &segments, None);
         assert_eq!(highlights.len(), 1);
         assert_eq!(highlights[0].0, 0..2);
-        assert_ne!(highlights[0].1.color, Some(theme.colors.accent.into()));
+        assert_ne!(
+            highlights[0].1.color,
+            Some(theme.colors.accent.foreground.into_color())
+        );
     }
 
     #[test]
@@ -1498,68 +1584,33 @@ mod tests {
 
     #[test]
     fn syntax_highlight_style_uses_theme_syntax_overrides() {
-        let theme = AppTheme::from_json_str(
+        let theme = AppTheme::from_json_str(&crate::theme::test_theme_json_with_syntax(
+            "gitcomet_dark",
             r##"{
-                "name": "Fixture",
-                "themes": [
-                    {
-                        "key": "fixture",
-                        "name": "Fixture",
-                        "appearance": "dark",
-                        "colors": {
-                            "window_bg": "#0d1016ff",
-                            "surface_bg": "#1f2127ff",
-                            "surface_bg_elevated": "#1f2127ff",
-                            "active_section": "#2d2f34ff",
-                            "border": "#2d2f34ff",
-                            "text": "#bfbdb6ff",
-                            "text_muted": "#8a8986ff",
-                            "accent": "#5ac1feff",
-                            "hover": "#2d2f34ff",
-                            "active": { "hex": "#2d2f34ff", "alpha": 0.78 },
-                            "focus_ring": { "hex": "#5ac1feff", "alpha": 0.60 },
-                            "focus_ring_bg": { "hex": "#5ac1feff", "alpha": 0.16 },
-                            "scrollbar_thumb": { "hex": "#8a8986ff", "alpha": 0.30 },
-                            "scrollbar_thumb_hover": { "hex": "#8a8986ff", "alpha": 0.42 },
-                            "scrollbar_thumb_active": { "hex": "#8a8986ff", "alpha": 0.52 },
-                            "danger": "#ef7177ff",
-                            "warning": "#feb454ff",
-                            "success": "#aad84cff"
-                        },
-                        "syntax": {
-                            "keyword": "#112233ff",
-                            "variable": "#445566ff",
-                            "diff_plus": "#abcdefff",
-                            "label": "#fedcbaff"
-                        },
-                        "radii": {
-                            "panel": 2.0,
-                            "pill": 2.0,
-                            "row": 2.0
-                        }
-                    }
-                ]
+                "keyword": "#112233ff",
+                "variable": "#445566ff",
+                "diff_plus": "#abcdefff",
+                "label": "#fedcbaff"
             }"##,
-        )
+        ))
         .expect("theme JSON should parse");
 
         let keyword = syntax_highlight_style(theme, SyntaxTokenKind::Keyword)
             .expect("keyword style should be present");
-        assert_eq!(keyword.color, Some(gpui::rgba(0x112233ff).into()));
+        assert_eq!(keyword.color, Some(gpui::rgba(0x112233ff).into_color()));
 
         let variable = syntax_highlight_style(theme, SyntaxTokenKind::Variable)
             .expect("variable style should be present when overridden");
-        assert_eq!(variable.color, Some(gpui::rgba(0x445566ff).into()));
+        assert_eq!(variable.color, Some(gpui::rgba(0x445566ff).into_color()));
 
         let diff_plus = syntax_highlight_style(theme, SyntaxTokenKind::DiffPlus)
             .expect("diff_plus style should be present");
-        assert_eq!(diff_plus.color, Some(gpui::rgba(0xabcdefff).into()));
+        assert_eq!(diff_plus.color, Some(gpui::rgba(0xabcdefff).into_color()));
 
         let label = syntax_highlight_style(theme, SyntaxTokenKind::Label)
             .expect("label style should be present when overridden");
-        assert_eq!(label.color, Some(gpui::rgba(0xfedcbaff).into()));
+        assert_eq!(label.color, Some(gpui::rgba(0xfedcbaff).into_color()));
     }
-
     #[test]
     fn syntax_highlight_style_kind_table_covers_new_token_kinds() {
         for kind in [
@@ -1589,61 +1640,27 @@ mod tests {
 
     #[test]
     fn syntax_highlight_style_uses_all_new_theme_syntax_overrides() {
-        let theme = AppTheme::from_json_str(
+        let theme = AppTheme::from_json_str(&crate::theme::test_theme_json_with_syntax(
+            "gitcomet_dark",
             r##"{
-                "name": "Fixture",
-                "themes": [
-                    {
-                        "key": "fixture",
-                        "name": "Fixture",
-                        "appearance": "dark",
-                        "colors": {
-                            "window_bg": "#0d1016ff",
-                            "surface_bg": "#1f2127ff",
-                            "surface_bg_elevated": "#1f2127ff",
-                            "active_section": "#2d2f34ff",
-                            "border": "#2d2f34ff",
-                            "text": "#bfbdb6ff",
-                            "text_muted": "#8a8986ff",
-                            "accent": "#5ac1feff",
-                            "hover": "#2d2f34ff",
-                            "active": { "hex": "#2d2f34ff", "alpha": 0.78 },
-                            "focus_ring": { "hex": "#5ac1feff", "alpha": 0.60 },
-                            "focus_ring_bg": { "hex": "#5ac1feff", "alpha": 0.16 },
-                            "scrollbar_thumb": { "hex": "#8a8986ff", "alpha": 0.30 },
-                            "scrollbar_thumb_hover": { "hex": "#8a8986ff", "alpha": 0.42 },
-                            "scrollbar_thumb_active": { "hex": "#8a8986ff", "alpha": 0.52 },
-                            "danger": "#ef7177ff",
-                            "warning": "#feb454ff",
-                            "success": "#aad84cff"
-                        },
-                        "syntax": {
-                            "string_regex": "#010101ff",
-                            "string_special": "#020202ff",
-                            "preproc": "#030303ff",
-                            "constructor": "#040404ff",
-                            "namespace": "#050505ff",
-                            "variable_builtin": "#060606ff",
-                            "label": "#070707ff",
-                            "constant_builtin": "#080808ff",
-                            "punctuation_special": "#090909ff",
-                            "punctuation_list_marker": "#0a0a0aff",
-                            "markup_heading": "#0b0b0bff",
-                            "markup_link": "#0c0c0cff",
-                            "text_literal": "#0d0d0dff",
-                            "diff_plus": "#0e0e0eff",
-                            "diff_minus": "#0f0f0fff",
-                            "diff_delta": "#101010ff"
-                        },
-                        "radii": {
-                            "panel": 2.0,
-                            "pill": 2.0,
-                            "row": 2.0
-                        }
-                    }
-                ]
+                "string_regex": "#010101ff",
+                "string_special": "#020202ff",
+                "preproc": "#030303ff",
+                "constructor": "#040404ff",
+                "namespace": "#050505ff",
+                "variable_builtin": "#060606ff",
+                "label": "#070707ff",
+                "constant_builtin": "#080808ff",
+                "punctuation_special": "#090909ff",
+                "punctuation_list_marker": "#0a0a0aff",
+                "markup_heading": "#0b0b0bff",
+                "markup_link": "#0c0c0cff",
+                "text_literal": "#0d0d0dff",
+                "diff_plus": "#0e0e0eff",
+                "diff_minus": "#0f0f0fff",
+                "diff_delta": "#101010ff"
             }"##,
-        )
+        ))
         .expect("theme JSON should parse");
 
         for (kind, color) in [
@@ -1668,12 +1685,11 @@ mod tests {
                 .unwrap_or_else(|| panic!("{kind:?} style should be present"));
             assert_eq!(
                 style.color,
-                Some(gpui::rgba(color).into()),
+                Some(gpui::rgba(color).into_color()),
                 "{kind:?} should use its explicit syntax override"
             );
         }
     }
-
     #[test]
     fn cached_styled_text_from_relative_highlights_expands_tabs_and_remaps_ranges() {
         let style = gpui::HighlightStyle {
@@ -1844,7 +1860,7 @@ mod tests {
                     language: Some(DiffSyntaxLanguage::Rust),
                     mode: DiffSyntaxMode::Auto,
                 },
-                word_color: None,
+                word_kind: None,
             },
             prepared_line: PreparedDiffSyntaxLine {
                 document: Some(document),
@@ -1933,7 +1949,7 @@ mod tests {
                             language: Some(DiffSyntaxLanguage::Rust),
                             mode: DiffSyntaxMode::Auto,
                         },
-                        word_color: None,
+                        word_kind: None,
                     },
                     prepared_line: PreparedDiffSyntaxLine {
                         document: Some(document),
@@ -1960,12 +1976,12 @@ mod tests {
 
         assert_eq!(
             start_style(&multiline),
-            Some(theme.syntax.comment.into()),
+            Some(theme.syntax.comment.into_color()),
             "multiline continuation should keep comment highlighting from document context"
         );
         assert_ne!(
             start_style(&standalone),
-            Some(theme.syntax.comment.into()),
+            Some(theme.syntax.comment.into_color()),
             "standalone line should not reuse cached comment styling from another prepared document"
         );
     }
@@ -2006,8 +2022,8 @@ mod tests {
             .find(|(range, _)| *range == (0..3))
             .and_then(|(_, style)| style.color);
 
-        assert_eq!(dark_keyword, Some(dark_theme.syntax.keyword.into()));
-        assert_eq!(light_keyword, Some(light_theme.syntax.keyword.into()));
+        assert_eq!(dark_keyword, Some(dark_theme.syntax.keyword.into_color()));
+        assert_eq!(light_keyword, Some(light_theme.syntax.keyword.into_color()));
         assert_ne!(
             dark_keyword, light_keyword,
             "theme-specific syntax colors should not bleed across cached entries"
@@ -2041,7 +2057,7 @@ mod tests {
             highlights.iter().any(|(range, style)| {
                 range.start <= second_line_start
                     && range.end > second_line_start
-                    && style.color == Some(theme.syntax.comment.into())
+                    && style.color == Some(theme.syntax.comment.into_color())
             }),
             "second line should retain comment highlighting from multiline document context"
         );
@@ -2072,7 +2088,7 @@ mod tests {
             !first.highlights.iter().any(|(range, style)| {
                 range.start <= second_line_start
                     && range.end > second_line_start
-                    && style.color == Some(theme.syntax.comment.into())
+                    && style.color == Some(theme.syntax.comment.into_color())
             }),
             "heuristic fallback should not invent multiline comment state before the chunk is ready"
         );
@@ -2098,7 +2114,7 @@ mod tests {
             second.highlights.iter().any(|(range, style)| {
                 range.start <= second_line_start
                     && range.end > second_line_start
-                    && style.color == Some(theme.syntax.comment.into())
+                    && style.color == Some(theme.syntax.comment.into_color())
             }),
             "resolved output should upgrade to full document-aware comment highlighting"
         );
@@ -2547,7 +2563,7 @@ mod tests {
         text.as_ref().hash(&mut text_hasher);
         let text_hash = text_hasher.finish();
         let style = gpui::HighlightStyle {
-            color: Some(theme.colors.text.into()),
+            color: Some(theme.colors.foreground.primary.into_color()),
             ..Default::default()
         };
         let base = CachedDiffStyledText {
@@ -2574,7 +2590,7 @@ mod tests {
         text.as_ref().hash(&mut text_hasher);
         let text_hash = text_hasher.finish();
         let style = gpui::HighlightStyle {
-            color: Some(theme.colors.warning.into()),
+            color: Some(theme.colors.status.warning.foreground.into_color()),
             ..Default::default()
         };
         let base = CachedDiffStyledText {
@@ -2589,7 +2605,7 @@ mod tests {
         assert_eq!(overlaid.highlights[1].0, 2..4);
         assert_eq!(
             overlaid.highlights[1].1.color,
-            Some(theme.colors.warning.into())
+            Some(theme.colors.status.warning.foreground.into_color())
         );
         assert!(overlaid.highlights[1].1.background_color.is_some());
         assert_ne!(overlaid.highlights_hash, base.highlights_hash);
@@ -2682,11 +2698,11 @@ mod tests {
         text.as_ref().hash(&mut text_hasher);
         let text_hash = text_hasher.finish();
         let left = gpui::HighlightStyle {
-            color: Some(theme.colors.warning.into()),
+            color: Some(theme.colors.status.warning.foreground.into_color()),
             ..Default::default()
         };
         let right = gpui::HighlightStyle {
-            color: Some(theme.colors.success.into()),
+            color: Some(theme.colors.status.success.foreground.into_color()),
             ..Default::default()
         };
         let base = CachedDiffStyledText {
@@ -2703,7 +2719,7 @@ mod tests {
         assert_eq!(overlaid.highlights[1].0, 2..3);
         assert_eq!(
             overlaid.highlights[1].1.color,
-            Some(theme.colors.warning.into())
+            Some(theme.colors.status.warning.foreground.into_color())
         );
         assert!(overlaid.highlights[1].1.background_color.is_some());
         assert_eq!(
@@ -2711,9 +2727,12 @@ mod tests {
             (
                 3..5,
                 gpui::HighlightStyle {
+                    // The theme's own search-match token, the same one the
+                    // non-overlay builder uses. It used to be mixed from the
+                    // accent here, which left `editor.search_match_background`
+                    // unread on dark themes and painted the two paths differently.
                     background_color: Some(
-                        with_alpha(theme.colors.accent, if theme.is_dark { 0.22 } else { 0.16 })
-                            .into()
+                        theme.colors.editor.search_match_background.into_color()
                     ),
                     ..Default::default()
                 }
@@ -2722,7 +2741,7 @@ mod tests {
         assert_eq!(overlaid.highlights[3].0, 5..7);
         assert_eq!(
             overlaid.highlights[3].1.color,
-            Some(theme.colors.success.into())
+            Some(theme.colors.status.success.foreground.into_color())
         );
         assert!(overlaid.highlights[3].1.background_color.is_some());
         assert_eq!(overlaid.highlights[4], (7..8, right));

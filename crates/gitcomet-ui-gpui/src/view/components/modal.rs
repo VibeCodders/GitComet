@@ -25,10 +25,27 @@ pub fn modal_scrim(theme: AppTheme) -> Stateful<Div> {
 /// Shared visual shell for scrim-backed modal content.
 pub fn modal_surface(theme: AppTheme) -> Div {
     div()
-        .bg(theme.colors.surface_bg_elevated)
+        .bg(theme.colors.surface.raised)
         .border_1()
-        .border_color(theme.colors.border)
+        .border_color(theme.colors.stroke.default)
         .rounded(px(theme.radii.popover))
         .shadow(crate::theme::shadow_modal(theme))
+        .overflow_hidden()
+}
+
+/// Shared visual shell for anchored surfaces — popovers and the menus that
+/// float over them. The lighter lift of the two: it hovers just above the
+/// content rather than sitting on a scrim like [`modal_surface`].
+///
+/// A floating menu that skips this is invisible in the worst way — it still
+/// lays out and still takes clicks, but paints straight onto whatever is
+/// underneath.
+pub fn popover_surface(theme: AppTheme) -> Div {
+    div()
+        .bg(theme.colors.surface.raised)
+        .border_1()
+        .border_color(theme.colors.stroke.default)
+        .rounded(px(theme.radii.popover))
+        .shadow(crate::theme::shadow_popover(theme))
         .overflow_hidden()
 }

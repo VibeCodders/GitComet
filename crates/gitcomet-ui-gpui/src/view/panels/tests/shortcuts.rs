@@ -468,6 +468,7 @@ fn conflict_navigation_anchor(
             .read(app)
             .conflict_resolver
             .nav_anchor
+            .map(|anchor| anchor.order_hint)
     })
 }
 
@@ -481,6 +482,7 @@ fn active_conflict_ix(
             .read(app)
             .conflict_resolver
             .active_conflict
+            .expect("test resolver should have an actionable displayed conflict")
     })
 }
 
@@ -928,87 +930,376 @@ fn history_context_menu_shortcuts_match_expected_actions(cx: &mut gpui::TestAppC
     );
 }
 
-#[gpui::test]
-fn history_author_filter_menu_suggests_authors_from_loaded_log(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
-    let (view, cx) = cx.add_window_view(|window, cx| {
-        super::super::GitCometView::new(store, events, None, window, cx)
-    });
+fn author_filter_fixture_repo(repo_id: RepoId) -> RepoState {
+    author_filter_repo_with_authors(repo_id, &["Alice", "Bob"])
+}
 
-    let repo_id = RepoId(712);
+fn author_filter_repo_with_authors(repo_id: RepoId, authors: &[&str]) -> RepoState {
     let workdir = std::env::temp_dir().join(format!(
         "gitcomet_ui_test_{}_author_filter",
         std::process::id()
     ));
-    let mut repo = shortcut_fixture_repo(
-        repo_id,
-        &workdir,
-        &CommitId("deadbeefdeadbeef".into()),
-    );
+    let mut repo = shortcut_fixture_repo(repo_id, &workdir, &CommitId("deadbeefdeadbeef".into()));
+    let commits = authors
+        .iter()
+        .enumerate()
+        .map(|(index, author)| gitcomet_core::domain::Commit {
+            id: CommitId(format!("deadbeefdeadbee{index}").into()),
+            parent_ids: gitcomet_core::domain::CommitParentIds::new(),
+            summary: format!("commit {index}").into(),
+            author: (*author).into(),
+            time: std::time::SystemTime::UNIX_EPOCH,
+        })
+        .collect();
     let log_page: Loadable<std::sync::Arc<gitcomet_core::domain::LogPage>> = Loadable::Ready(
         gitcomet_core::domain::LogPage {
-            commits: vec![
-                gitcomet_core::domain::Commit {
-                    id: CommitId("deadbeefdeadbeef".into()),
-                    parent_ids: gitcomet_core::domain::CommitParentIds::new(),
-                    summary: "Second commit".into(),
-                    author: "Alice".into(),
-                    time: std::time::SystemTime::UNIX_EPOCH,
-                },
-                gitcomet_core::domain::Commit {
-                    id: CommitId("cafebabecafebabe".into()),
-                    parent_ids: gitcomet_core::domain::CommitParentIds::new(),
-                    summary: "Initial commit".into(),
-                    author: "Bob".into(),
-                    time: std::time::SystemTime::UNIX_EPOCH,
-                },
-            ],
+            commits,
             next_cursor: None,
         }
         .into(),
     );
     repo.log = log_page.clone();
     repo.history_state.log = log_page;
-    repo.history_state.history_author_filter = Some("Alice".into());
-    apply_state(cx, &view, app_state_with_active_repo(repo));
+    repo
+}
 
-    let author_model = cx.update(|_window, app| {
-        context_menu_model_for(&view, app, PopoverKind::HistoryAuthorFilter { repo_id })
+fn author_filter_repo_with_many_authors(repo_id: RepoId, count: usize) -> RepoState {
+    let workdir = std::env::temp_dir().join(format!(
+        "gitcomet_ui_test_{}_author_filter_many",
+        std::process::id()
+    ));
+    let mut repo = shortcut_fixture_repo(repo_id, &workdir, &CommitId("deadbeefdeadbeef".into()));
+    let log_page: Loadable<std::sync::Arc<gitcomet_core::domain::LogPage>> = Loadable::Ready(
+        gitcomet_core::domain::LogPage {
+            commits: (0..count)
+                .map(|ix| gitcomet_core::domain::Commit {
+                    id: CommitId(format!("{ix:016x}").into()),
+                    parent_ids: gitcomet_core::domain::CommitParentIds::new(),
+                    summary: "msg".into(),
+                    author: format!("author {ix:04}").into(),
+                    time: std::time::SystemTime::UNIX_EPOCH,
+                })
+                .collect(),
+            next_cursor: None,
+        }
+        .into(),
+    );
+    repo.log = log_page.clone();
+    repo.history_state.log = log_page;
+    repo
+}
+
+/// Every author must be reachable by scrolling, however many there are. The
+/// list is virtualized, so far-down rows are not built until they are scrolled
+/// to — but they do exist, rather than being cut off the end of the list.
+#[gpui::test]
+fn history_author_filter_scrolls_to_every_author(cx: &mut gpui::TestAppContext) {
+    let _visual_guard = crate::test_support::lock_visual_test();
+    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::GitCometView::new(store, events, None, window, cx)
     });
-    let entries: Vec<(String, Option<String>, Box<ContextMenuAction>)> = author_model
-        .items
-        .iter()
-        .filter_map(|item| match item {
-            ContextMenuItem::Entry {
-                label,
-                icon,
-                action,
-                ..
-            } => Some((label.to_string(), icon.as_ref().map(|i| i.to_string()), action.clone())),
-            _ => None,
-        })
-        .collect();
 
-    // All authors is present and unchecked while a filter is active.
-    assert_eq!(entries[0].0, "All authors");
-    assert_eq!(entries[0].1, None);
-    assert!(matches!(
-        entries[0].2.as_ref(),
-        ContextMenuAction::SetHistoryAuthorFilter { author: None, .. }
-    ));
-    // Suggestions come from the loaded log, deduplicated and sorted; the
-    // active filter is marked with a check.
-    assert_eq!(entries[1].0, "Alice");
-    assert_eq!(entries[1].1, Some("icons/check.svg".into()));
-    assert!(matches!(
-        entries[1].2.as_ref(),
-        ContextMenuAction::SetHistoryAuthorFilter {
-            author: Some(name),
-            ..
-        } if name == "Alice"
-    ));
-    assert_eq!(entries[2].0, "Bob");
-    assert_eq!(entries[2].1, None);
+    const AUTHORS: usize = 500;
+    // Row 0 is "All authors", so the last author sits at row `AUTHORS`.
+    const LAST_ROW: &str = "picker_prompt_item_500";
+
+    let repo_id = RepoId(716);
+    apply_state(
+        cx,
+        &view,
+        app_state_with_active_repo(author_filter_repo_with_many_authors(repo_id, AUTHORS)),
+    );
+    open_popover_for_test(cx, &view, PopoverKind::HistoryAuthorFilter { repo_id });
+    draw_and_drain_test_window(cx);
+
+    assert!(
+        cx.debug_bounds("picker_prompt_item_1").is_some(),
+        "the first author must render"
+    );
+    assert!(
+        cx.debug_bounds(LAST_ROW).is_none(),
+        "a row far below the viewport must not be built until it is scrolled to"
+    );
+
+    cx.update(|_window, app| {
+        let popover_host = view.read(app).popover_host.clone();
+        popover_host.update(app, |host, cx| {
+            host.scroll_history_author_filter_to_item_for_test(AUTHORS, cx);
+        });
+    });
+    draw_and_drain_test_window(cx);
+
+    assert!(
+        cx.debug_bounds(LAST_ROW).is_some(),
+        "scrolling to the end of the list must render the last author"
+    );
+}
+
+/// The author dropdown is a picker: its search box takes focus as the popover
+/// opens, so the user can start typing without clicking into it first.
+#[gpui::test]
+fn history_author_filter_focuses_its_search_box_and_narrows_the_list(
+    cx: &mut gpui::TestAppContext,
+) {
+    let _visual_guard = crate::test_support::lock_visual_test();
+    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::GitCometView::new(store, events, None, window, cx)
+    });
+
+    let repo_id = RepoId(712);
+    apply_state(
+        cx,
+        &view,
+        app_state_with_active_repo(author_filter_fixture_repo(repo_id)),
+    );
+    open_popover_for_test(cx, &view, PopoverKind::HistoryAuthorFilter { repo_id });
+    draw_and_drain_test_window(cx);
+
+    let search_is_focused = cx.update(|window, app| {
+        view.read(app)
+            .popover_host
+            .read(app)
+            .history_author_filter_search_input_for_test()
+            .is_some_and(|input| input.read(app).focus_handle().is_focused(window))
+    });
+    assert!(
+        search_is_focused,
+        "opening the author filter must focus its search box"
+    );
+
+    // Rows: "All authors" (index 0) then the loaded authors, alphabetically.
+    assert!(cx.debug_bounds("picker_prompt_item_0").is_some());
+    assert!(cx.debug_bounds("picker_prompt_item_1").is_some());
+    assert!(cx.debug_bounds("picker_prompt_item_2").is_some());
+
+    cx.simulate_keystrokes("b o");
+    draw_and_drain_test_window(cx);
+
+    let query = cx.update(|_window, app| {
+        view.read(app)
+            .popover_host
+            .read(app)
+            .history_author_filter_search_input_for_test()
+            .map(|input| input.read(app).text().to_string())
+            .unwrap_or_default()
+    });
+    assert_eq!(query, "bo", "keystrokes must reach the search box");
+    // Every author is handed to the picker, which does the narrowing; the
+    // selectors carry each row's original index — "All authors" 0, `Alice` 1,
+    // `Bob` 2 — so only `Bob`'s survives.
+    assert!(
+        cx.debug_bounds("picker_prompt_item_2").is_some(),
+        "`Bob` must survive the query"
+    );
+    assert!(
+        cx.debug_bounds("picker_prompt_item_1").is_none(),
+        "`Alice` must be filtered out"
+    );
+    assert!(
+        cx.debug_bounds("picker_prompt_item_0").is_none(),
+        "`All authors` does not match the query either"
+    );
+}
+
+/// The AUTHOR column header stays highlighted while its dropdown is up. The
+/// dropdown is a picker rather than a context menu, so it has to opt into
+/// keeping the invoker active explicitly.
+#[gpui::test]
+fn history_author_filter_keeps_its_header_highlighted(cx: &mut gpui::TestAppContext) {
+    let _visual_guard = crate::test_support::lock_visual_test();
+    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::GitCometView::new(store, events, None, window, cx)
+    });
+
+    let repo_id = RepoId(714);
+    apply_state(
+        cx,
+        &view,
+        app_state_with_active_repo(author_filter_fixture_repo(repo_id)),
+    );
+
+    let invoker: SharedString = "history_author_filter_header".into();
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            this.set_active_context_menu_invoker(Some(invoker.clone()), cx);
+        });
+    });
+    open_popover_for_test(cx, &view, PopoverKind::HistoryAuthorFilter { repo_id });
+    draw_and_drain_test_window(cx);
+
+    let active = cx.update(|_window, app| view.read(app).active_context_menu_invoker.clone());
+    assert_eq!(
+        active.as_deref(),
+        Some("history_author_filter_header"),
+        "the AUTHOR header must stay highlighted while its dropdown is open"
+    );
+}
+
+/// The dropdown carries a search box and full author names, so it is wider than
+/// the sibling column menus (which sit at 220 design px).
+#[gpui::test]
+fn history_author_filter_is_wide_enough_for_full_names(cx: &mut gpui::TestAppContext) {
+    let _visual_guard = crate::test_support::lock_visual_test();
+    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::GitCometView::new(store, events, None, window, cx)
+    });
+
+    let repo_id = RepoId(717);
+    apply_state(
+        cx,
+        &view,
+        app_state_with_active_repo(author_filter_fixture_repo(repo_id)),
+    );
+    open_popover_for_test(cx, &view, PopoverKind::HistoryAuthorFilter { repo_id });
+    draw_and_drain_test_window(cx);
+
+    let width = debug_width(cx, "app_popover");
+    assert!(
+        width >= 300.0,
+        "the author dropdown must stay wide enough for full author names, got {width}"
+    );
+}
+
+/// Enter applies the highlighted suggestion, and closes the popover.
+#[gpui::test]
+fn history_author_filter_applies_the_selected_author(cx: &mut gpui::TestAppContext) {
+    let _visual_guard = crate::test_support::lock_visual_test();
+    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let store_for_assert = store.clone();
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::GitCometView::new(store, events, None, window, cx)
+    });
+
+    let repo_id = RepoId(713);
+    apply_state(
+        cx,
+        &view,
+        app_state_with_active_repo(author_filter_fixture_repo(repo_id)),
+    );
+    // Arrow keys and Enter reach the search box through actions, which need the
+    // text-input keymap installed.
+    cx.update(|_window, app| crate::app::bind_text_input_keys_for_test(app));
+    open_popover_for_test(cx, &view, PopoverKind::HistoryAuthorFilter { repo_id });
+    draw_and_drain_test_window(cx);
+
+    cx.simulate_keystrokes("b o");
+    draw_and_drain_test_window(cx);
+    cx.simulate_keystrokes("down");
+    draw_and_drain_test_window(cx);
+    cx.simulate_keystrokes("enter");
+    wait_until(cx, "the author filter to be applied", |cx| {
+        cx.update(|_window, _app| {
+            store_for_assert
+                .snapshot()
+                .repos
+                .iter()
+                .find(|repo| repo.id == repo_id)
+                .and_then(|repo| repo.history_state.history_author_filter.clone())
+                == Some("Bob".to_string())
+        })
+    });
+
+    let popover_open = cx.update(|_window, app| {
+        view.read(app)
+            .popover_host
+            .read(app)
+            .is_kind_open(&PopoverKind::HistoryAuthorFilter { repo_id })
+    });
+    assert!(!popover_open, "applying a filter must close the dropdown");
+}
+
+/// Suggestions only cover the commits loaded so far, and the backend filter is
+/// a substring match, so a name that is not in the list is still applied as
+/// typed rather than being a dead end.
+#[gpui::test]
+fn history_author_filter_applies_free_form_text(cx: &mut gpui::TestAppContext) {
+    let _visual_guard = crate::test_support::lock_visual_test();
+    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let store_for_assert = store.clone();
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::GitCometView::new(store, events, None, window, cx)
+    });
+
+    let repo_id = RepoId(715);
+    apply_state(
+        cx,
+        &view,
+        app_state_with_active_repo(author_filter_fixture_repo(repo_id)),
+    );
+    cx.update(|_window, app| crate::app::bind_text_input_keys_for_test(app));
+    open_popover_for_test(cx, &view, PopoverKind::HistoryAuthorFilter { repo_id });
+    draw_and_drain_test_window(cx);
+
+    // Neither loaded author matches, so nothing is highlighted to apply.
+    cx.simulate_keystrokes("c a r");
+    draw_and_drain_test_window(cx);
+    cx.simulate_keystrokes("enter");
+
+    wait_until(cx, "the typed author filter to be applied", |cx| {
+        cx.update(|_window, _app| {
+            store_for_assert
+                .snapshot()
+                .repos
+                .iter()
+                .find(|repo| repo.id == repo_id)
+                .and_then(|repo| repo.history_state.history_author_filter.clone())
+                == Some("car".to_string())
+        })
+    });
+}
+
+/// Typing narrows the list without moving the selection, so the index can end up
+/// past the end. The dropdown clamps it when it decides which row to highlight,
+/// and Enter has to land on that same row rather than falling back to the raw
+/// query — which would apply a filter the user never highlighted.
+#[gpui::test]
+fn history_author_filter_enter_applies_the_row_the_list_highlights(cx: &mut gpui::TestAppContext) {
+    let _visual_guard = crate::test_support::lock_visual_test();
+    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let store_for_assert = store.clone();
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::GitCometView::new(store, events, None, window, cx)
+    });
+
+    let repo_id = RepoId(718);
+    apply_state(
+        cx,
+        &view,
+        app_state_with_active_repo(author_filter_repo_with_authors(
+            repo_id,
+            &["Barb", "Bob", "boberta"],
+        )),
+    );
+    cx.update(|_window, app| crate::app::bind_text_input_keys_for_test(app));
+    open_popover_for_test(cx, &view, PopoverKind::HistoryAuthorFilter { repo_id });
+    draw_and_drain_test_window(cx);
+
+    // "b" matches all three; three Downs land on the last of them.
+    cx.simulate_keystrokes("b");
+    draw_and_drain_test_window(cx);
+    cx.simulate_keystrokes("down down down");
+    draw_and_drain_test_window(cx);
+
+    // "bo" narrows to two, leaving the selection past the end.
+    cx.simulate_keystrokes("o");
+    draw_and_drain_test_window(cx);
+    cx.simulate_keystrokes("enter");
+
+    wait_until(cx, "the highlighted author to be applied", |cx| {
+        cx.update(|_window, _app| {
+            store_for_assert
+                .snapshot()
+                .repos
+                .iter()
+                .find(|repo| repo.id == repo_id)
+                .and_then(|repo| repo.history_state.history_author_filter.clone())
+                == Some("boberta".to_string())
+        })
+    });
 }
 
 #[gpui::test]
@@ -2737,6 +3028,7 @@ fn create_branch_popover_text_input_f4_navigates_diff_without_closing_popover(
                         repo_id: RepoId(1),
                         target: "HEAD".to_string(),
                         source_selectable: false,
+                        name_prefix: String::new(),
                     },
                     gpui::point(gpui::px(120.0), gpui::px(72.0)),
                     window,
@@ -2822,6 +3114,7 @@ fn create_branch_popover_text_input_f1_navigates_previous_diff_without_closing_p
                         repo_id: RepoId(1),
                         target: "HEAD".to_string(),
                         source_selectable: false,
+                        name_prefix: String::new(),
                     },
                     gpui::point(gpui::px(120.0), gpui::px(72.0)),
                     window,
@@ -4145,7 +4438,7 @@ fn conflict_diff_search_input_change_navigation_preserves_focus(cx: &mut gpui::T
         },
         |pane| {
             format!(
-                "path={:?} markers={} active_conflict={}",
+                "path={:?} markers={} active_conflict={:?}",
                 pane.conflict_resolver.path.clone(),
                 pane.conflict_resolver.resolved_outline.markers.len(),
                 pane.conflict_resolver.active_conflict,
@@ -4192,19 +4485,24 @@ fn conflict_diff_search_input_change_navigation_preserves_focus(cx: &mut gpui::T
     draw_and_drain_test_window(cx);
     let first_anchor = conflict_navigation_anchor(cx, &view)
         .expect("expected F7 from diff search input to set a navigation anchor");
+    assert_eq!(
+        active_conflict_ix(cx, &view),
+        1,
+        "expected one F7 from the fresh first-conflict anchor to advance"
+    );
 
     cx.simulate_keystrokes("f7");
     draw_and_drain_test_window(cx);
     let second_anchor = conflict_navigation_anchor(cx, &view)
         .expect("expected the second F7 to keep a conflict navigation anchor");
-    assert!(
-        second_anchor > first_anchor,
-        "expected repeated F7 from diff search input to move to a later conflict"
+    assert_eq!(
+        second_anchor, first_anchor,
+        "explicit conflict navigation does not wrap past the last target"
     );
     assert_eq!(
         active_conflict_ix(cx, &view),
         1,
-        "expected repeated F7 from diff search input to advance to the second conflict"
+        "expected repeated F7 at the end to keep the second conflict active"
     );
 
     cx.simulate_keystrokes("shift-f7");
@@ -4223,6 +4521,244 @@ fn conflict_diff_search_input_change_navigation_preserves_focus(cx: &mut gpui::T
         diff_search_input_is_focused(cx, &view),
         "expected diff search input to keep focus after conflict navigation shortcuts"
     );
+}
+
+#[gpui::test]
+fn semantic_conflict_navigation_handles_automatic_deltas_and_projection_rebuilds(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::GitCometView::new(store, events, None, window, cx)
+    });
+
+    let repo_id = RepoId(70544);
+    let commit_id = CommitId("1122334455667722".into());
+    let workdir = std::env::temp_dir().join(format!(
+        "gitcomet_ui_test_{}_semantic_conflict_nav",
+        std::process::id()
+    ));
+    let path = std::path::PathBuf::from("src/semantic-conflict.rs");
+    let base = "start\nold-a\nsep-1\nold-conflict-1\nsep-2\nold-b\nsep-3\nold-conflict-2\nend\n";
+    let ours = "start\nnew-a\nsep-1\nours-conflict-1\nsep-2\nold-b\nsep-3\nours-conflict-2\nend\n";
+    let theirs =
+        "start\nold-a\nsep-1\ntheirs-conflict-1\nsep-2\nnew-b\nsep-3\ntheirs-conflict-2\nend\n";
+    let session = ConflictSession::from_stage_inputs(
+        path.clone(),
+        gitcomet_core::domain::FileConflictKind::BothModified,
+        ConflictPayload::Text(base.into()),
+        ConflictPayload::Text(ours.into()),
+        ConflictPayload::Text(theirs.into()),
+    );
+    let current = session
+        .marker_projection_text()
+        .expect("plan-backed session marker projection")
+        .to_string();
+
+    let mut repo = shortcut_fixture_repo(repo_id, &workdir, &commit_id);
+    set_test_conflict_status(&mut repo, path.clone(), DiffArea::Unstaged);
+    set_test_conflict_file(&mut repo, path.clone(), base, ours, theirs, current);
+    repo.conflict_state.conflict_file_load_mode = gitcomet_state::model::ConflictFileLoadMode::Full;
+    repo.conflict_state.conflict_session = Some(session);
+    repo.conflict_state.conflict_rev = 1;
+
+    apply_state(cx, &view, app_state_with_active_repo(repo));
+    wait_for_main_pane_condition(
+        cx,
+        &view,
+        "semantic conflict targets",
+        |pane| {
+            pane.conflict_resolver.path.as_deref() == Some(path.as_path())
+                && pane.conflict_resolver.nav_targets.len() == 4
+                && pane.conflict_resolver.active_conflict == Some(0)
+                && pane
+                    .conflict_resolver
+                    .nav_anchor
+                    .is_some_and(|anchor| anchor.order_hint == 1)
+        },
+        |pane| {
+            format!(
+                "path={:?} targets={:?} anchor={:?} active={:?}",
+                pane.conflict_resolver.path,
+                pane.conflict_resolver.nav_targets,
+                pane.conflict_resolver.nav_anchor,
+                pane.conflict_resolver.active_conflict,
+            )
+        },
+    );
+
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            this.main_pane.update(cx, |pane, cx| {
+                assert!(pane.conflict_has_prev_delta());
+                assert!(pane.conflict_has_next_delta());
+                pane.conflict_jump_first(cx);
+            });
+        });
+    });
+    let (anchor, active, can_prev_conflict, can_next_conflict, can_first) =
+        cx.update(|_window, app| {
+            let pane = view.read(app).main_pane.read(app);
+            (
+                pane.conflict_resolver.nav_anchor,
+                pane.conflict_resolver.active_conflict,
+                pane.conflict_has_prev(),
+                pane.conflict_has_next(),
+                pane.conflict_has_prev_delta(),
+            )
+        });
+    assert_eq!(anchor.unwrap().order_hint, 0);
+    assert_eq!(active, None, "automatic deltas have no marker block");
+    cx.update(|_window, app| {
+        let pane = view.read(app).main_pane.read(app);
+        let (has_base, selected) = pane
+            .conflict_resolver_active_pick_state()
+            .expect("the semantic automatic delta remains actionable");
+        assert!(has_base);
+        assert!(selected.contains(&crate::view::conflict_resolver::ConflictChoice::Ours));
+    });
+
+    // Ctrl+3 reaches the semantic plan block even though navigation left no
+    // displayed marker selected. KDiff3-style source picks toggle, so the
+    // automatic local selection becomes an ordered Local+Remote selection.
+    bind_app_keys_and_global_diff_fallback_for_test(cx);
+    focus_detached_window_focus(cx);
+    cx.simulate_keystrokes("ctrl-3");
+    wait_for_main_pane_condition(
+        cx,
+        &view,
+        "automatic delta Ctrl+3 override",
+        |pane| {
+            pane.conflict_resolver_active_pick_state()
+                .is_some_and(|(_, selected)| {
+                    selected.contains(&crate::view::conflict_resolver::ConflictChoice::Ours)
+                        && selected
+                            .contains(&crate::view::conflict_resolver::ConflictChoice::Theirs)
+                })
+        },
+        |pane| {
+            format!(
+                "active pick state={:?}",
+                pane.conflict_resolver_active_pick_state()
+            )
+        },
+    );
+    assert!(!can_prev_conflict);
+    assert!(can_next_conflict);
+    assert!(!can_first);
+
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            this.main_pane.update(cx, |pane, cx| {
+                pane.conflict_jump_next(cx);
+            });
+        });
+    });
+    assert_eq!(active_conflict_ix(cx, &view), 0);
+    assert_eq!(conflict_navigation_anchor(cx, &view), Some(1));
+
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            this.main_pane.update(cx, |pane, cx| {
+                pane.conflict_jump_last(cx);
+            });
+        });
+    });
+    assert_eq!(active_conflict_ix(cx, &view), 1);
+    assert_eq!(conflict_navigation_anchor(cx, &view), Some(3));
+    cx.update(|_window, app| {
+        let pane = view.read(app).main_pane.read(app);
+        assert!(pane.conflict_has_prev_delta());
+        assert!(!pane.conflict_has_next_delta());
+    });
+
+    // A block click resets the semantic anchor before subsequent F2/F3/F7
+    // traversal, even when another target was selected previously.
+    let main_pane = cx.update(|_window, app| view.read(app).main_pane.clone());
+    cx.update(|_window, app| {
+        main_pane.update(app, |pane, cx| {
+            pane.conflict_resolver_select_conflict(0, cx);
+            pane.conflict_resolver_toggle_collapse_context(cx);
+            pane.conflict_resolver_toggle_hide_resolved(cx);
+            let next_mode = match pane.conflict_resolver.view_mode {
+                ConflictResolverViewMode::ThreeWay => ConflictResolverViewMode::TwoWayDiff,
+                ConflictResolverViewMode::TwoWayDiff => ConflictResolverViewMode::ThreeWay,
+            };
+            pane.conflict_resolver_set_view_mode(next_mode, cx);
+        });
+    });
+    assert_eq!(active_conflict_ix(cx, &view), 0);
+    assert_eq!(
+        conflict_navigation_anchor(cx, &view),
+        Some(1),
+        "view mode, context folding, and hide-resolved rebuilds preserve the anchor"
+    );
+
+    bind_app_keys_and_global_diff_fallback_for_test(cx);
+    focus_detached_window_focus(cx);
+    cx.simulate_keystrokes("f7");
+    draw_and_drain_test_window(cx);
+    assert_eq!(
+        active_conflict_ix(cx, &view),
+        1,
+        "detached-focus navigation continues from the clicked semantic target"
+    );
+    assert_eq!(conflict_navigation_anchor(cx, &view), Some(3));
+
+    // Resolving the last conflict keeps the existing wrap-around auto-advance
+    // behavior, but the destination is selected through the semantic target
+    // list (and therefore skips both automatic deltas).
+    cx.update(|_window, app| {
+        main_pane.update(app, |pane, cx| {
+            pane.conflict_resolver_pick_active_conflict(
+                crate::view::conflict_resolver::ConflictChoice::Ours,
+                cx,
+            );
+        });
+    });
+    assert_eq!(
+        active_conflict_ix(cx, &view),
+        0,
+        "auto-advance wraps from the last resolved conflict to the first unresolved conflict"
+    );
+    assert_eq!(conflict_navigation_anchor(cx, &view), Some(1));
+
+    // Ctrl+Shift+3 is Choose C Everywhere, not "all unresolved conflicts".
+    // It must replace both original conflicts and both automatic deltas.
+    cx.update(|_window, app| {
+        main_pane.update(app, |pane, cx| {
+            pane.conflict_resolver_set_view_mode(ConflictResolverViewMode::ThreeWay, cx);
+        });
+    });
+    cx.simulate_keystrokes("ctrl-shift-3");
+    // The bulk choice lands in the store, and this harness seeds the view's
+    // state directly rather than wiring the store through to it, so assert
+    // where the reducer actually writes.
+    let delta_selections = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| {
+            let snapshot = view.read(app).store.snapshot();
+            snapshot
+                .repos
+                .iter()
+                .find_map(|repo| repo.conflict_state.conflict_session.as_ref())
+                .and_then(|session| session.merge_plan.as_ref())
+                .map(|plan| {
+                    plan.blocks
+                        .iter()
+                        .filter(|block| block.is_delta)
+                        .map(|block| block.selection.as_slice().to_vec())
+                        .collect::<Vec<_>>()
+                })
+        })
+    };
+    wait_until(cx, "Choose C Everywhere", |cx| {
+        delta_selections(cx).is_some_and(|blocks| {
+            !blocks.is_empty()
+                && blocks
+                    .iter()
+                    .all(|selection| selection.as_slice() == [gitcomet_core::merge::MergeSource::C])
+        })
+    });
 }
 
 #[gpui::test]
@@ -5231,7 +5767,7 @@ fn detached_window_focus_conflict_quick_pick_uses_global_diff_shortcut_fallback(
         },
         |pane| {
             format!(
-                "path={:?} markers={} active_conflict={}",
+                "path={:?} markers={} active_conflict={:?}",
                 pane.conflict_resolver.path.clone(),
                 pane.conflict_resolver.resolved_outline.markers.len(),
                 pane.conflict_resolver.active_conflict,
@@ -5660,6 +6196,144 @@ fn bottom_status_bar_zoom_button_keeps_icon_at_default_scale_and_opens_picker(
     );
 }
 
+/// The bottom bar only exists in full chrome, so every branding test needs an
+/// active repository before the bar is drawn at all.
+fn open_repo_for_bottom_status_bar_test(
+    cx: &mut gpui::VisualTestContext,
+    view: &gpui::Entity<super::super::GitCometView>,
+    repo_id: RepoId,
+    workdir_suffix: &str,
+) {
+    let commit_id = CommitId("1122334455667788".into());
+    let workdir = std::env::temp_dir().join(format!(
+        "gitcomet_ui_test_{}_{workdir_suffix}",
+        std::process::id()
+    ));
+    let repo = shortcut_fixture_repo(repo_id, &workdir, &commit_id);
+
+    apply_state(cx, view, app_state_with_active_repo(repo));
+    draw_and_drain_test_window(cx);
+}
+
+#[gpui::test]
+fn bottom_status_bar_free_badge_opens_editions_page_and_updates_tooltip_on_hover(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::GitCometView::new(store, events, None, window, cx)
+    });
+
+    open_repo_for_bottom_status_bar_test(cx, &view, RepoId(710), "bottom_status_free_badge");
+
+    let badge_bounds = cx
+        .debug_bounds("bottom_status_bar_free_badge")
+        .expect("expected bottom status bar free badge bounds");
+    let badge_center = badge_bounds.center();
+
+    cx.simulate_mouse_move(badge_center, None, Modifiers::default());
+    crate::view::test_support::wait_for_native_tooltip(cx);
+    assert_eq!(
+        crate::view::test_support::tooltip_text(cx, &view),
+        Some("See GitComet editions".into())
+    );
+
+    cx.simulate_click(badge_center, Modifiers::default());
+    draw_and_drain_test_window(cx);
+
+    assert_eq!(cx.opened_url(), Some(crate::view::EDITIONS_URL.to_string()));
+    assert!(
+        !popover_is_open(cx, &view),
+        "expected the free badge click to leave popovers closed"
+    );
+}
+
+#[gpui::test]
+fn bottom_status_bar_free_badge_scales_with_ui_zoom(cx: &mut gpui::TestAppContext) {
+    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::GitCometView::new(store, events, None, window, cx)
+    });
+
+    open_repo_for_bottom_status_bar_test(cx, &view, RepoId(711), "bottom_status_free_badge_zoom");
+
+    let default_width = debug_width(cx, "bottom_status_bar_free_badge");
+
+    set_ui_scale_percent_for_test(cx, &view, 200);
+    draw_and_drain_test_window(cx);
+
+    // Unlike the title bar it used to live in, the bottom bar is uncached and
+    // sized from design pixels, so the badge tracks UI zoom with its neighbours.
+    let zoomed_width = debug_width(cx, "bottom_status_bar_free_badge");
+    assert!(
+        zoomed_width > default_width * 1.5,
+        "expected the FREE badge to grow with UI zoom (default={default_width}, zoomed={zoomed_width})"
+    );
+}
+
+#[gpui::test]
+fn bottom_status_bar_branding_opens_discord_and_release_notes(cx: &mut gpui::TestAppContext) {
+    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::GitCometView::new(store, events, None, window, cx)
+    });
+
+    open_repo_for_bottom_status_bar_test(cx, &view, RepoId(712), "bottom_status_branding");
+
+    let discord_bounds = cx
+        .debug_bounds("bottom_status_bar_discord")
+        .expect("expected bottom status bar discord badge bounds");
+    cx.simulate_click(discord_bounds.center(), Modifiers::default());
+    draw_and_drain_test_window(cx);
+    assert_eq!(cx.opened_url(), Some(crate::view::DISCORD_URL.to_string()));
+
+    let version_bounds = cx
+        .debug_bounds("bottom_status_bar_version")
+        .expect("expected bottom status bar version bounds");
+    cx.simulate_click(version_bounds.center(), Modifiers::default());
+    draw_and_drain_test_window(cx);
+    assert_eq!(cx.opened_url(), Some(crate::view::RELEASES_URL.to_string()));
+
+    let brand_bounds = cx
+        .debug_bounds("bottom_status_bar_brand")
+        .expect("expected the GitComet wordmark to be visible in the bottom bar");
+    assert!(
+        version_bounds.origin.x > brand_bounds.origin.x,
+        "expected the version number to sit at the bar's trailing end, right of the wordmark"
+    );
+}
+
+#[gpui::test]
+fn bottom_status_bar_brand_opens_the_website_and_shows_a_tooltip(cx: &mut gpui::TestAppContext) {
+    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::GitCometView::new(store, events, None, window, cx)
+    });
+
+    open_repo_for_bottom_status_bar_test(cx, &view, RepoId(713), "bottom_status_brand_link");
+
+    let brand_bounds = cx
+        .debug_bounds("bottom_status_bar_brand_link")
+        .expect("expected the GitComet mark and wordmark to share one link");
+    let brand_center = brand_bounds.center();
+
+    cx.simulate_mouse_move(brand_center, None, Modifiers::default());
+    crate::view::test_support::wait_for_native_tooltip(cx);
+    assert_eq!(
+        crate::view::test_support::tooltip_text(cx, &view),
+        Some("Open gitcomet.dev".into())
+    );
+
+    cx.simulate_click(brand_center, Modifiers::default());
+    draw_and_drain_test_window(cx);
+
+    assert_eq!(cx.opened_url(), Some(crate::view::WEBSITE_URL.to_string()));
+    assert!(
+        !popover_is_open(cx, &view),
+        "expected the wordmark click to leave popovers closed"
+    );
+}
+
 #[gpui::test]
 fn shared_context_menu_rows_fill_the_popover_width(cx: &mut gpui::TestAppContext) {
     let (store, events) = AppStore::new(Arc::new(TestBackend));
@@ -5748,6 +6422,7 @@ fn prompt_popovers_grow_wider_with_ui_zoom(cx: &mut gpui::TestAppContext) {
             repo_id: RepoId(1),
             target: "HEAD".to_string(),
             source_selectable: false,
+            name_prefix: String::new(),
         },
     );
     draw_and_drain_test_window(cx);

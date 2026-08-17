@@ -10,7 +10,9 @@ use super::util::{
     push_diagnostic, refresh_full_effects, refresh_primary_effects, selected_conflict_target,
     start_conflict_target_reload, start_current_conflict_target_reload,
 };
-use crate::model::{AppState, DiagnosticKind, InteractiveRebaseSetup, Loadable, RepoLoadsInFlight};
+use crate::model::{
+    AppState, DiagnosticKind, InteractiveRebaseSetup, Loadable, RepoLoadsInFlight, SidebarMode,
+};
 use crate::msg::{Effect, RepoActionKind, RepoExternalChange};
 use gitcomet_core::domain::{DiffArea, DiffTarget, LogCursor, LogPage, LogScope};
 use gitcomet_core::error::Error;
@@ -103,7 +105,37 @@ pub(super) fn reload_repo(state: &mut AppState, repo_id: crate::model::RepoId) -
 
     let mut effects = refresh_full_effects(repo_state, git_log_settings);
     append_auto_background_metadata_effects(repo_state, git_log_settings, &mut effects);
+    // Linked-worktree rows survive a reload, so their dirty counts have to be
+    // refreshed along with everything else. The monitor only flushes for this
+    // repo's own `.git`, so a commit or stash made inside a linked worktree
+    // reaches us no other way, and Reload is exactly how a user asks for it.
+    if let Some(effect) = super::effects::request_worktree_dirty_effect(repo_state) {
+        effects.push(effect);
+    }
     effects
+}
+
+/// Keep the live Files tree in step with the disk. Commit browsing is immutable
+/// and left alone. A refresh costs a full walk, so it runs eagerly only while the
+/// user is looking at the tree, and is deferred as `stale` otherwise.
+fn file_browser_refresh_for_external_change(
+    repo_state: &mut crate::model::RepoState,
+    change: RepoExternalChange,
+    sidebar_shows_this_files_tree: bool,
+) -> Option<Effect> {
+    if !(change.worktree || change.index || change.git_state) {
+        return None;
+    }
+    if repo_state.file_browser.source != gitcomet_core::domain::FileSource::WorkingDirectory {
+        return None;
+    }
+    if !sidebar_shows_this_files_tree {
+        repo_state.file_browser.stale = true;
+        return None;
+    }
+    // Deliberately no `entries = Loading` and no `expanded_dirs.clear()`: the rows
+    // stay put, expansion included, until the new listing replaces them.
+    super::effects::request_file_browser_load(repo_state)
 }
 
 pub(super) fn repo_externally_changed(
@@ -111,9 +143,14 @@ pub(super) fn repo_externally_changed(
     repo_id: crate::model::RepoId,
     change: RepoExternalChange,
 ) -> Vec<Effect> {
+    let sidebar_shows_this_files_tree =
+        state.sidebar_mode == SidebarMode::Files && state.active_repo == Some(repo_id);
     let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) else {
         return Vec::new();
     };
+
+    let file_browser_effect =
+        file_browser_refresh_for_external_change(repo_state, change, sidebar_shows_this_files_tree);
 
     // Coalesce refreshes while a refresh is already in flight.
     let mut effects = if change.git_state {
@@ -134,6 +171,9 @@ pub(super) fn repo_externally_changed(
         {
             effects.push(Effect::LoadRemoteBranches { repo_id });
         }
+        if let Some(effect) = super::effects::request_worktree_dirty_effect(repo_state) {
+            effects.push(effect);
+        }
         effects
     } else {
         let mut effects = Vec::new();
@@ -153,6 +193,8 @@ pub(super) fn repo_externally_changed(
         }
         effects
     };
+
+    effects.extend(file_browser_effect);
 
     // Tag reloads are driven by the `tags` flag alone, independent of
     // `git_state`, so any change that sets `tags` refreshes them regardless of
@@ -248,6 +290,29 @@ pub(super) fn repo_externally_changed(
     effects
 }
 
+/// Reloads the first page after the user changed *what* the history shows —
+/// its scope or its author filter. The caller has already applied the change to
+/// `repo_state`; this holds the previous page on screen while the new walk runs,
+/// drops any pagination in progress, and persists the change. `persist` is given
+/// the repository's workdir.
+fn restart_history_load(
+    state: &mut AppState,
+    repo_ix: usize,
+    persist: impl FnOnce(std::path::PathBuf) -> Effect,
+) -> Vec<Effect> {
+    let repo_state = &mut state.repos[repo_ix];
+    repo_state.retain_log_while_loading();
+    repo_state.set_log(Loadable::Loading);
+    repo_state.set_log_loading_more(false);
+    // Any count on screen belongs to the walk being replaced.
+    repo_state.set_log_scan_progress(None);
+
+    let mut effects = vec![persist(repo_state.spec.workdir.clone())];
+    let request = super::util::first_page_log_request(repo_state);
+    effects.extend(super::util::request_log_effect(repo_state, request));
+    effects
+}
+
 pub(super) fn set_history_scope(
     state: &mut AppState,
     repo_id: crate::model::RepoId,
@@ -256,44 +321,17 @@ pub(super) fn set_history_scope(
     let Some(repo_ix) = state.repos.iter().position(|r| r.id == repo_id) else {
         return Vec::new();
     };
+    if state.repos[repo_ix].history_state.history_scope == scope {
+        return Vec::new();
+    }
+    state.repos[repo_ix].set_log_scope(scope);
 
-    let workdir = {
-        let repo_state = &mut state.repos[repo_ix];
-        if repo_state.history_state.history_scope == scope {
-            return Vec::new();
-        }
-
-        repo_state.set_log_scope(scope);
-        repo_state.retain_log_while_loading();
-        repo_state.set_log(Loadable::Loading);
-        repo_state.set_log_loading_more(false);
-        repo_state.spec.workdir.clone()
-    };
-    let mut effects = vec![Effect::PersistRepoHistoryMode {
+    restart_history_load(state, repo_ix, |workdir| Effect::PersistRepoHistoryMode {
         repo_id: Some(repo_id),
         workdir,
         mode: scope,
         action: "updating history mode",
-    }];
-    let author_filter = state.repos[repo_ix]
-        .history_state
-        .history_author_filter
-        .clone();
-    if state.repos[repo_ix].loads_in_flight.request_log(
-        scope,
-        author_filter.clone(),
-        super::util::DEFAULT_LOG_PAGE_SIZE,
-        None,
-    ) {
-        effects.push(Effect::LoadLog {
-            repo_id,
-            scope,
-            author: author_filter,
-            limit: super::util::DEFAULT_LOG_PAGE_SIZE,
-            cursor: None,
-        });
-    }
-    effects
+    })
 }
 
 pub(super) fn set_history_author_filter(
@@ -304,41 +342,19 @@ pub(super) fn set_history_author_filter(
     let Some(repo_ix) = state.repos.iter().position(|r| r.id == repo_id) else {
         return Vec::new();
     };
-
-    let workdir = {
-        let repo_state = &mut state.repos[repo_ix];
-        if repo_state.history_state.history_author_filter == author {
-            return Vec::new();
-        }
-
-        repo_state.set_history_author_filter(author.clone());
-        repo_state.retain_log_while_loading();
-        repo_state.set_log(Loadable::Loading);
-        repo_state.set_log_loading_more(false);
-        repo_state.spec.workdir.clone()
-    };
-    let mut effects = vec![Effect::PersistRepoHistoryAuthorFilter {
-        repo_id: Some(repo_id),
-        workdir,
-        author: author.clone(),
-        action: "updating history author filter",
-    }];
-    let history_scope = state.repos[repo_ix].history_state.history_scope;
-    if state.repos[repo_ix].loads_in_flight.request_log(
-        history_scope,
-        author.clone(),
-        super::util::DEFAULT_LOG_PAGE_SIZE,
-        None,
-    ) {
-        effects.push(Effect::LoadLog {
-            repo_id,
-            scope: history_scope,
-            author,
-            limit: super::util::DEFAULT_LOG_PAGE_SIZE,
-            cursor: None,
-        });
+    if state.repos[repo_ix].history_state.history_author_filter == author {
+        return Vec::new();
     }
-    effects
+    state.repos[repo_ix].set_history_author_filter(author.clone());
+
+    restart_history_load(state, repo_ix, |workdir| {
+        Effect::PersistRepoHistoryAuthorFilter {
+            repo_id: Some(repo_id),
+            workdir,
+            author,
+            action: "updating history author filter",
+        }
+    })
 }
 
 pub(super) fn load_more_history(
@@ -361,23 +377,13 @@ pub(super) fn load_more_history(
     };
 
     repo_state.set_log_loading_more(true);
-    let author = repo_state.history_state.history_author_filter.clone();
-    if repo_state.loads_in_flight.request_log(
-        repo_state.history_state.history_scope,
-        author.clone(),
-        super::util::DEFAULT_LOG_PAGE_SIZE,
-        Some(cursor.clone()),
-    ) {
-        vec![Effect::LoadLog {
-            repo_id,
-            scope: repo_state.history_state.history_scope,
-            author,
-            limit: super::util::DEFAULT_LOG_PAGE_SIZE,
-            cursor: Some(cursor),
-        }]
-    } else {
-        Vec::new()
-    }
+    let request = crate::model::PendingLogLoad {
+        cursor: Some(cursor),
+        ..super::util::first_page_log_request(repo_state)
+    };
+    super::util::request_log_effect(repo_state, request)
+        .into_iter()
+        .collect()
 }
 
 pub(super) fn rebase_state_loaded(
@@ -534,11 +540,49 @@ pub(super) fn merge_commit_message_loaded(
     effects
 }
 
+/// Applies a partially built page while its walk is still running.
+///
+/// Chunks are prefixes of one another, so this replaces rather than appends and
+/// applying one twice is harmless. Only a first page streams: a "load more"
+/// merges into the existing page, and a prefix cannot say where that merge
+/// starts.
+pub(super) fn log_chunk_loaded(
+    state: &mut AppState,
+    repo_id: crate::model::RepoId,
+    seq: crate::model::LogLoadSeq,
+    commits: Vec<gitcomet_core::domain::Commit>,
+    scanned: u64,
+) -> Vec<Effect> {
+    let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) else {
+        return Vec::new();
+    };
+    if !repo_state.loads_in_flight.is_active_log_reply(seq)
+        || repo_state.loads_in_flight.active_log_is_load_more()
+    {
+        return Vec::new();
+    }
+
+    repo_state.set_log_scan_progress(Some(scanned));
+    if commits.is_empty() {
+        // Nothing found yet: keep whatever the view is painting and just let the
+        // progress readout advance.
+        return Vec::new();
+    }
+    // Published as the page held *while loading*, not as the finished log: the
+    // walk is still running, so there is no answer yet to "is there more?", and
+    // a `Ready` page with no cursor would claim there is not.
+    repo_state.set_partial_log_while_loading(Arc::new(LogPage {
+        commits,
+        next_cursor: None,
+    }));
+    Vec::new()
+}
+
 pub(super) fn log_loaded(
     state: &mut AppState,
     repo_id: crate::model::RepoId,
+    seq: crate::model::LogLoadSeq,
     scope: LogScope,
-    author: Option<String>,
     cursor: Option<LogCursor>,
     result: std::result::Result<LogPage, Error>,
 ) -> Vec<Effect> {
@@ -546,28 +590,22 @@ pub(super) fn log_loaded(
     if let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) {
         let is_load_more = cursor.is_some();
 
-        // Drop replies that no longer match the requested scope or author
-        // filter; the newest pending request, if any, is replayed below.
-        if repo_state.history_state.history_scope != scope
-            || repo_state.history_state.history_author_filter.as_deref() != author.as_deref()
-        {
-            if is_load_more {
-                repo_state.set_log_loading_more(false);
-            }
-            if let Some(next) = repo_state.loads_in_flight.finish_log() {
-                repo_state.set_log_loading_more(next.cursor.is_some());
-                effects.push(Effect::LoadLog {
-                    repo_id,
-                    scope: next.scope,
-                    author: next.author,
-                    limit: next.limit,
-                    cursor: next.cursor,
-                });
-            }
+        // Drop replies from a walk that a newer request superseded. That walk
+        // was cancelled and its replacement is still running, so the in-flight
+        // bookkeeping belongs to the newer request and must not be touched here.
+        if !repo_state.loads_in_flight.is_active_log_reply(seq) {
             return effects;
         }
 
+        repo_state.set_log_scan_progress(None);
         match result {
+            // A cancelled walk is not a failure: the request that replaced it
+            // owns the state now, so leave everything as the newer load found it.
+            Err(e) if matches!(e.kind(), gitcomet_core::error::ErrorKind::Cancelled) => {
+                if is_load_more {
+                    repo_state.set_log_loading_more(false);
+                }
+            }
             Ok(mut page) => {
                 if is_load_more && let Loadable::Ready(existing) = &mut repo_state.log {
                     // Drop the history_state copy first so the Arc's refcount
@@ -606,14 +644,25 @@ pub(super) fn log_loaded(
         // Reconcile the commit multi-selection against the reloaded page: drop
         // ids that no longer exist, and drop the anchor index hint since row
         // indices may have shifted.
-        if !repo_state.history_state.multi_selection.commits.is_empty()
+        //
+        // Only a *replaced* page can say an id no longer exists. A "load more"
+        // appends, so an id missing from the grown page was equally missing
+        // before, and dropping it there would fight every reveal that is still
+        // paging toward its target — one clear per batch, which the details pane
+        // shows as a flicker between the commit and the working tree.
+        if !is_load_more
+            && !repo_state.history_state.multi_selection.commits.is_empty()
             && let Loadable::Ready(page) = &repo_state.log
         {
+            let reveal_target = repo_state.history_state.reveal_target.clone();
+            let survives = |id: &gitcomet_core::domain::CommitId| {
+                reveal_target.as_ref() == Some(id) || page.commits.iter().any(|c| c.id == *id)
+            };
+
             let mut next = repo_state.history_state.multi_selection.clone();
-            next.commits
-                .retain(|id| page.commits.iter().any(|c| c.id == *id));
+            next.commits.retain(&survives);
             if let Some(anchor) = &next.anchor
-                && !page.commits.iter().any(|c| c.id == *anchor)
+                && !survives(anchor)
             {
                 next.anchor = None;
             }
@@ -624,11 +673,15 @@ pub(super) fn log_loaded(
             // have vanished — an external amend/rebase can replace exactly the
             // focused commit. Re-point focus at a surviving selected commit so
             // the details pane never trails a commit that no longer exists.
+            //
+            // A reveal's target is exempt: it is deliberately selected ahead of
+            // the page that will contain it, and a scope switch mid-reveal
+            // restarts the log from its first page.
             let focus_gone = repo_state
                 .history_state
                 .selected_commit
                 .as_ref()
-                .is_some_and(|id| !page.commits.iter().any(|c| c.id == *id));
+                .is_some_and(|id| !survives(id));
             let refocus = focus_gone.then(|| next.commits.last().cloned()).flatten();
 
             repo_state.set_commit_multi_selection(next);
@@ -652,10 +705,11 @@ pub(super) fn log_loaded(
             repo_state.set_log_loading_more(false);
         }
 
-        if let Some(next) = repo_state.loads_in_flight.finish_log() {
+        if let Some((seq, next)) = repo_state.loads_in_flight.finish_log() {
             repo_state.set_log_loading_more(next.cursor.is_some());
             effects.push(Effect::LoadLog {
                 repo_id,
+                seq,
                 scope: next.scope,
                 author: next.author,
                 limit: next.limit,

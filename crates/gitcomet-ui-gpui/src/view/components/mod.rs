@@ -1,7 +1,6 @@
 mod avatar;
-mod branch_ref_picker;
 mod button;
-mod commit_sha_hover_menu;
+mod commit_link_menu;
 mod containers;
 mod context_menu;
 mod diff_stat;
@@ -24,9 +23,8 @@ pub use avatar::{
     AVATAR_DIAMETER_PX, AVATAR_FONT_PX, author_avatar, author_color, author_initials,
     initials_paint_origin_y,
 };
-pub use branch_ref_picker::{BranchRefPicker, BranchRefPickerItem};
 pub use button::{Button, ButtonStyle};
-pub use commit_sha_hover_menu::{CommitShaHoverMenu, CommitShaLink};
+pub use commit_link_menu::{CommitLinkMenu, LinkTarget, MessageLink};
 pub use containers::{ScrollContainer, empty_state, empty_state_message, split_columns_header};
 #[cfg(test)]
 pub use containers::{panel, pill};
@@ -36,9 +34,17 @@ pub use context_menu::{
 };
 pub use diff_stat::diff_stat;
 pub use interactive_row::{InteractiveRowExt, InteractiveRowState, InteractiveRowStyle};
-pub use modal::{modal_scrim, modal_surface};
+pub use modal::{modal_scrim, modal_surface, popover_surface};
+/// Public field type of [`PickerPromptLayout::headers`], carried out of the
+/// private module with it so a caller can name what that field hands them
+/// instead of only ever binding it through an inferred closure argument.
+#[allow(unused_imports)]
+pub use picker_prompt::PickerPromptHeader;
+pub use picker_prompt::picker_prompt_layout;
 pub use picker_prompt::{
-    PickerPrompt, PickerPromptItem, PickerPromptItemPart, PickerPromptLayout, picker_prompt_layout,
+    PICKER_LIST_MAX_HEIGHT_PX, PickerPrompt, PickerPromptContextMenuEvent, PickerPromptGeometry,
+    PickerPromptItem, PickerPromptItemPart, PickerPromptLayout,
+    picker_prompt_layout_with_collapsed,
 };
 pub use repository_badge::{
     REPOSITORY_BADGE_SIZE_PX, repository_initials, repository_initials_box,
@@ -53,10 +59,11 @@ pub use text_fade::{FadingText, trailing_fade};
 pub use toast::{ToastKind, toast};
 pub use tokens::*;
 pub(crate) use truncated_text::{
-    PathTruncationAlignmentGroup, TruncatedText, TruncatedTextTooltipMode,
+    PathTruncationAlignmentGroup, TruncatedText, TruncatedTextFlex, TruncatedTextTooltipMode,
 };
 
 pub(crate) use crate::kit::text_truncation::TextTruncationProfile;
 pub use crate::kit::{
-    Scrollbar, ScrollbarAxis, ScrollbarMarker, ScrollbarMarkerKind, TextInput, TextInputOptions,
+    MINIMAP_COLUMN_WIDTH_PX, MinimapColumn, Scrollbar, ScrollbarAxis, ScrollbarMarker,
+    ScrollbarMarkerKind, TextInput, TextInputOptions,
 };

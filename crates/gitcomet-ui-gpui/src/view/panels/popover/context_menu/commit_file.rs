@@ -22,10 +22,6 @@ pub(super) fn model(
             _ => None,
         })
         .unwrap_or(false);
-    let copy_path_text = this
-        .resolve_workdir_path(repo_id, path)
-        .map(|p| path_text_for_copy(&p))
-        .unwrap_or_else(|_| path_text_for_copy(path));
 
     let mut items = vec![ContextMenuItem::Header(
         path.file_name()
@@ -88,15 +84,7 @@ pub(super) fn model(
                 }),
             });
         }
-        items.push(ContextMenuItem::Entry {
-            label: "Copy path".into(),
-            icon: Some("icons/copy.svg".into()),
-            shortcut: Some("C".into()),
-            disabled: false,
-            action: Box::new(ContextMenuAction::CopyText {
-                text: copy_path_text,
-            }),
-        });
+        push_copy_path_entries(&mut items, this, repo_id, path, Some("C".into()));
         return ContextMenuModel::new(items);
     }
 
@@ -120,6 +108,16 @@ pub(super) fn model(
         shortcut: None,
         disabled: false,
         action: Box::new(ContextMenuAction::OpenFile {
+            repo_id,
+            path: path.to_path_buf(),
+        }),
+    });
+    items.push(ContextMenuItem::Entry {
+        label: "Edit file".into(),
+        icon: Some("icons/pencil.svg".into()),
+        shortcut: None,
+        disabled: crate::view::should_bypass_text_file_preview_for_path(path),
+        action: Box::new(ContextMenuAction::EditFile {
             repo_id,
             path: path.to_path_buf(),
         }),
@@ -180,15 +178,7 @@ pub(super) fn model(
             action: Box::new(ContextMenuAction::CopyText { text: permalink }),
         });
     }
-    items.push(ContextMenuItem::Entry {
-        label: "Copy path".into(),
-        icon: Some("icons/copy.svg".into()),
-        shortcut: Some("C".into()),
-        disabled: false,
-        action: Box::new(ContextMenuAction::CopyText {
-            text: copy_path_text,
-        }),
-    });
+    push_copy_path_entries(&mut items, this, repo_id, path, Some("C".into()));
 
     ContextMenuModel::new(items)
 }

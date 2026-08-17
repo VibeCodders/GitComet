@@ -1,4 +1,5 @@
 use super::*;
+use palette::IntoColor;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -12,7 +13,23 @@ const CONTENT_CARD_GAP_PX: f32 = 8.0;
 /// Bottom margin the main content card leaves for the bottom bar. The collapsed
 /// section popover matches it so its top/bottom gaps read symmetric.
 const CONTENT_CARD_BOTTOM_MARGIN_PX: f32 = 2.0;
+/// Width of the panel a collapsed-rail section (Local/Remote branches,
+/// Worktrees, Submodules, Stashes) opens into. Wider than the expanded
+/// sidebar's 280px default: the rail's popover is transient and floats over the
+/// canvas, so it can afford the room that branch names, worktree paths and
+/// stash summaries want, without the pane's permanent cost.
+const COLLAPSED_POPOVER_WIDTH_PX: f32 = 340.0;
 static SPLASH_BACKDROP_IMAGE_CACHE: OnceLock<Arc<gpui::Image>> = OnceLock::new();
+
+/// Corner radius of the main content card — squarer than the shared `panel`
+/// radius the floating dialogs and splash cards keep. This surface is chrome
+/// fused to the tab strip above it and the sidebar beside it, not a card
+/// floating on the canvas, so it takes the same radius as the controls
+/// (buttons, tabs) it sits among. The corner caps derive from this, so both
+/// move together.
+fn main_content_card_radius(theme: AppTheme) -> f32 {
+    theme.radii.control
+}
 
 struct SplashInteractiveColors {
     base: gpui::Rgba,
@@ -183,7 +200,7 @@ impl GitCometView {
             .justify_center()
             .child(svg_icon(
                 "icons/warning.svg",
-                theme.colors.warning,
+                theme.colors.status.warning.foreground,
                 scaled_px(36.0),
             ))
             .into_any_element()
@@ -318,7 +335,10 @@ impl GitCometView {
         content: impl IntoElement,
         theme: AppTheme,
     ) -> AnyElement {
-        let border_glow = with_alpha(theme.colors.border, if theme.is_dark { 0.86 } else { 0.74 });
+        let border_glow = with_alpha(
+            theme.colors.stroke.default,
+            if theme.is_dark { 0.86 } else { 0.74 },
+        );
 
         div()
             .id(id)
@@ -340,14 +360,14 @@ impl GitCometView {
                     .w_full()
                     .max_w(px(560.0))
                     .bg(with_alpha(
-                        theme.colors.surface_bg,
+                        theme.colors.surface.panel,
                         if theme.is_dark { 0.96 } else { 0.98 },
                     ))
                     .border_1()
                     .border_color(border_glow)
                     .rounded(px(theme.radii.panel))
                     .shadow(vec![gpui::BoxShadow {
-                        color: gpui::rgba(0x00000052).into(),
+                        color: gpui::rgba(0x00000052).into_color(),
                         offset: point(px(0.0), px(22.0)),
                         blur_radius: px(52.0),
                         spread_radius: px(0.0),
@@ -403,11 +423,13 @@ impl GitCometView {
         cx: &mut gpui::Context<Self>,
     ) -> AnyElement {
         let detail_bg = with_alpha(
-            theme.colors.window_bg,
+            theme.colors.surface.canvas,
             if theme.is_dark { 0.36 } else { 0.82 },
         );
-        let detail_border =
-            with_alpha(theme.colors.border, if theme.is_dark { 0.96 } else { 0.82 });
+        let detail_border = with_alpha(
+            theme.colors.stroke.default,
+            if theme.is_dark { 0.96 } else { 0.82 },
+        );
 
         div()
             .id("git_unavailable_card")
@@ -432,7 +454,7 @@ impl GitCometView {
                     .text_center()
                     .text_sm()
                     .line_height(px(22.0))
-                    .text_color(theme.colors.text_muted)
+                    .text_color(theme.colors.foreground.secondary)
                     .child(
                         "GitComet cannot open, refresh, or run repository actions until a Git executable is configured.",
                     ),
@@ -450,7 +472,7 @@ impl GitCometView {
                     .py_2()
                     .text_xs()
                     .line_height(px(18.0))
-                    .text_color(theme.colors.text_muted)
+                    .text_color(theme.colors.foreground.secondary)
                     .child(self.git_runtime_unavailable_detail_content()),
             )
             .child(
@@ -472,7 +494,10 @@ impl GitCometView {
 
     fn git_unavailable_overlay(&mut self, cx: &mut gpui::Context<Self>) -> AnyElement {
         let theme = self.theme;
-        let border_glow = with_alpha(theme.colors.border, if theme.is_dark { 0.86 } else { 0.74 });
+        let border_glow = with_alpha(
+            theme.colors.stroke.default,
+            if theme.is_dark { 0.86 } else { 0.74 },
+        );
 
         div()
             .id("git_unavailable_overlay")
@@ -483,7 +508,7 @@ impl GitCometView {
             .size_full()
             .overflow_hidden()
             .bg(with_alpha(
-                theme.colors.window_bg,
+                theme.colors.surface.canvas,
                 if theme.is_dark { 0.76 } else { 0.82 },
             ))
             .child(self.interstitial_backdrop())
@@ -501,14 +526,14 @@ impl GitCometView {
                             .w_full()
                             .max_w(px(560.0))
                             .bg(with_alpha(
-                                theme.colors.surface_bg,
+                                theme.colors.surface.panel,
                                 if theme.is_dark { 0.96 } else { 0.98 },
                             ))
                             .border_1()
                             .border_color(border_glow)
                             .rounded(px(theme.radii.panel))
                             .shadow(vec![gpui::BoxShadow {
-                                color: gpui::rgba(0x00000052).into(),
+                                color: gpui::rgba(0x00000052).into_color(),
                                 offset: point(px(0.0), px(22.0)),
                                 blur_radius: px(52.0),
                                 spread_radius: px(0.0),
@@ -544,7 +569,7 @@ impl GitCometView {
                 .child(
                     div()
                         .text_sm()
-                        .text_color(theme.colors.text_muted)
+                        .text_color(theme.colors.foreground.secondary)
                         .child("GitComet is opening your workspace."),
                 )
                 .child(
@@ -554,10 +579,10 @@ impl GitCometView {
                         .items_center()
                         .gap_1()
                         .text_sm()
-                        .text_color(theme.colors.text_muted)
+                        .text_color(theme.colors.foreground.secondary)
                         .child(svg_spinner(
                             ("repository_loading_spinner", 0u64),
-                            theme.colors.accent,
+                            theme.colors.accent.foreground,
                             scaled_px(16.0),
                         ))
                         .child("Please wait…"),
@@ -723,7 +748,7 @@ impl GitCometView {
                             gpui::linear_color_stop(gpui::rgba(0x03081352), 1.0),
                         ))
                         .shadow(vec![gpui::BoxShadow {
-                            color: panel_shadow.into(),
+                            color: panel_shadow.into_color(),
                             offset: point(px(0.0), px(40.0)),
                             blur_radius: px(80.0),
                             spread_radius: px(0.0),
@@ -897,7 +922,7 @@ impl GitCometView {
         let scaled_px =
             |value: f32| crate::ui_scale::design_px_from_percent(value, ui_scale_percent);
         let active = self.sidebar_collapsed_popover;
-        let icon_muted = theme.colors.text_muted;
+        let icon_muted = theme.colors.foreground.secondary;
         let active_bg = theme.active_overlay();
         let hover_bg = theme.hover_overlay();
         let slot = scaled_px(28.0);
@@ -905,7 +930,7 @@ impl GitCometView {
         let icons = CollapsedSidebarSection::ALL.into_iter().map(|section| {
             let is_active = active == Some(section);
             let icon_color = if is_active {
-                theme.colors.text
+                theme.colors.foreground.primary
             } else {
                 icon_muted
             };
@@ -987,8 +1012,8 @@ impl GitCometView {
             .min_h(px(0.0))
             .rounded(px(theme.radii.panel))
             .border_1()
-            .border_color(theme.colors.border)
-            .bg(theme.colors.surface_bg_elevated)
+            .border_color(theme.colors.stroke.default)
+            .bg(theme.colors.surface.raised)
             .shadow_lg()
             // Claim clicks anywhere on the panel so its empty regions don't fall
             // through to the dismiss scrim underneath.
@@ -1032,7 +1057,7 @@ impl GitCometView {
             .ml(scaled_px(6.0))
             .top(scaled_px(4.0))
             .bottom(scaled_px(4.0) + px(CONTENT_CARD_BOTTOM_MARGIN_PX))
-            .w(scaled_px(268.0))
+            .w(scaled_px(COLLAPSED_POPOVER_WIDTH_PX))
             .flex()
             .flex_col()
             .child(panel)
@@ -1107,14 +1132,15 @@ impl GitCometView {
                         .flex_row()
                         .flex_1()
                         .min_h(px(0.0))
-                        .bg(theme.colors.sidebar_bg)
+                        .bg(theme.colors.surface.chrome)
                         .child(
                             div()
                                 .id("sidebar_pane")
+                                .debug_selector(|| "sidebar_pane".to_string())
                                 .relative()
                                 .w(self.sidebar_render_width)
                                 .min_h(px(0.0))
-                                .bg(theme.colors.sidebar_bg)
+                                .bg(theme.colors.surface.chrome)
                                 .when(!self.sidebar_collapsed, |d| {
                                     d.child(self.sidebar_pane.clone())
                                 })
@@ -1138,11 +1164,11 @@ impl GitCometView {
                                 .mb(px(CONTENT_CARD_BOTTOM_MARGIN_PX))
                                 .mr(px(CONTENT_CARD_GAP_PX))
                                 .relative()
-                                .rounded(px(theme.radii.panel))
+                                .rounded(px(main_content_card_radius(theme)))
                                 .border_1()
-                                .border_color(theme.colors.border)
+                                .border_color(theme.colors.stroke.default)
                                 .overflow_hidden()
-                                .bg(theme.colors.window_bg)
+                                .bg(theme.colors.surface.canvas)
                                 .child(
                                     div()
                                         .flex_1()
@@ -1175,7 +1201,7 @@ impl GitCometView {
                                         .when(self.details_collapsed, |d| {
                                             // The resize handle is hidden while collapsed, so
                                             // keep a hairline between main and the strip.
-                                            d.border_l_1().border_color(theme.colors.border_variant)
+                                            d.border_l_1().border_color(theme.colors.stroke.subtle)
                                         })
                                         .when(!self.details_collapsed, |d| {
                                             d.child(
@@ -1206,22 +1232,34 @@ impl GitCometView {
                                         )),
                                 )
                                 .child(card_corner_caps(
-                                    px((theme.radii.panel - 1.0).max(0.0)),
-                                    theme.colors.sidebar_bg,
-                                ))
-                                .child(
-                                    // Sidebar resize grab strip overlaying the card's
-                                    // left edge, so the boundary consumes no layout
-                                    // space of its own.
-                                    div().absolute().left_0().top_0().bottom_0().child(
-                                        self.pane_resize_handle(
-                                            theme,
-                                            "pane_resize_sidebar",
-                                            PaneResizeHandle::Sidebar,
-                                            cx,
-                                        ),
-                                    ),
-                                ),
+                                    px((main_content_card_radius(theme) - 1.0).max(0.0)),
+                                    theme.colors.surface.chrome,
+                                )),
+                        )
+                        .child(
+                            // Sidebar resize grab strip, straddling the card's left
+                            // edge the way the details strip straddles its boundary,
+                            // so the grip centers on the rule instead of sitting
+                            // beside it. It hangs off the row rather than the card
+                            // because the card clips its overflow, and it matches the
+                            // card's bottom margin so both strips end on the same
+                            // line. Absolute, so the boundary still consumes no
+                            // layout space of its own.
+                            div()
+                                .absolute()
+                                .top_0()
+                                .bottom(px(CONTENT_CARD_BOTTOM_MARGIN_PX))
+                                .left(
+                                    (self.sidebar_render_width
+                                        - self.pane_resize_handle_width() / 2.0)
+                                        .max(px(0.0)),
+                                )
+                                .child(self.pane_resize_handle(
+                                    theme,
+                                    "pane_resize_sidebar",
+                                    PaneResizeHandle::Sidebar,
+                                    cx,
+                                )),
                         )
                         // Scrim only while open (not during fade-out).
                         .when(popover_open.is_some(), |d| {

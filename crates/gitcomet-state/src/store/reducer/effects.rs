@@ -1,20 +1,23 @@
 use super::util::{
     EffectAccumulator, apply_selected_diff_load_plan_state, diff_reload_effects, push_diagnostic,
     push_notification, selected_diff_load_plan,
-};
-use crate::model::{
+};  use crate::model::{
     AppNotificationKind, AppState, CherryPickRangePreview, CommitMultiSelection,
-    ConflictFileLoadMode, DiagnosticKind, Loadable, RangeSelection, RepoId, RepoLoadsInFlight,
-    RepoState, SidebarDataRequest, SidebarMode,
-};
+    ConflictFileLoadMode, DiagnosticKind, ForeignDiffOrigin, Loadable, RangeSelection, RepoId,
+    RepoLoadsInFlight, RepoState, SidebarDataRequest, SidebarMode,
+  };
 use crate::msg::{CommitSelectMode, ConflictAutosolveMode, Effect};
-use gitcomet_core::conflict_session::{ConflictPayload, ConflictResolverStrategy, ConflictSession};
-use gitcomet_core::domain::{
+use gitcomet_core::conflict_session::{
+    ConflictPayload, ConflictRegionResolution, ConflictRegionSourceRanges,
+    ConflictResolverStrategy, ConflictSession, reconstruct_conflict_marker_sides,
+};  use gitcomet_core::domain::{
     Branch, CommitDetails, CommitFileChange, CommitId, CommitRefSummary, EMPTY_TREE_ID, FileEntry,
-    FileSource, FileStatusKind, LogPage, RecentCommitMessage, ReflogEntry, Remote, RemoteBranch,
-    RemoteTag, RepoStatus, StashEntry, Submodule, Tag, UpstreamDivergence, Worktree,
-};
+    FileSource, FileStatusKind, LogPage, RecentCommitMessage, RefMetadata, ReflogEntry, Remote,
+    RemoteBranch, RemoteTag, RepoStatus, StashEntry, Submodule, Tag, UpstreamDivergence, Worktree,
+    WorktreeDirtySummary,
+  };
 use gitcomet_core::error::Error;
+use gitcomet_core::merge::{MergeSource, OrderedSelection};
 use gitcomet_core::services::{InteractiveRebaseAction, InteractiveRebaseEntry};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -81,14 +84,19 @@ pub(super) fn conflict_file_loaded(
     {
         // A same-path reload stashes the previous session (see
         // `reset_conflict_target_reload_state`); it counts as the existing
-        // session for resolution restore and suppresses the on-open autosolve.
+        // session for resolution restore. Ordinary reloads suppress on-open
+        // autosolve, while the provisional CurrentOnly -> Full upgrade does not.
         let stashed_session = repo_state.conflict_state.session_pending_restore.take();
         let existing_session = repo_state
             .conflict_state
             .conflict_session
             .as_ref()
             .or(stashed_session.as_ref());
-        let fresh_open = existing_session.is_none();
+        // CurrentOnly sessions are provisional: they preserve marker-backed
+        // picks during the fast first paint, but the subsequent Full load is
+        // still the first stage-backed open and must run on-open autosolve.
+        let fresh_open =
+            existing_session.is_none_or(conflict_session_uses_provisional_stage_inputs);
         let session = conflict_session.or_else(|| match &result {
             Ok(Some(file)) => build_conflict_session(repo_state, file),
             _ => None,
@@ -99,6 +107,9 @@ pub(super) fn conflict_file_loaded(
             }
             session
         });
+        let session_is_provisional = session
+            .as_ref()
+            .is_some_and(conflict_session_uses_provisional_stage_inputs);
         let value = match result {
             Ok(v) => Loadable::Ready(v),
             Err(e) => {
@@ -112,21 +123,32 @@ pub(super) fn conflict_file_loaded(
         if keep_stashed_session {
             repo_state.conflict_state.session_pending_restore = stashed_session;
         }
-        if fresh_open && repo_state.conflict_state.conflict_session.is_some() {
+        if fresh_open
+            && !session_is_provisional
+            && repo_state.conflict_state.conflict_session.is_some()
+        {
             auto_resolve_session_on_open(repo_state, &path);
         }
     }
     Vec::new()
 }
 
-/// UI_DESIGN.md section 30 auto-solve policy: the High and Medium confidence tiers
-/// (safe rules, subchunk split, whitespace/regex normalization) apply
-/// automatically when a conflicted file first opens in the resolver. The Low
-/// tier (history merge) only ever runs behind the explicit Auto-solve action.
+/// UI_DESIGN.md section 30 auto-solve policy: only the always-safe rules
+/// (identical sides, one-side-changed) and the subchunk split apply
+/// automatically when a conflicted file first opens in the resolver.
 ///
-/// Reloads of an already-open file keep user resolutions via
+/// Whitespace-only conflicts and regex normalization are deliberately left
+/// alone, matching KDiff3: its `WhiteSpace2FileMergeDefault` /
+/// `WhiteSpace3FileMergeDefault` both default to "Manual Choice"
+/// (`e_SrcSelector::None`), so `MergeResultWindow::merge` skips
+/// `updateDefaults` for whitespace blocks, and `RunRegExpAutoMergeOnMergeStart`
+/// defaults to false. Both still run behind the explicit Auto-solve action, as
+/// does the Low tier (history merge).
+///
+/// Reloads of an already stage-backed file keep user resolutions via
 /// [`restore_conflict_session_resolutions`] and are never re-autosolved, so a
-/// region the user deliberately un-resolved stays unresolved.
+/// region the user deliberately un-resolved stays unresolved. A provisional
+/// CurrentOnly session waits to run this policy until its Full upgrade.
 fn auto_resolve_session_on_open(repo_state: &mut RepoState, path: &Path) {
     let Some(session) = repo_state.conflict_state.conflict_session.as_mut() else {
         return;
@@ -142,12 +164,13 @@ fn auto_resolve_session_on_open(repo_state: &mut RepoState, path: &Path) {
 
     let stats = super::conflict_interactions::apply_autosolve_to_session(
         session,
-        ConflictAutosolveMode::Regex,
-        true,
+        ConflictAutosolveMode::Safe,
+        false,
     );
     if stats.total_resolved() == 0 {
         return;
     }
+    session.sync_merge_plan_from_regions();
     let unresolved_after = session.unsolved_count();
     let total_after = session.total_regions();
 
@@ -156,7 +179,7 @@ fn auto_resolve_session_on_open(repo_state: &mut RepoState, path: &Path) {
         true,
         format!("telemetry.conflict_autosolve.on_open {}", path.display()),
         super::util::conflict_autosolve_telemetry_summary(
-            ConflictAutosolveMode::Regex,
+            ConflictAutosolveMode::Safe,
             Some(path),
             total_before,
             total_after,
@@ -173,10 +196,39 @@ fn restore_conflict_session_resolutions(existing: &ConflictSession, next: &mut C
         return;
     }
 
+    // Split/join rewrites the in-memory marker projection without touching the
+    // worktree until Save. If Git stages are unchanged, keep that complete
+    // structural projection across same-path watcher or explicit reloads.
+    if existing.has_pending_structural_edits
+        && existing.conflict_kind == next.conflict_kind
+        && existing.strategy == next.strategy
+        && existing.base == next.base
+        && existing.ours == next.ours
+        && existing.theirs == next.theirs
+    {
+        next.marker_projection = existing.marker_projection.clone();
+        next.regions = existing.regions.clone();
+        next.region_source_ranges = existing.region_source_ranges.clone();
+        next.merge_plan = existing.merge_plan.clone();
+        next.merge_plan_fallback = existing.merge_plan_fallback;
+        next.region_plan_blocks = existing.region_plan_blocks.clone();
+        next.has_pending_structural_edits = true;
+        return;
+    }
+
     let same_region =
         |left: &gitcomet_core::conflict_session::ConflictRegion,
          right: &gitcomet_core::conflict_session::ConflictRegion| {
             left.base == right.base && left.ours == right.ours && left.theirs == right.theirs
+        };
+    let existing_is_provisional = conflict_session_uses_provisional_stage_inputs(existing);
+    let next_has_base_source = !next.base.is_absent();
+    let matches_existing =
+        |previous: &gitcomet_core::conflict_session::ConflictRegion,
+         current: &gitcomet_core::conflict_session::ConflictRegion| {
+            (previous.base == current.base || (existing_is_provisional && previous.base.is_none()))
+                && previous.ours == current.ours
+                && previous.theirs == current.theirs
         };
 
     // The common reload case is positionally identical. Preserve every
@@ -186,13 +238,17 @@ fn restore_conflict_session_resolutions(existing: &ConflictSession, next: &mut C
             .regions
             .iter()
             .zip(next.regions.iter())
-            .all(|(left, right)| same_region(left, right))
+            .all(|(previous, current)| matches_existing(previous, current))
     {
         for (previous, current) in existing.regions.iter().zip(next.regions.iter_mut()) {
-            current.resolution = previous.resolution.clone();
+            current.resolution =
+                restored_region_resolution(previous, existing_is_provisional, next_has_base_source);
         }
+        next.sync_merge_plan_from_regions();
         return;
     }
+
+    next.restore_plan_decisions_from(existing);
 
     // When the region sequence changed, only restore identities that are
     // unique on both sides. This aligns insertions/deletions while avoiding
@@ -216,7 +272,7 @@ fn restore_conflict_session_resolutions(existing: &ConflictSession, next: &mut C
             || existing
                 .regions
                 .iter()
-                .filter(|candidate| same_region(current, candidate))
+                .filter(|candidate| matches_existing(candidate, current))
                 .take(2)
                 .count()
                 != 1
@@ -226,19 +282,141 @@ fn restore_conflict_session_resolutions(existing: &ConflictSession, next: &mut C
         let Some(found) = existing.regions.get(cursor..).and_then(|remaining| {
             remaining
                 .iter()
-                .position(|previous| same_region(previous, current))
+                .position(|previous| matches_existing(previous, current))
         }) else {
             continue;
         };
-        current.resolution = existing.regions[cursor + found].resolution.clone();
+        current.resolution = restored_region_resolution(
+            &existing.regions[cursor + found],
+            existing_is_provisional,
+            next_has_base_source,
+        );
         cursor += found + 1;
     }
+    restore_provisional_resolutions_by_source_overlap(existing, next);
+    next.sync_merge_plan_from_regions();
+}
+
+fn source_ranges_overlap(left: &std::ops::Range<usize>, right: &std::ops::Range<usize>) -> bool {
+    if left.is_empty() || right.is_empty() {
+        return left.is_empty() && right.is_empty() && left.start == right.start;
+    }
+    left.start < right.end && right.start < left.end
+}
+
+fn conflict_ranges_overlap(
+    previous: &ConflictRegionSourceRanges,
+    current: &ConflictRegionSourceRanges,
+) -> bool {
+    source_ranges_overlap(&previous.ours, &current.ours)
+        || source_ranges_overlap(&previous.theirs, &current.theirs)
+}
+
+fn source_backed_resolution(resolution: &ConflictRegionResolution) -> bool {
+    matches!(
+        resolution,
+        ConflictRegionResolution::PickBase
+            | ConflictRegionResolution::PickOurs
+            | ConflictRegionResolution::PickTheirs
+            | ConflictRegionResolution::PickBoth
+            | ConflictRegionResolution::Sources(_)
+    )
+}
+
+fn restore_provisional_resolutions_by_source_overlap(
+    existing: &ConflictSession,
+    next: &mut ConflictSession,
+) {
+    if !conflict_session_uses_provisional_stage_inputs(existing)
+        || existing.region_source_ranges.len() != existing.regions.len()
+        || next.region_source_ranges.len() != next.regions.len()
+    {
+        return;
+    }
+    let Some(marker_projection) = existing.marker_projection.as_deref() else {
+        return;
+    };
+    let (projected_ours, projected_theirs) = reconstruct_conflict_marker_sides(marker_projection);
+    let (Some(next_ours), Some(next_theirs)) = (next.ours.as_text(), next.theirs.as_text()) else {
+        return;
+    };
+    if projected_ours != next_ours || projected_theirs != next_theirs {
+        return;
+    }
+
+    let next_has_base_source = !next.base.is_absent();
+    let restored: Vec<Option<ConflictRegionResolution>> = next
+        .region_source_ranges
+        .iter()
+        .map(|current_ranges| {
+            let mut candidates = existing
+                .region_source_ranges
+                .iter()
+                .enumerate()
+                .filter(|(_, previous_ranges)| {
+                    conflict_ranges_overlap(previous_ranges, current_ranges)
+                })
+                .map(|(index, _)| &existing.regions[index]);
+            let first = candidates.next()?;
+            if !source_backed_resolution(&first.resolution) {
+                return None;
+            }
+            let decision = restored_region_resolution(first, true, next_has_base_source);
+            candidates
+                .all(|region| {
+                    source_backed_resolution(&region.resolution)
+                        && restored_region_resolution(region, true, next_has_base_source)
+                            == decision
+                })
+                .then_some(decision)
+        })
+        .collect();
+
+    for (region, restored) in next.regions.iter_mut().zip(restored) {
+        if matches!(region.resolution, ConflictRegionResolution::Unresolved)
+            && let Some(restored) = restored
+        {
+            region.resolution = restored;
+        }
+    }
+}
+
+fn restored_region_resolution(
+    previous: &gitcomet_core::conflict_session::ConflictRegion,
+    existing_is_provisional: bool,
+    next_has_base_source: bool,
+) -> ConflictRegionResolution {
+    let resolution = previous.resolution.clone();
+    if !existing_is_provisional || previous.base.is_some() || !next_has_base_source {
+        return resolution;
+    }
+
+    // A CurrentOnly two-way marker block numbers ours/theirs as A/B. A
+    // full three-source session numbers base/ours/theirs as A/B/C, so carry
+    // early ordered picks into the loaded session's source space.
+    match resolution {
+        ConflictRegionResolution::Sources(selection) => ConflictRegionResolution::Sources(
+            OrderedSelection::from_sources(selection.iter().map(|source| match source {
+                MergeSource::A => MergeSource::B,
+                MergeSource::B | MergeSource::C => MergeSource::C,
+            })),
+        ),
+        other => other,
+    }
+}
+
+fn conflict_session_uses_provisional_stage_inputs(session: &ConflictSession) -> bool {
+    session.strategy == gitcomet_core::conflict_session::ConflictResolverStrategy::FullTextResolver
+        && session.base.is_absent()
+        && session.ours.is_absent()
+        && session.theirs.is_absent()
 }
 
 /// Build a `ConflictSession` from a loaded `ConflictFile` and the current repo status.
 ///
-/// Looks up the `FileConflictKind` from the status entries and constructs
-/// a session with parsed conflict regions (for marker-based text conflicts).
+/// Looks up the `FileConflictKind` from the status entries. Full loads derive
+/// text boundaries from immutable Git stages; CurrentOnly loads use a
+/// provisional marker-backed session until those stages arrive.
 fn build_conflict_session(
     repo_state: &crate::model::RepoState,
     file: &crate::model::ConflictFile,
@@ -254,8 +432,52 @@ fn build_conflict_session(
     let ours = ConflictPayload::from_stage_parts(file.ours_bytes.clone(), file.ours.clone());
     let theirs = ConflictPayload::from_stage_parts(file.theirs_bytes.clone(), file.theirs.clone());
 
-    // If we have merged text with markers, parse regions from it.
-    if let Some(current) = file.current.as_ref() {
+    let is_binary = base.is_binary() || ours.is_binary() || theirs.is_binary();
+    let strategy = gitcomet_core::conflict_session::ConflictResolverStrategy::for_conflict(
+        conflict_kind,
+        is_binary,
+    );
+
+    if strategy == gitcomet_core::conflict_session::ConflictResolverStrategy::FullTextResolver
+        && base.is_absent()
+        && ours.is_absent()
+        && theirs.is_absent()
+    {
+        // CurrentOnly intentionally omits the immutable stages. Build a
+        // provisional session from the worktree markers so first-paint picks
+        // have real regions; the Full upgrade replaces its inputs and retains
+        // matching choices.
+        file.current.as_ref().map(|current| {
+            ConflictSession::from_merged_shared_text(
+                file.path.to_path_buf(),
+                conflict_kind,
+                base,
+                ours,
+                theirs,
+                current.clone(),
+            )
+        })
+    } else if strategy
+        == gitcomet_core::conflict_session::ConflictResolverStrategy::FullTextResolver
+    {
+        let current = file
+            .current
+            .as_ref()
+            .map(|text| ConflictPayload::Text(text.clone()))
+            .or_else(|| {
+                file.current_bytes
+                    .as_ref()
+                    .map(|bytes| ConflictPayload::Binary(bytes.clone()))
+            });
+        Some(ConflictSession::from_stage_inputs_with_current(
+            file.path.to_path_buf(),
+            conflict_kind,
+            base,
+            ours,
+            theirs,
+            current,
+        ))
+    } else if let Some(current) = file.current.as_ref() {
         Some(ConflictSession::from_merged_shared_text(
             file.path.to_path_buf(),
             conflict_kind,
@@ -304,6 +526,210 @@ pub(super) fn worktrees_loaded(
             .finish(RepoLoadsInFlight::WORKTREES)
         {
             effects.push(Effect::LoadWorktrees { repo_id });
+        }
+    }
+    effects
+}
+
+pub(super) fn worktree_dirty_loaded(
+    state: &mut AppState,
+    repo_id: RepoId,
+    result: std::result::Result<Vec<WorktreeDirtySummary>, Error>,
+) -> Vec<Effect> {
+    let mut effects = Vec::new();
+    let mut inline_refresh = None;
+    if let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) {
+        match result {
+            Ok(v) => repo_state.set_worktree_dirty(Loadable::Ready(v)),
+            // A worktree that cannot be opened (removed, on an unmounted
+            // volume) is a routine condition, not something worth a diagnostic
+            // banner -- the scan simply reports nothing for it, per worktree,
+            // inside the scan.
+            //
+            // A failure of the whole reply is a different thing: it means the
+            // scan never ran (cancelled load, repo handle gone, git runtime
+            // unavailable), not that the worktrees are clean. Overwriting a good
+            // list with it would blank every row and -- through
+            // `selected_worktree_is_gone` below -- drop the selection and close
+            // the inline diff the user is reading. Keep the last known counts on
+            // screen, and record the error only when there is nothing to keep.
+            Err(e) => {
+                if !matches!(repo_state.worktree_dirty, Loadable::Ready(_)) {
+                    // A cancelled scan is not a failure worth showing: the load
+                    // it belonged to was abandoned deliberately, and the trigger
+                    // that abandoned it queues another. Anything else is a real
+                    // failure and the pane should say so rather than sit on
+                    // `Loading` forever.
+                    let next = if matches!(e.kind(), gitcomet_core::error::ErrorKind::Cancelled) {
+                        Loadable::NotLoaded
+                    } else {
+                        Loadable::Error(e.to_string())
+                    };
+                    repo_state.set_worktree_dirty(next);
+                }
+            }
+        }
+        // A selected worktree row only exists while that worktree has changes.
+        // Once it goes clean -- committed, stashed, reverted -- or drops out of a
+        // failed scan, its row is gone, and a selection pointing at a row nothing
+        // renders leaves the details pane with nothing to show and no way back.
+        let selected_worktree_is_gone = repo_state
+            .history_state
+            .worktree_selection
+            .as_ref()
+            .is_some_and(|selected| match &repo_state.worktree_dirty {
+                Loadable::Ready(dirty) => !dirty.iter().any(|summary| &summary.path == selected),
+                // Anything else is the absence of an answer, not the answer that
+                // the row is gone. Dropping the selection on it would close the
+                // user's open diff every time a scan is cancelled.
+                _ => false,
+            });
+        if selected_worktree_is_gone {
+            repo_state.set_worktree_selection(None);
+        }
+        inline_refresh = refresh_worktree_inline_diff_entries(repo_state);
+        if repo_state
+            .loads_in_flight
+            .finish(RepoLoadsInFlight::WORKTREE_DIRTY)
+        {
+            // Rebuilt rather than repeated: the selection may have moved while
+            // the finished scan was running, and the repeat should carry the
+            // file lists of whatever is selected now.
+            effects.push(worktree_dirty_effect(repo_state));
+        }
+    }
+    // Outside the borrow above.
+    match inline_refresh {
+        // The file changed sides (staged <-> unstaged): a different target, so
+        // the pane must drop what it is showing and load the new one.
+        Some(WorktreeInlineRefresh::Reselect(ix)) => {
+            effects.extend(super::diff_selection::select_inline_submodule_diff(
+                state, repo_id, ix,
+            ));
+        }
+        // The target did not move, but this scan is the only notice we get that
+        // the file behind it may have been edited -- nothing else invalidates a
+        // linked worktree's patch.
+        Some(WorktreeInlineRefresh::Reload) => {
+            effects.extend(
+                super::diff_selection::refresh_inline_submodule_selected_diff(state, repo_id),
+            );
+        }
+        None => {}
+    }
+    effects
+}
+
+/// What a landed scan asks of the linked-worktree diff that is open over it.
+enum WorktreeInlineRefresh {
+    /// The selected file now sits at another index, under another target.
+    Reselect(usize),
+    /// The selected row still points at the same target; only its contents can
+    /// have moved.
+    Reload,
+}
+
+/// Re-resolves an open linked-worktree inline diff against a scan that has just
+/// landed.
+///
+/// The entry list is a snapshot of the worktree's changed files taken when a row
+/// was clicked, while the rows themselves are rebuilt from every scan. Left
+/// alone, a rescan that adds or removes a file shifts the row indices out from
+/// under `selected_ix`: the pane highlights whichever file now sits at that
+/// index, and steps to neighbours that may no longer be changed at all. Submodule
+/// inline diffs need none of this -- their entries come from a fixed commit.
+///
+/// Returns what the caller should do with the diff once the borrow ends. `None`
+/// when there is nothing open to refresh -- and when the file the diff shows is
+/// no longer changed, in which case the diff is closed outright, the same way a
+/// vanished row retires one.
+fn refresh_worktree_inline_diff_entries(
+    repo_state: &mut RepoState,
+) -> Option<WorktreeInlineRefresh> {
+    let (entries, selected, origin) = {
+        let inline = repo_state.diff_state.inline_submodule_diff.as_ref()?;
+        if !matches!(inline.origin, ForeignDiffOrigin::Worktree { .. }) {
+            return None;
+        }
+        let Loadable::Ready(dirty) = &repo_state.worktree_dirty else {
+            return None;
+        };
+        let summary = dirty
+            .iter()
+            .find(|summary| summary.path == inline.submodule_repo_path)?;
+        let entries = crate::model::worktree_inline_diff_entries(summary);
+        let selected = inline.entries.get(inline.selected_ix).and_then(|shown| {
+            // Matched on the whole target, not the path: a file that is staged
+            // *and* modified again appears twice, once per half, and a path-only
+            // match always resolves to the staged copy -- so the pane silently
+            // swapped sides under anyone reading the unstaged one.
+            entries
+                .iter()
+                .position(|entry| entry.target == shown.target)
+                // Only once the exact target is gone does the same path in the
+                // other half become the best answer: staging what is on screen
+                // retires its unstaged entry, and following the file there beats
+                // closing the diff.
+                .or_else(|| entries.iter().position(|entry| entry.path == shown.path))
+        });
+        // The chip labelling the diff reads `origin`, which was captured when the
+        // row was clicked. A checkout in that worktree moves the branch under it.
+        let origin = ForeignDiffOrigin::Worktree {
+            branch: summary.branch.clone(),
+            detached: summary.detached,
+        };
+        (entries, selected, origin)
+    };
+
+    let Some(selected) = selected else {
+        repo_state.diff_state.inline_submodule_diff = None;
+        repo_state.bump_diff_state_rev();
+        return None;
+    };
+
+    let inline = repo_state.diff_state.inline_submodule_diff.as_mut()?;
+    let target_moved = entries[selected].target != inline.target;
+    let changed =
+        entries != inline.entries || selected != inline.selected_ix || origin != inline.origin;
+    inline.entries = entries;
+    inline.selected_ix = selected;
+    inline.origin = origin;
+    if changed {
+        repo_state.bump_diff_state_rev();
+    }
+    Some(if target_moved {
+        WorktreeInlineRefresh::Reselect(selected)
+    } else {
+        WorktreeInlineRefresh::Reload
+    })
+}
+
+pub(super) fn ref_metadata_loaded(
+    state: &mut AppState,
+    repo_id: RepoId,
+    result: std::result::Result<Vec<(String, RefMetadata)>, Error>,
+) -> Vec<Effect> {
+    let mut effects = Vec::new();
+    if let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) {
+        let ref_metadata = match result {
+            Ok(entries) => Loadable::Ready(entries.into_iter().collect()),
+            // A backend that does not implement this will never implement it,
+            // so latch an empty map rather than `Error` — callers retry on
+            // `Error`, which would re-schedule a doomed load on every open.
+            Err(e) if matches!(e.kind(), gitcomet_core::error::ErrorKind::Unsupported(_)) => {
+                Loadable::Ready(std::collections::HashMap::new())
+            }
+            // Deliberately no diagnostic: this data only decorates picker rows,
+            // which fall back to name-only. A transient failure must not raise
+            // an error banner on every picker open.
+            Err(e) => Loadable::Error(e.to_string()),
+        };
+        repo_state.set_ref_metadata(ref_metadata);
+        if repo_state
+            .loads_in_flight
+            .finish(RepoLoadsInFlight::REF_METADATA)
+        {
+            effects.push(Effect::LoadRefMetadata { repo_id });
         }
     }
     effects
@@ -787,6 +1213,76 @@ pub(super) fn select_commit_and_load_details(
     vec![Effect::LoadCommitDetails { repo_id, commit_id }]
 }
 
+pub(super) fn select_worktree_uncommitted(
+    state: &mut AppState,
+    repo_id: RepoId,
+    path: PathBuf,
+) -> Vec<Effect> {
+    let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) else {
+        return Vec::new();
+    };
+    // Idempotent on purpose. A pending history reveal re-drives on every render
+    // of the history panel, so this message arrives once per frame for as long
+    // as pagination takes to reach the target. Re-running the body each time
+    // would bump `commit_details_rev` -- which the details pane hashes, so the
+    // repaint drives the next render -- and re-arm a full `git status` walk
+    // across every linked worktree.
+    if repo_state.history_state.worktree_selection.as_deref() == Some(path.as_path()) {
+        return Vec::new();
+    }
+    // Whatever this displaces -- another worktree's open diff, say -- is retired
+    // by `retire_orphaned_worktree_diffs` once the reducer settles.
+    repo_state.set_worktree_selection(Some(path));
+    repo_state.set_commit_details(Loadable::NotLoaded);
+
+    // Only the selected worktree's changed files are carried in state, so the row
+    // that was just selected needs a scan to fetch its own. The counts are already
+    // on screen and stay there while it runs.
+    request_worktree_dirty_effect(repo_state)
+        .into_iter()
+        .collect()
+}
+
+/// Retires an inline diff belonging to a linked worktree that is no longer the
+/// selected one.
+///
+/// The diff pane renders an inline foreign diff in preference to the diff target,
+/// so one whose worktree row is gone keeps another checkout's file -- and its
+/// origin chip -- on screen with no row left to deselect it. A worktree selection
+/// ends in more ways than it begins: switching worktrees, selecting any commit
+/// (`set_selected_commit` clears it as a side effect), clearing the selection, and
+/// a scan that no longer lists the worktree. Rather than remember all four, this
+/// runs once after every message and states the invariant directly.
+///
+/// Submodule-origin inline diffs are untouched: they never had a worktree row.
+pub(super) fn retire_orphaned_worktree_diffs(state: &mut AppState) {
+    for repo_state in &mut state.repos {
+        let selected = repo_state.history_state.worktree_selection.as_deref();
+        let orphaned = repo_state
+            .diff_state
+            .inline_submodule_diff
+            .as_ref()
+            .is_some_and(|inline| {
+                matches!(inline.origin, ForeignDiffOrigin::Worktree { .. })
+                    && Some(inline.submodule_repo_path.as_path()) != selected
+            });
+        if !orphaned {
+            continue;
+        }
+
+        // Exactly what `CloseInlineSubmoduleDiff` clears, and no more. The inline
+        // diff carries its own `diff`/`diff_file`/`diff_file_image` inside
+        // `InlineSubmoduleDiffState`, so dropping it drops every loadable it ever
+        // owned. `diff_target` and the diff-state loadables beside it belong to
+        // the commit or working-tree file selected *behind* the inline diff --
+        // opening one never touched them -- and the pane falls back to that file
+        // once the inline diff is gone. Clearing them here blanked the pane
+        // instead.
+        repo_state.diff_state.inline_submodule_diff = None;
+        repo_state.bump_diff_state_rev();
+    }
+}
+
 pub(super) fn clear_commit_selection(state: &mut AppState, repo_id: RepoId) -> Vec<Effect> {
     let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) else {
         return Vec::new();
@@ -955,6 +1451,54 @@ pub(super) fn load_reflog(state: &mut AppState, repo_id: RepoId) -> Vec<Effect> 
     } else {
         Vec::new()
     }
+}
+
+pub(super) fn load_hover_commit_message(
+    state: &mut AppState,
+    repo_id: RepoId,
+    commit_id: CommitId,
+) -> Vec<Effect> {
+    let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) else {
+        return Vec::new();
+    };
+    if !matches!(repo_state.open, Loadable::Ready(())) {
+        return Vec::new();
+    }
+    // Already showing or fetching this commit: hovering the same row again must
+    // not re-issue the read.
+    if repo_state
+        .hover_commit_message
+        .as_ref()
+        .is_some_and(|(id, state)| *id == commit_id && !matches!(state, Loadable::Error(_)))
+    {
+        return Vec::new();
+    }
+    repo_state.set_hover_commit_message(commit_id.clone(), Loadable::Loading);
+    vec![Effect::LoadHoverCommitMessage { repo_id, commit_id }]
+}
+
+pub(super) fn hover_commit_message_loaded(
+    state: &mut AppState,
+    repo_id: RepoId,
+    commit_id: CommitId,
+    result: std::result::Result<String, Error>,
+) -> Vec<Effect> {
+    if let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id)
+        // A result for a commit the pointer has already left is stale.
+        && repo_state
+            .hover_commit_message
+            .as_ref()
+            .is_some_and(|(id, _)| *id == commit_id)
+    {
+        let value = match result {
+            Ok(message) => Loadable::Ready(Arc::from(message.as_str())),
+            // Deliberately not a diagnostic: a hover that loses its race with a
+            // background fetch is not something to tell the user about.
+            Err(e) => Loadable::Error(e.to_string()),
+        };
+        repo_state.set_hover_commit_message(commit_id, value);
+    }
+    Vec::new()
 }
 
 pub(super) fn load_recent_commit_messages(
@@ -1142,6 +1686,87 @@ pub(super) fn load_worktrees(state: &mut AppState, repo_id: RepoId) -> Vec<Effec
     }
 }
 
+pub(super) fn load_worktree_dirty(state: &mut AppState, repo_id: RepoId) -> Vec<Effect> {
+    let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) else {
+        return Vec::new();
+    };
+    if !matches!(repo_state.open, Loadable::Ready(())) {
+        return Vec::new();
+    }
+    // Unlike the other loaders this one does not flip to `Loading`: the counts
+    // stay on screen while a rescan runs, so a window-focus refresh does not
+    // blank the rows it is about to redraw identically.
+    if repo_state
+        .loads_in_flight
+        .request(RepoLoadsInFlight::WORKTREE_DIRTY)
+    {
+        vec![worktree_dirty_effect(repo_state)]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Queues a rescan of the other worktrees' uncommitted changes, if one is not
+/// already running. Returns `None` when a scan is in flight, so callers can
+/// fire this from several triggers without stacking up repeated full scans.
+///
+/// The watcher-driven trigger fires on every git-state flush, and a full scan
+/// runs `status` on every other worktree, so what bounds the cost is worth
+/// spelling out. First, what does *not* reach here: `.git/index` is classified
+/// as `RepoExternalChange::Index`, not `git_state` (`repo_monitor.rs`,
+/// `is_git_index_path`), so the common edit-stage-unstage loop -- which writes
+/// nothing else -- costs no scan at all. A linked worktree's own index sits at
+/// `.git/worktrees/<name>/index` and is deliberately outside that test, so
+/// changes there do still arrive as git-state and do still earn a scan.
+/// Then, for what does reach here: the monitor debounces raw events at 250ms
+/// with a 2s ceiling
+/// (`repo_monitor.rs`), and `request` admits at most one scan in flight plus one
+/// queued. A storm therefore costs one scan at a time, never a growing queue,
+/// and always ends with one trailing scan — dropping the queued repeat instead
+/// would be cheaper but could leave the counts stale after the last event.
+/// There is deliberately no time-based throttle here: this reducer has no clock,
+/// and the ones that do (window focus, `view/mod.rs`) ride their own.
+pub(super) fn request_worktree_dirty_effect(repo_state: &mut RepoState) -> Option<Effect> {
+    if !matches!(repo_state.open, Loadable::Ready(())) {
+        return None;
+    }
+    repo_state
+        .loads_in_flight
+        .request(RepoLoadsInFlight::WORKTREE_DIRTY)
+        .then(|| worktree_dirty_effect(repo_state))
+}
+
+/// The scan effect, aimed at whichever worktree row is selected.
+///
+/// Built in one place so every trigger -- watcher flush, window focus, selecting
+/// a row -- asks for the file lists of the worktree that is actually on screen,
+/// and for counts alone everywhere else.
+pub(super) fn worktree_dirty_effect(repo_state: &RepoState) -> Effect {
+    Effect::LoadWorktreeDirty {
+        repo_id: repo_state.id,
+        workdir: repo_state.spec.workdir.clone(),
+        files_for: repo_state.history_state.worktree_selection.clone(),
+    }
+}
+
+pub(super) fn load_ref_metadata(state: &mut AppState, repo_id: RepoId) -> Vec<Effect> {
+    let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) else {
+        return Vec::new();
+    };
+    if !matches!(repo_state.open, Loadable::Ready(())) {
+        return Vec::new();
+    }
+    repo_state.set_ref_metadata(Loadable::Loading);
+    if repo_state
+        .loads_in_flight
+        .request(RepoLoadsInFlight::REF_METADATA)
+    {
+        vec![Effect::LoadRefMetadata { repo_id }]
+    } else {
+        Vec::new()
+    }
+}
+
 pub(super) fn load_submodules(state: &mut AppState, repo_id: RepoId) -> Vec<Effect> {
     let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) else {
         return Vec::new();
@@ -1171,10 +1796,94 @@ pub(super) fn load_file_browser(
     if !matches!(repo_state.open, Loadable::Ready(())) {
         return Vec::new();
     }
-    repo_state.file_browser.source = source.clone();
-    repo_state.file_browser.entries = Loadable::Loading;
+    let source_changed = repo_state.file_browser.source != source;
+    repo_state.file_browser.source = source;
+    // Blank the tree only when there is nothing worth keeping: rows from another
+    // source would be actively wrong, but a same-source refresh can leave them up.
+    if source_changed || !matches!(repo_state.file_browser.entries, Loadable::Ready(_)) {
+        repo_state.file_browser.entries = Loadable::Loading;
+    }
     repo_state.file_browser.bump_rev();
-    vec![Effect::LoadFileBrowser { repo_id, source }]
+    request_file_browser_load(repo_state).into_iter().collect()
+}
+
+/// Expand every directory on the way to `path` so the file explorer can show it.
+///
+/// Also clears the search query: the filtered view builds its rows from matches
+/// and force-expands their ancestors, ignoring `expanded_dirs` entirely, so a
+/// reveal into a filtered tree would scroll to a row index that does not mean
+/// what the caller computed.
+pub(super) fn reveal_file_browser_path(
+    state: &mut AppState,
+    repo_id: RepoId,
+    path: PathBuf,
+) -> Vec<Effect> {
+    let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) else {
+        return Vec::new();
+    };
+    // `ancestors()` yields the path itself first — skip it, a file is not a
+    // directory to expand — and stops before the empty root component.
+    for ancestor in path.ancestors().skip(1) {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        repo_state
+            .file_browser
+            .expanded_dirs
+            .insert(Arc::new(ancestor.to_path_buf()));
+    }
+    if !repo_state.file_browser.search_query.is_empty() {
+        repo_state.file_browser.search_query.clear();
+    }
+    repo_state.file_browser.bump_rev();
+    Vec::new()
+}
+
+/// Whether a query actually filters the file tree, and so force-expands every
+/// directory and ignores `expanded_dirs`.
+///
+/// The search input is multiline and stores what was typed verbatim, so a lone
+/// space is a non-empty query that filters nothing. Mirrors the view's
+/// `file_browser_search_is_active`.
+fn file_browser_query_filters(query: &str) -> bool {
+    query.lines().any(|line| !line.trim().is_empty())
+}
+
+fn file_browser_is_filtered(repo_state: &RepoState) -> bool {
+    file_browser_query_filters(&repo_state.file_browser.search_query)
+}
+
+#[cfg(test)]
+mod file_browser_filter_tests {
+    use super::file_browser_query_filters;
+
+    /// The same table the view asserts in
+    /// `file_browser_search_predicate_agrees_with_the_renderers_matchers`.
+    /// The predicate lives in both crates and cannot be shared, so the two
+    /// tables are what keep them from drifting: change one, change both.
+    ///
+    /// Calls the real predicate rather than restating it: a copy here would
+    /// stay green through exactly the drift it exists to catch.
+    #[test]
+    fn filtered_predicate_matches_the_views_table() {
+        for (query, expected) in [
+            ("", false),
+            (" ", false),
+            ("\n", false),
+            ("  \n \t ", false),
+            ("a", true),
+            (" a ", true),
+            ("a\nb", true),
+            ("\na", true),
+            ("#comment", true),
+        ] {
+            assert_eq!(
+                file_browser_query_filters(query),
+                expected,
+                "disagreement for {query:?}"
+            );
+        }
+    }
 }
 
 pub(super) fn toggle_file_browser_dir(
@@ -1183,12 +1892,76 @@ pub(super) fn toggle_file_browser_dir(
     path: PathBuf,
 ) -> Vec<Effect> {
     if let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) {
+        // A filtered tree renders every directory expanded and never reads
+        // `expanded_dirs`, so a toggle here would move nothing on screen and
+        // then silently reshape the tree the moment the search was cleared.
+        if file_browser_is_filtered(repo_state) {
+            return Vec::new();
+        }
         let path = Arc::new(path);
         if repo_state.file_browser.expanded_dirs.contains(&path) {
             repo_state.file_browser.expanded_dirs.remove(&path);
         } else {
             repo_state.file_browser.expanded_dirs.insert(path);
         }
+        repo_state.file_browser.bump_rev();
+    }
+    Vec::new()
+}
+
+/// Expand or collapse `path` and every directory under it.
+///
+/// The backend enumerates the whole tree in one pass, so every descendant is
+/// already in `entries` and this needs no loading. `starts_with` on the flat
+/// list also covers `path` itself, which is what makes "Expand all under here"
+/// open the folder it was invoked on.
+pub(super) fn set_file_browser_dir_expanded_recursive(
+    state: &mut AppState,
+    repo_id: RepoId,
+    path: PathBuf,
+    expanded: bool,
+) -> Vec<Effect> {
+    // `Path::starts_with("")` is true of every path, so an empty path would
+    // reach the whole tree and a collapse would wipe `expanded_dirs` outright.
+    // The branch-group sibling guards this the same way.
+    if path.as_os_str().is_empty() {
+        return Vec::new();
+    }
+    let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) else {
+        return Vec::new();
+    };
+    // Frozen while a search filters the tree, for the same reason a single
+    // toggle is.
+    if file_browser_is_filtered(repo_state) {
+        return Vec::new();
+    }
+    let Loadable::Ready(entries) = &repo_state.file_browser.entries else {
+        return Vec::new();
+    };
+
+    // Cloning the Arc releases the borrow on `file_browser` so `expanded_dirs`
+    // can be written while the entry list is walked.
+    let entries = Arc::clone(entries);
+    let mut changed = false;
+    for entry in entries.iter() {
+        if entry.kind != gitcomet_core::domain::FileEntryKind::Directory
+            || !entry.path.starts_with(&path)
+        {
+            continue;
+        }
+        // Each entry already owns its path as an `Arc`, so expanding reuses it
+        // rather than allocating a second copy per directory.
+        changed |= if expanded {
+            repo_state
+                .file_browser
+                .expanded_dirs
+                .insert(Arc::clone(&entry.path))
+        } else {
+            repo_state.file_browser.expanded_dirs.remove(&entry.path)
+        };
+    }
+
+    if changed {
         repo_state.file_browser.bump_rev();
     }
     Vec::new()
@@ -1208,6 +1981,16 @@ pub(super) fn set_file_browser_search(
     Vec::new()
 }
 
+pub(super) fn request_file_browser_load(repo_state: &mut RepoState) -> Option<Effect> {
+    repo_state
+        .loads_in_flight
+        .request(RepoLoadsInFlight::FILE_BROWSER)
+        .then(|| Effect::LoadFileBrowser {
+            repo_id: repo_state.id,
+            source: repo_state.file_browser.source.clone(),
+        })
+}
+
 pub(super) fn set_file_browser_source(
     state: &mut AppState,
     repo_id: RepoId,
@@ -1216,12 +1999,13 @@ pub(super) fn set_file_browser_source(
     if let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id)
         && repo_state.file_browser.source != source
     {
-        repo_state.file_browser.source = source.clone();
+        repo_state.file_browser.source = source;
         repo_state.file_browser.entries = Loadable::NotLoaded;
         repo_state.file_browser.expanded_dirs.clear();
         repo_state.file_browser.search_query.clear();
+        repo_state.file_browser.stale = false;
         repo_state.file_browser.bump_rev();
-        return vec![Effect::LoadFileBrowser { repo_id, source }];
+        return request_file_browser_load(repo_state).into_iter().collect();
     }
     Vec::new()
 }
@@ -1233,13 +2017,9 @@ pub(super) fn set_sidebar_mode(state: &mut AppState, mode: SidebarMode) -> Vec<E
         if mode == SidebarMode::Files
             && let Some(repo_id) = state.active_repo
             && let Some(repo) = state.repos.iter_mut().find(|r| r.id == repo_id)
-            && matches!(
-                repo.file_browser.entries,
-                Loadable::NotLoaded | Loadable::Error(_)
-            )
+            && repo.file_browser.needs_load()
         {
-            let source = repo.file_browser.source.clone();
-            return vec![Effect::LoadFileBrowser { repo_id, source }];
+            return request_file_browser_load(repo).into_iter().collect();
         }
     }
     Vec::new()
@@ -1320,10 +2100,18 @@ pub(super) fn file_browser_loaded(
     source: FileSource,
     result: std::result::Result<Vec<FileEntry>, gitcomet_core::error::Error>,
 ) -> Vec<Effect> {
-    if let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) {
-        if repo_state.file_browser.source != source {
-            return Vec::new();
-        }
+    let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) else {
+        return Vec::new();
+    };
+
+    // Release the lane before the stale-source guard: a reply for a source the
+    // user has already navigated away from still ends the walk that was running,
+    // and the request queued behind it is the one that matters now.
+    let has_pending = repo_state
+        .loads_in_flight
+        .finish(RepoLoadsInFlight::FILE_BROWSER);
+
+    if repo_state.file_browser.source == source {
         repo_state.file_browser.entries = match result {
             Ok(v) => Loadable::Ready(Arc::new(v)),
             Err(e) => {
@@ -1331,7 +2119,15 @@ pub(super) fn file_browser_loaded(
                 Loadable::Error(e.to_string())
             }
         };
+        repo_state.file_browser.stale = false;
         repo_state.file_browser.bump_rev();
+    }
+
+    if has_pending {
+        return vec![Effect::LoadFileBrowser {
+            repo_id,
+            source: repo_state.file_browser.source.clone(),
+        }];
     }
     Vec::new()
 }
@@ -1879,6 +2675,65 @@ pub(super) fn squash_rebase_setup_loaded(
         // Automated squash rebase — no editor window; reports as "Rebase".
         interactive: false,
     }]
+}
+
+/// Start revealing a commit referenced from elsewhere.
+///
+/// The reference is remembered and resolved off-thread. Selecting only happens
+/// once it resolves, so a reference that turns out to be a build id or a Gerrit
+/// change id never sends the log walking.
+pub(super) fn reveal_commit(
+    state: &mut AppState,
+    repo_id: RepoId,
+    reference: CommitId,
+) -> Vec<Effect> {
+    let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) else {
+        return Vec::new();
+    };
+    repo_state.set_reveal_target(Some(reference.clone()));
+    vec![Effect::ResolveCommitForReveal { repo_id, reference }]
+}
+
+pub(super) fn finish_commit_reveal(state: &mut AppState, repo_id: RepoId) -> Vec<Effect> {
+    if let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) {
+        repo_state.set_reveal_target(None);
+    }
+    Vec::new()
+}
+
+pub(super) fn commit_reveal_resolved(
+    state: &mut AppState,
+    repo_id: RepoId,
+    reference: CommitId,
+    result: std::result::Result<CommitDetails, Error>,
+) -> Vec<Effect> {
+    let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) else {
+        return Vec::new();
+    };
+    // A reply for a reveal the user has already left behind.
+    if repo_state.history_state.reveal_target.as_ref() != Some(&reference) {
+        return Vec::new();
+    }
+
+    let details = match result {
+        Ok(details) => details,
+        Err(e) => {
+            repo_state.set_reveal_target(None);
+            push_notification(
+                state,
+                crate::model::AppNotificationKind::Warning,
+                format!("Could not find commit {reference}: {e}"),
+            );
+            return Vec::new();
+        }
+    };
+
+    // Publish the details before selecting: the selection path then sees them
+    // already loaded and does not ask git for the same commit twice.
+    let commit_id = details.id.clone();
+    repo_state.set_reveal_target(Some(commit_id.clone()));
+    repo_state.set_commit_details(Loadable::Ready(Arc::new(details)));
+    select_commit(state, repo_id, commit_id)
 }
 
 pub(super) fn commit_details_loaded(
@@ -3659,6 +4514,49 @@ mod tests {
     }
 
     #[test]
+    fn reveal_file_browser_path_expands_every_ancestor_and_clears_the_search() {
+        let mut state = AppState::default();
+        let repo_id = RepoId(1);
+        state.repos.push(RepoState::new_opening(
+            repo_id,
+            RepoSpec {
+                workdir: PathBuf::from("/tmp/repo"),
+            },
+        ));
+        state.repos[0].file_browser.search_query = "main".to_string();
+        let rev_before = state.repos[0].file_browser.file_browser_rev;
+
+        reveal_file_browser_path(
+            &mut state,
+            repo_id,
+            PathBuf::from("crates/gitcomet-ui-gpui/src/main.rs"),
+        );
+
+        let expanded = &state.repos[0].file_browser.expanded_dirs;
+        for dir in [
+            "crates",
+            "crates/gitcomet-ui-gpui",
+            "crates/gitcomet-ui-gpui/src",
+        ] {
+            assert!(
+                expanded.contains(&Arc::new(PathBuf::from(dir))),
+                "{dir} must be expanded so the file's row is visible"
+            );
+        }
+        assert!(
+            !expanded.contains(&Arc::new(PathBuf::from(
+                "crates/gitcomet-ui-gpui/src/main.rs"
+            ))),
+            "the file itself is not a directory to expand"
+        );
+        assert!(
+            state.repos[0].file_browser.search_query.is_empty(),
+            "a filtered tree builds its rows from matches, so the search has to go"
+        );
+        assert_ne!(state.repos[0].file_browser.file_browser_rev, rev_before);
+    }
+
+    #[test]
     fn toggle_file_browser_dir_expands_and_collapses() {
         let repo_id = RepoId(1);
         let mut state = new_state_with_repo(repo_id);
@@ -3755,7 +4653,19 @@ mod tests {
                 .any(|e| matches!(e, Effect::LoadFileBrowser { .. }))
         );
 
-        repo_mut(&mut state, repo_id).file_browser.entries = Loadable::Ready(Arc::new(Vec::new()));
+        // Each phase has to deliver its reply the way the executor does, or the
+        // in-flight lane coalesces the next request away.
+        file_browser_loaded(
+            &mut state,
+            repo_id,
+            FileSource::WorkingDirectory,
+            Ok(Vec::new()),
+        );
+        assert!(matches!(
+            repo_mut(&mut state, repo_id).file_browser.entries,
+            Loadable::Ready(_)
+        ));
+
         set_sidebar_mode(&mut state, SidebarMode::Branches);
         let effects = set_sidebar_mode(&mut state, SidebarMode::Files);
         assert!(
@@ -3764,7 +4674,14 @@ mod tests {
                 .any(|e| matches!(e, Effect::LoadFileBrowser { .. }))
         );
 
-        repo_mut(&mut state, repo_id).file_browser.entries = Loadable::Error("fail".to_string());
+        file_browser_loaded(
+            &mut state,
+            repo_id,
+            FileSource::WorkingDirectory,
+            Err(gitcomet_core::error::Error::new(
+                gitcomet_core::error::ErrorKind::Backend("fail".to_string()),
+            )),
+        );
         set_sidebar_mode(&mut state, SidebarMode::Branches);
         let effects = set_sidebar_mode(&mut state, SidebarMode::Files);
         assert!(

@@ -78,6 +78,7 @@ actions!(
         TerminalSelectAll,
         ToggleCommandPalette,
         CommandPaletteDismiss,
+        LocateFileInExplorer,
     ]
 );
 
@@ -94,11 +95,17 @@ pub(crate) fn is_diff_shortcut_candidate(keystroke: &gpui::Keystroke) -> bool {
             && !mods.control
             && !mods.platform
             && !mods.function
-            && matches!(key, "i" | "s" | "w" | "up" | "down" | "left" | "right"))
+            && matches!(
+                key,
+                "e" | "i" | "s" | "w" | "up" | "down" | "left" | "right"
+            ))
         || ((mods.control || mods.platform)
             && !mods.alt
             && !mods.function
-            && matches!(key, "a" | "c" | "e" | "s" | "d" | "h" | "u"))
+            && matches!(
+                key,
+                "1" | "2" | "3" | "a" | "c" | "e" | "s" | "d" | "h" | "u"
+            ))
         || (matches!(key, "a" | "b" | "c" | "d") && no_command_modifiers)
 }
 
@@ -140,6 +147,8 @@ mod chrome;
 pub(crate) mod clone_progress;
 mod color;
 mod command_palette;
+mod commit_message_hover;
+mod commit_message_text;
 pub(crate) mod components;
 mod conflict_markers;
 pub(crate) mod conflict_resolver;
@@ -214,6 +223,7 @@ pub(in crate::view) use terminal_preferences::{
 };
 use word_diff::{capped_word_diff_ranges, capped_word_diff_ranges_for_file_diff_texts};
 
+use commit_message_hover::{CommitMessageHoverHost, CommitMessageHoverState};
 #[cfg(test)]
 use diff_text_model::CachedDiffTextSegment;
 use diff_text_model::{CachedDiffStyledText, SyntaxTokenKind};
@@ -279,6 +289,48 @@ const ERROR_BANNER_OVERFLOW_HINT_MIN_CHARS: usize = 240;
 
 const HISTORY_GRAPH_COL_GAP_PX: f32 = 16.0;
 const HISTORY_GRAPH_MARGIN_X_PX: f32 = 10.0;
+/// Corner radius where a graph line turns between columns. Against a 16px column
+/// pitch and a 14px half-row this leaves roughly a 10px straight horizontal run
+/// per column crossed and 8px of straight vertical below the corner, so the turn
+/// reads as a corner rather than as a diagonal.
+const HISTORY_GRAPH_ELBOW_RADIUS_PX: f32 = 6.0;
+
+/// Width of the lane-coloured wash at the right edge of the graph column. It
+/// fades from transparent into the border on the message cell, tying a commit's
+/// dot to its message.
+const HISTORY_GRAPH_FADE_WIDTH_PX: f32 = 44.0;
+/// Alpha the fade reaches where it meets the message border. Deliberately faint:
+/// it runs behind the lane strokes on every row, so anything stronger reads as a
+/// selection highlight.
+const HISTORY_GRAPH_FADE_ALPHA: f32 = 0.10;
+/// Below this much ref-column width the hover branch badge is dropped rather
+/// than truncated to an unreadable stub.
+const HISTORY_BRANCH_BADGE_MIN_W_PX: f32 = 34.0;
+/// Alpha of the hover branch badge. Faint by design -- it is an on-demand hint
+/// in a column that otherwise holds solid ref chips, and must not read as one.
+const HISTORY_BRANCH_BADGE_ALPHA: f32 = 0.70;
+/// Width of the lane-coloured border down the left edge of the message cell.
+const HISTORY_MESSAGE_BORDER_W_PX: f32 = 3.0;
+/// Vertical inset of that border, so consecutive rows read as separate borders
+/// rather than as one continuous stripe down the list.
+const HISTORY_MESSAGE_BORDER_INSET_Y_PX: f32 = 3.0;
+/// Gap between that border and the message text.
+const HISTORY_MESSAGE_BORDER_GAP_PX: f32 = 6.0;
+
+/// Left offset of the message text inside its cell, in design px.
+///
+/// With the lane border shown the text clears the border by a fixed gap rather
+/// than using the cell's own padding — the border would otherwise sit almost
+/// against the text. Shared by the commit rows, which paint their text on a
+/// canvas, and the two uncommitted-changes rows, which lay theirs out as
+/// elements, so the three cannot drift apart.
+const fn history_message_text_left_px(show_graph_color_marker: bool) -> f32 {
+    if show_graph_color_marker {
+        HISTORY_MESSAGE_BORDER_W_PX + HISTORY_MESSAGE_BORDER_GAP_PX
+    } else {
+        HISTORY_COL_HANDLE_PX / 2.0
+    }
+}
 
 const PANE_RESIZE_HANDLE_PX: f32 = 8.0;
 const PANE_COLLAPSED_PX: f32 = 34.0;
@@ -298,7 +350,10 @@ const TOAST_FADE_OUT_MS: u64 = 220;
 const TOAST_SLIDE_PX: f32 = 12.0;
 const TERMINAL_PANEL_DEFAULT_HEIGHT_PX: f32 = 220.0;
 const TERMINAL_PANEL_RESIZE_HANDLE_PX: f32 = 6.0;
+pub(crate) const WEBSITE_URL: &str = "https://gitcomet.dev";
 pub(crate) const EDITIONS_URL: &str = "https://gitcomet.dev/#editions";
+pub(crate) const RELEASES_URL: &str = "https://github.com/Auto-Explore/GitComet/releases";
+pub(crate) const DISCORD_URL: &str = "https://discord.com/invite/2ufDGP8RnA";
 
 pub(in crate::view) fn restrict_scroll_to_vertical_axis<E: Styled>(mut element: E) -> E {
     element.style().restrict_scroll_to_axis = Some(true);
@@ -307,17 +362,21 @@ pub(in crate::view) fn restrict_scroll_to_vertical_axis<E: Styled>(mut element: 
 
 // Only use these wrappers for views that remain mounted while their parent is mounted.
 // Parent-controlled mount/unmount boundaries, like collapsible panes, must rebuild their child.
-fn stable_cached_view<V: Render>(view: Entity<V>, style: StyleRefinement) -> AnyView {
+fn stable_cached_view<V: Render>(view: Entity<V>, style: StyleRefinement) -> AnyElement {
     let view = AnyView::from(view);
     // GPUI's cached mount path skips some test-only debug bounds and paint tracking.
-    if cfg!(test) { view } else { view.cached(style) }
+    if cfg!(test) {
+        view.into_any_element()
+    } else {
+        view.cached(style).into_any_element()
+    }
 }
 
-fn stable_cached_fill_view<V: Render>(view: Entity<V>) -> AnyView {
+fn stable_cached_fill_view<V: Render>(view: Entity<V>) -> AnyElement {
     stable_cached_view(view, StyleRefinement::default().size_full())
 }
 
-fn stable_cached_fixed_height_view<V: Render>(view: Entity<V>, height: Pixels) -> AnyView {
+fn stable_cached_fixed_height_view<V: Render>(view: Entity<V>, height: Pixels) -> AnyElement {
     stable_cached_view(
         view,
         StyleRefinement::default().w_full().h(height).flex_none(),
@@ -703,6 +762,7 @@ impl GitCometView {
             "decrease-ui-scale" => cx.defer(|cx| cx.dispatch_action(&DecreaseUiScale)),
             "reset-ui-scale" => cx.defer(|cx| cx.dispatch_action(&ResetUiScale)),
             "close-window" => cx.defer(|cx| cx.dispatch_action(&CloseWindow)),
+            "locate-file-in-explorer" => self.locate_open_file_in_explorer(cx),
             "open-repository" => cx.defer(|cx| cx.dispatch_action(&OpenRepository)),
             "switch-repository" => {
                 if let Some(window) = window {
@@ -778,6 +838,7 @@ impl GitCometView {
                             repo_id,
                             target,
                             source_selectable: true,
+                            name_prefix: String::new(),
                         },
                         window,
                         cx,
@@ -1143,6 +1204,28 @@ impl GitCometView {
         });
     }
 
+    pub(in crate::view) fn show_commit_message_hover(
+        &mut self,
+        next: CommitMessageHoverState,
+        pointer: Point<Pixels>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        // Same reasoning as the refs hover: the history canvas listens for
+        // mouse-move at the window level, so it still fires under an open
+        // overlay and the card would surface on top of it.
+        if self.is_overlay_open(cx) {
+            self.dismiss_commit_message_hover(cx);
+            return;
+        }
+        self.commit_message_hover_host
+            .update(cx, |host, cx| host.show(next, pointer, cx));
+    }
+
+    pub(in crate::view) fn dismiss_commit_message_hover(&mut self, cx: &mut gpui::Context<Self>) {
+        self.commit_message_hover_host
+            .update(cx, |host, cx| host.dismiss(cx));
+    }
+
     pub(in crate::view) fn close_history_refs_hover(&mut self, cx: &mut gpui::Context<Self>) {
         self.history_refs_hover_host
             .update(cx, |host, cx| host.close(cx));
@@ -1343,6 +1426,7 @@ impl GitCometView {
         let diff_reveal_whitespace_chars = ui_session.diff_reveal_whitespace_chars.unwrap_or(false);
         let diff_word_wrap = ui_session.diff_word_wrap.unwrap_or(false);
         let diff_show_line_numbers = ui_session.diff_show_line_numbers.unwrap_or(true);
+        let auto_save_file_edits = ui_session.auto_save_file_edits.unwrap_or(false);
         let commit_push_after_enabled = ui_session.commit_push_after_enabled.unwrap_or(false);
         let restored_change_tracking_height = ui_session.change_tracking_height;
         let restored_untracked_height = ui_session.untracked_height;
@@ -1352,6 +1436,8 @@ impl GitCometView {
         let history_show_date = ui_session.history_show_date.unwrap_or(true);
         let history_show_sha = ui_session.history_show_sha.unwrap_or(false);
         let history_relative_dates = ui_session.history_relative_dates.unwrap_or(true);
+        let history_highlight_commit_chain =
+            ui_session.history_highlight_commit_chain.unwrap_or(true);
         let history_show_tags = ui_session.history_show_tags.unwrap_or(true);
         let history_tag_fetch_mode = ui_session.history_tag_fetch_mode.unwrap_or_default();
         let default_tag_type = ui_session.default_tag_type.unwrap_or_default();
@@ -1442,6 +1528,9 @@ impl GitCometView {
         let toast_host = cx.new(|_cx| ToastHost::new(initial_theme, weak_view.clone()));
         let history_refs_hover_host =
             cx.new(|_cx| HistoryRefsHoverHost::new(initial_theme, weak_view.clone()));
+        let commit_message_hover_host = cx.new(|_cx| {
+            CommitMessageHoverHost::new(initial_theme, Arc::clone(&store), ui_model.clone())
+        });
         let repo_tabs_bar = cx.new(|cx| {
             RepoTabsBarView::new(
                 Arc::clone(&store),
@@ -1484,6 +1573,7 @@ impl GitCometView {
                 timezone,
                 show_timezone,
                 history_relative_dates,
+                history_highlight_commit_chain,
                 diff_scroll_sync,
                 diff_content_mode,
                 diff_whitespace_mode,
@@ -1492,6 +1582,7 @@ impl GitCometView {
                 diff_reveal_whitespace_chars,
                 diff_word_wrap,
                 diff_show_line_numbers,
+                auto_save_file_edits,
                 history_show_graph,
                 history_show_author,
                 history_show_date,
@@ -1565,6 +1656,7 @@ impl GitCometView {
                 details_pane.clone(),
                 sidebar_pane.clone(),
                 ui_session.repo_sidebar_pinned_branches.clone(),
+                ui_session.repo_sidebar_collapsed_items.clone(),
                 window,
                 cx,
             )
@@ -1583,6 +1675,12 @@ impl GitCometView {
         let activation_subscription = cx.observe_window_activation(window, |this, window, cx| {
             let now = Instant::now();
             if !window.is_window_active() {
+                // Leaving the app is one of the two moments auto-save has to
+                // mean more than "after a pause": the pending timer would
+                // otherwise fire against a window the user has already left,
+                // and an external edit to the same file could land first.
+                this.main_pane
+                    .update(cx, |pane, cx| pane.flush_file_editor_buffer(cx));
                 // Capture the focused element before the platform blur() fires and clears it.
                 // This is the restore target when opening the palette via a global hotkey while
                 // this window is in the background.
@@ -1612,6 +1710,13 @@ impl GitCometView {
             if let Some(msg) =
                 repo_activation_msg(&this.state, &mut this.last_repo_activation_dispatch_at, now)
             {
+                // Other worktrees have no watcher of their own — the repo
+                // monitor only flushes for the active repo — so coming back to
+                // the window is the moment their uncommitted-change counts get
+                // reconciled. Rides the same throttle as the activation refresh.
+                if let Some(repo_id) = this.state.active_repo {
+                    this.store.dispatch(Msg::LoadWorktreeDirty { repo_id });
+                }
                 this.store.dispatch(msg);
             }
         });
@@ -1784,6 +1889,7 @@ impl GitCometView {
             tooltip_host,
             toast_host,
             history_refs_hover_host,
+            commit_message_hover_host,
             popover_host,
             command_palette,
             command_palette_open: false,
@@ -1821,6 +1927,7 @@ impl GitCometView {
             diff_reveal_whitespace_chars,
             diff_word_wrap,
             diff_show_line_numbers,
+            auto_save_file_edits,
             ui_scale_percent: ui_scale.percent,
             open_repo_panel: false,
             open_repo_input,
@@ -1844,6 +1951,8 @@ impl GitCometView {
             pane_resize: None,
             last_mouse_pos: point(px(0.0), px(0.0)),
             pending_terminal_shutdown_prompt: None,
+            pending_unsaved_file_edits_prompt: None,
+            pending_unsaved_file_edits_flush: None,
             pending_quit_other_views: Vec::new(),
             pending_pull_reconcile_prompt: None,
             pending_force_delete_branch_prompt: None,
@@ -1918,6 +2027,8 @@ impl GitCometView {
             .update(cx, |host, cx| host.set_theme(theme, cx));
         self.history_refs_hover_host
             .update(cx, |host, cx| host.set_theme(theme, cx));
+        self.commit_message_hover_host
+            .update(cx, |host, cx| host.set_theme(theme, cx));
         self.popover_host
             .update(cx, |host, cx| host.set_theme(theme, cx));
         self.command_palette
@@ -1958,6 +2069,19 @@ impl GitCometView {
             .update(cx, |_input, cx| cx.notify());
         self.auth_prompt_secret_input
             .update(cx, |_input, cx| cx.notify());
+        cx.notify();
+    }
+
+    /// Repaint the panes that show which files have unsaved editor buffers.
+    ///
+    /// The main pane owns those buffers and the sidebar draws them, and the two
+    /// are separate entities with no store snapshot between them to carry the
+    /// change — so the pane that changed it says so, here.
+    pub(in crate::view) fn notify_unsaved_file_edits_changed(
+        &mut self,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.sidebar_pane.update(cx, |_pane, cx| cx.notify());
         cx.notify();
     }
 
@@ -2352,6 +2476,37 @@ impl GitCometView {
             .update(cx, |pane, cx| pane.set_diff_show_line_numbers(next, cx));
     }
 
+    /// Show the file the main pane has open in the sidebar's file explorer,
+    /// expanding the folders on the way to it and scrolling it into view.
+    ///
+    /// Switches the sidebar to Files when it is showing Branches — the action is
+    /// reachable from the menu, the palette and a shortcut, so the tree it acts
+    /// on may not even be visible.
+    pub(crate) fn locate_open_file_in_explorer(&mut self, cx: &mut gpui::Context<Self>) {
+        if self.sidebar_collapsed {
+            self.set_sidebar_collapsed(false, cx);
+        }
+        self.sidebar_pane
+            .update(cx, |pane, cx| pane.locate_open_file(cx));
+        cx.notify();
+    }
+
+    /// Mirrors the settings window's auto-save toggle into the pane that owns
+    /// the file editor. The main window never writes this back (the settings
+    /// window is the only writer), so there is no persist call here.
+    pub(in crate::view) fn set_auto_save_file_edits(
+        &mut self,
+        next: bool,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.auto_save_file_edits == next {
+            return;
+        }
+        self.auto_save_file_edits = next;
+        self.main_pane
+            .update(cx, |pane, cx| pane.set_auto_save_file_edits(next, cx));
+    }
+
     pub(in crate::view) fn set_history_column_preferences(
         &mut self,
         show_graph: bool,
@@ -2370,6 +2525,17 @@ impl GitCometView {
         self.main_pane
             .update(cx, |pane, cx| pane.reset_history_column_widths(cx));
         self.schedule_ui_settings_persist(cx);
+    }
+
+    pub(in crate::view) fn set_history_highlight_commit_chain(
+        &mut self,
+        enabled: bool,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.main_pane.update(cx, |pane, cx| {
+            pane.set_history_highlight_commit_chain(enabled, cx);
+        });
+        cx.notify();
     }
 
     pub(in crate::view) fn set_history_relative_dates(
@@ -2799,7 +2965,7 @@ impl GitCometView {
                 id,
                 components::ResizeGripAxis::Vertical,
                 dragging,
-                idle_line.then_some(theme.colors.border_variant),
+                idle_line.then_some(theme.colors.stroke.subtle),
             ))
             .on_drag(handle, |_handle, _offset, _window, cx| {
                 cx.new(|_cx| PaneResizeDragGhost)
@@ -3078,8 +3244,8 @@ impl GitCometView {
 
     fn auth_prompt_banner_colors(theme: AppTheme) -> (gpui::Rgba, gpui::Rgba) {
         (
-            with_alpha(theme.colors.accent, 0.15),
-            with_alpha(theme.colors.accent, 0.3),
+            with_alpha(theme.colors.accent.foreground, 0.15),
+            with_alpha(theme.colors.accent.foreground, 0.3),
         )
     }
 
@@ -3398,6 +3564,19 @@ impl Render for GitCometView {
             );
         }
 
+        if let Some(prompt) = self.pending_unsaved_file_edits_prompt.take() {
+            let anchor = point(
+                self.last_window_size.width / 2.0,
+                self.last_window_size.height / 2.0,
+            );
+            self.open_popover_at(
+                PopoverKind::UnsavedFileEditsConfirm(prompt),
+                anchor,
+                window,
+                cx,
+            );
+        }
+
         if let Some(prompt) = self.pending_terminal_shutdown_prompt.take() {
             let anchor = point(
                 self.last_window_size.width / 2.0,
@@ -3507,7 +3686,7 @@ impl Render for GitCometView {
                 weight: gpui::FontWeight::default(),
                 style: gpui::FontStyle::default(),
             })
-            .text_color(theme.colors.text)
+            .text_color(theme.colors.foreground.primary)
             // Any click anywhere hides visible tooltips (both gpui-managed
             // bubbles and the canvas-driven TooltipHost overlay).
             .capture_any_mouse_down(cx.listener(|this, _e: &MouseDownEvent, _window, cx| {
@@ -3515,6 +3694,8 @@ impl Render for GitCometView {
                 this.tooltip_host.update(cx, |host, cx| {
                     host.clear_tooltip(cx);
                 });
+                this.commit_message_hover_host
+                    .update(cx, |host, cx| host.dismiss(cx));
             }));
 
         if show_custom_window_chrome {
@@ -3573,9 +3754,21 @@ impl Render for GitCometView {
                     .relative()
                     .px_2()
                     .py_1()
-                    .bg(with_alpha(theme.colors.warning, 0.13))
+                    // Light's `status.*.background` is a saturated cream that
+                    // reads as a coloured card rather than a notification. The
+                    // status colour stays in the border; the panel is neutral,
+                    // like the toasts and the progress shell.
+                    .bg(if theme.is_dark {
+                        with_alpha(theme.colors.status.warning.foreground, 0.13)
+                    } else {
+                        theme.colors.surface.raised
+                    })
                     .border_1()
-                    .border_color(with_alpha(theme.colors.warning, 0.30))
+                    .border_color(if theme.is_dark {
+                        with_alpha(theme.colors.status.warning.foreground, 0.30)
+                    } else {
+                        theme.colors.status.warning.border
+                    })
                     .rounded(px(theme.radii.panel))
                     .child(
                         div()
@@ -3591,7 +3784,7 @@ impl Render for GitCometView {
                             .child(
                                 div()
                                     .text_sm()
-                                    .text_color(theme.colors.text_muted)
+                                    .text_color(theme.colors.foreground.secondary)
                                     .child(
                                         "Would you like to contribute by reporting issue to GitComet GitHub repository?",
                                     ),
@@ -3599,7 +3792,7 @@ impl Render for GitCometView {
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(theme.colors.text_muted)
+                                    .text_color(theme.colors.foreground.secondary)
                                     .child(format!("Summary: {summary}")),
                             )
                             .child(
@@ -3670,7 +3863,7 @@ impl Render for GitCometView {
                 .child(
                     div()
                         .text_sm()
-                        .text_color(theme.colors.text_muted)
+                        .text_color(theme.colors.foreground.secondary)
                         .child(subtitle),
                 )
                 .when(requires_username, |this| {
@@ -3681,7 +3874,7 @@ impl Render for GitCometView {
                     this.child(
                         div()
                             .text_xs()
-                            .text_color(theme.colors.text_muted)
+                            .text_color(theme.colors.foreground.secondary)
                             .child("Use Cancel if you do not trust this host."),
                     )
                 })
@@ -3696,7 +3889,7 @@ impl Render for GitCometView {
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(theme.colors.text_muted)
+                                .text_color(theme.colors.foreground.secondary)
                                 .child(prompt.reason.clone()),
                         ),
                     )
@@ -3750,7 +3943,7 @@ impl Render for GitCometView {
             let dismiss = components::Button::new("repo_error_banner_close", "")
                 .start_slot(svg_icon(
                     "icons/generic_close.svg",
-                    theme.colors.text_muted,
+                    theme.colors.foreground.secondary,
                     px(12.0),
                 ))
                 .style(components::ButtonStyle::Transparent)
@@ -3763,7 +3956,7 @@ impl Render for GitCometView {
                     .id("repo_error_banner_command")
                     .font_family(crate::font_preferences::EDITOR_MONOSPACE_FONT_FAMILY)
                     .bg(with_alpha(
-                        theme.colors.window_bg,
+                        theme.colors.surface.canvas,
                         if theme.is_dark { 0.28 } else { 0.75 },
                     ))
                     .rounded(px(theme.radii.row))
@@ -3778,9 +3971,17 @@ impl Render for GitCometView {
                     .px_2()
                     .py_1()
                     .pr(px(40.0))
-                    .bg(with_alpha(theme.colors.danger, 0.15))
+                    .bg(if theme.is_dark {
+                        with_alpha(theme.colors.status.danger.foreground, 0.15)
+                    } else {
+                        theme.colors.surface.raised
+                    })
                     .border_1()
-                    .border_color(with_alpha(theme.colors.danger, 0.3))
+                    .border_color(if theme.is_dark {
+                        with_alpha(theme.colors.status.danger.foreground, 0.3)
+                    } else {
+                        theme.colors.status.danger.border
+                    })
                     .rounded(px(theme.radii.panel))
                     .child(
                         restrict_scroll_to_vertical_axis(
@@ -3805,7 +4006,7 @@ impl Render for GitCometView {
                             div()
                                 .mt_1()
                                 .text_xs()
-                                .text_color(theme.colors.text_muted)
+                                .text_color(theme.colors.foreground.secondary)
                                 .child("Scroll for full output"),
                         )
                     })
@@ -3816,7 +4017,7 @@ impl Render for GitCometView {
         let mut root = div()
             .size_full()
             .cursor(cursor)
-            .text_color(theme.colors.text);
+            .text_color(theme.colors.foreground.primary);
         root = root.relative();
         root = root.child(UiScaleScrollCapture { view: cx.entity() });
         root = root
@@ -3834,6 +4035,10 @@ impl Render for GitCometView {
                     return;
                 }
                 this.toggle_command_palette(window, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &LocateFileInExplorer, _window, cx| {
+                this.locate_open_file_in_explorer(cx);
                 cx.stop_propagation();
             }))
             .on_action(cx.listener(|this, _: &CommandPaletteDismiss, window, cx| {
@@ -3935,6 +4140,8 @@ impl Render for GitCometView {
             this.last_mouse_pos = e.position;
             this.history_refs_hover_host
                 .update(cx, |host, cx| host.on_mouse_moved(e.position, cx));
+            this.commit_message_hover_host
+                .update(cx, |host, cx| host.on_mouse_moved(e.position, cx));
             this.tooltip_host
                 .update(cx, |tooltip, cx| tooltip.on_mouse_moved(e.position, cx));
 
@@ -4010,6 +4217,7 @@ impl Render for GitCometView {
             .size_full()
             .child(self.command_palette.clone())
             .child(stable_overlay_view(self.history_refs_hover_host.clone()))
+            .child(stable_overlay_view(self.commit_message_hover_host.clone()))
             .child(stable_overlay_view(self.popover_host.clone()))
             .child(stable_overlay_view(self.toast_host.clone()))
             .child(stable_overlay_view(self.tooltip_host.clone()));

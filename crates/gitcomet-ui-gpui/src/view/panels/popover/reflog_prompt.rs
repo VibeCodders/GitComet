@@ -41,6 +41,29 @@ fn reflog_match_text(entry: &gitcomet_core::domain::ReflogEntry) -> String {
     format!("{} {} {}", entry.selector, short, entry.message)
 }
 
+/// The reflog rows for `query` plus the layout filtering produced for them,
+/// so the rendered list and keyboard navigation stay in lockstep (the same
+/// derivation [`super::search_inputs::scroll_reflog_to_row`] scrolls by).
+pub(super) fn rendered_rows(
+    this: &PopoverHost,
+    repo_id: RepoId,
+    query: &str,
+) -> (Vec<components::PickerPromptItem>, components::PickerPromptLayout) {
+    let Some(repo) = this.state.repos.iter().find(|r| r.id == repo_id) else {
+        return (Vec::new(), components::PickerPromptLayout::default());
+    };
+    let Loadable::Ready(entries) = &repo.reflog else {
+        return (Vec::new(), components::PickerPromptLayout::default());
+    };
+    let items = entries
+        .iter()
+        .enumerate()
+        .map(|(ix, e)| reflog_item(e, ix == 0))
+        .collect::<Vec<_>>();
+    let layout = components::picker_prompt_layout(&items, query);
+    (items, layout)
+}
+
 /// The entry indices that survive the current query, in display order. Kept in
 /// lockstep with the search subscription so the footer's reset actions target
 /// the same row the selection highlight sits on.
@@ -126,7 +149,7 @@ fn reflog_footer(
 
     div()
         .border_t_1()
-        .border_color(theme.colors.border)
+        .border_color(theme.colors.stroke.default)
         .px(scaled_px(8.0))
         .py(scaled_px(6.0))
         .flex()
@@ -135,7 +158,7 @@ fn reflog_footer(
         .child(
             div()
                 .text_xs()
-                .text_color(theme.colors.text_muted)
+                .text_color(theme.colors.foreground.secondary)
                 .child(summary),
         )
         .child(
@@ -147,7 +170,7 @@ fn reflog_footer(
                 .child(
                     div()
                         .text_xs()
-                        .text_color(theme.colors.text_muted)
+                        .text_color(theme.colors.foreground.secondary)
                         .child("Reset HEAD to here"),
                 )
                 .child(
@@ -199,7 +222,7 @@ pub(super) fn panel(
                     col.child(
                         div()
                             .text_xs()
-                            .text_color(theme.colors.text_muted)
+                            .text_color(theme.colors.foreground.secondary)
                             .line_height(scaled_px(14.0))
                             .child(format!("{count} entries")),
                     )
@@ -250,15 +273,18 @@ pub(super) fn panel(
                 .iter()
                 .map(|e| (e.index, e.new_id.clone()))
                 .collect();
-            let items = owned_entries
-                .iter()
-                .enumerate()
-                .map(|(ix, e)| reflog_item(e, ix == 0))
-                .collect::<Vec<_>>();
+            let query = this
+                .reflog_search_input
+                .as_ref()
+                .map(|input| input.read(cx).text().trim().to_string())
+                .unwrap_or_default();
+            let (items, layout) = rendered_rows(this, repo_id, &query);
+            let layout = std::rc::Rc::new(layout);
+            let items: std::rc::Rc<[components::PickerPromptItem]> = items.into();
 
             let picker = match this.reflog_search_input.clone() {
                 Some(search) => components::PickerPrompt::new(search, this.picker_prompt_scroll.clone())
-                    .items(items)
+                    .prebuilt_items(items, layout)
                     .tooltip_host(this.tooltip_host.clone())
                     .empty_text("No reflog entries")
                     .max_height(scaled_px(340.0))
@@ -304,7 +330,7 @@ pub(super) fn panel(
             .flex_col()
             .w(width.preferred_px(ui_scale))
             .child(header)
-            .child(div().border_t_1().border_color(theme.colors.border))
+            .child(div().border_t_1().border_color(theme.colors.stroke.default))
             .child(body),
     )
 }

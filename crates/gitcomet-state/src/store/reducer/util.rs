@@ -668,14 +668,53 @@ pub(super) fn refresh_primary_effects(repo_state: &mut RepoState) -> Vec<Effect>
     effects
 }
 
+/// The request for a fresh first page of `repo_state`'s history, under whatever
+/// scope and author filter it currently has.
+pub(super) fn first_page_log_request(repo_state: &RepoState) -> crate::model::PendingLogLoad {
+    crate::model::PendingLogLoad {
+        scope: repo_state.history_state.history_scope,
+        author: repo_state.history_state.history_author_filter.clone(),
+        limit: DEFAULT_LOG_PAGE_SIZE,
+        cursor: None,
+    }
+}
+
+/// Requests `load` and returns the effect that starts it, or `None` when it was
+/// coalesced into a walk already in flight. The effect carries the sequence
+/// number the request was given, which is how its replies are recognised.
+pub(super) fn request_log_effect(
+    repo_state: &mut RepoState,
+    load: crate::model::PendingLogLoad,
+) -> Option<Effect> {
+    let repo_id = repo_state.id;
+    let seq = repo_state.loads_in_flight.request_log(load.clone())?;
+    let crate::model::PendingLogLoad {
+        scope,
+        author,
+        limit,
+        cursor,
+    } = load;
+    Some(Effect::LoadLog {
+        repo_id,
+        seq,
+        scope,
+        author,
+        limit,
+        cursor,
+    })
+}
+
 pub(super) fn append_refresh_primary_effects(
     repo_state: &mut RepoState,
     effects: &mut impl EffectAccumulator,
 ) {
     let repo_id = repo_state.id;
-    let scope = repo_state.history_state.history_scope;
+    let log_request = first_page_log_request(repo_state);
 
-    if repo_state.loads_in_flight.request_primary_refresh_batch() {
+    if let Some(seq) = repo_state
+        .loads_in_flight
+        .request_primary_refresh_batch(log_request.clone())
+    {
         repo_state.set_log_loading_more(false);
         effects.push_effect(Effect::LoadHeadBranch { repo_id });
         effects.push_effect(Effect::LoadUpstreamDivergence { repo_id });
@@ -683,10 +722,11 @@ pub(super) fn append_refresh_primary_effects(
         effects.push_effect(Effect::LoadStatus { repo_id });
         effects.push_effect(Effect::LoadLog {
             repo_id,
-            scope,
-            author: repo_state.history_state.history_author_filter.clone(),
-            limit: DEFAULT_LOG_PAGE_SIZE,
-            cursor: None,
+            seq,
+            scope: log_request.scope,
+            author: log_request.author,
+            limit: log_request.limit,
+            cursor: log_request.cursor,
         });
         return;
     }
@@ -705,22 +745,11 @@ pub(super) fn append_refresh_primary_effects(
     }
     append_requested_rebase_and_merge_refresh_effects(repo_state, effects);
     append_requested_status_refresh_effects(repo_state, effects);
-    if repo_state.loads_in_flight.request_log(
-        scope,
-        repo_state.history_state.history_author_filter.clone(),
-        DEFAULT_LOG_PAGE_SIZE,
-        None,
-    ) {
+    if let Some(effect) = request_log_effect(repo_state, log_request) {
         // Block pagination while a refresh log load is in flight, to avoid concurrent LogLoaded
         // merges with different cursors.
         repo_state.set_log_loading_more(false);
-        effects.push_effect(Effect::LoadLog {
-            repo_id,
-            scope,
-            author: repo_state.history_state.history_author_filter.clone(),
-            limit: DEFAULT_LOG_PAGE_SIZE,
-            cursor: None,
-        });
+        effects.push_effect(effect);
     }
 }
 
@@ -763,20 +792,10 @@ pub(super) fn append_refresh_full_effects(
         effects.push_effect(Effect::LoadUpstreamDivergence { repo_id });
     }
     append_requested_status_refresh_effects(repo_state, effects);
-    if repo_state.loads_in_flight.request_log(
-        repo_state.history_state.history_scope,
-        repo_state.history_state.history_author_filter.clone(),
-        DEFAULT_LOG_PAGE_SIZE,
-        None,
-    ) {
+    let log_request = first_page_log_request(repo_state);
+    if let Some(effect) = request_log_effect(repo_state, log_request) {
         repo_state.set_log_loading_more(false);
-        effects.push_effect(Effect::LoadLog {
-            repo_id,
-            scope: repo_state.history_state.history_scope,
-            author: repo_state.history_state.history_author_filter.clone(),
-            limit: DEFAULT_LOG_PAGE_SIZE,
-            cursor: None,
-        });
+        effects.push_effect(effect);
     }
     if repo_state
         .loads_in_flight
@@ -1103,6 +1122,7 @@ fn summarize_command(
             RepoCommandKind::SetUpstreamBranch { .. } => "Set as tracking upstream",
             RepoCommandKind::UnsetUpstreamBranch { .. } => "Unlink upstream branch",
             RepoCommandKind::DeleteRemoteBranch { .. } => "Delete remote branch",
+            RepoCommandKind::DeleteRemoteBranches { .. } => "Delete remote branches",
             RepoCommandKind::PushTag { .. } => "Push tag",
             RepoCommandKind::DeleteRemoteTag { .. } => "Delete remote tag",
             RepoCommandKind::Reset { .. } => "Reset",
@@ -1135,6 +1155,7 @@ fn summarize_command(
             RepoCommandKind::CheckoutConflictBase { .. } => "Checkout base",
             RepoCommandKind::LaunchMergetool { .. } => "Mergetool",
             RepoCommandKind::SaveWorktreeFile { .. } => "Save file",
+            RepoCommandKind::AppendGitignorePatterns { .. } => "Update .gitignore",
             RepoCommandKind::ExportPatch { .. } | RepoCommandKind::ApplyPatch { .. } => "Patch",
             RepoCommandKind::AddWorktree { .. }
             | RepoCommandKind::RemoveWorktree { .. }
@@ -1280,6 +1301,10 @@ fn summarize_command(
         RepoCommandKind::DeleteRemoteBranch { remote, branch } => {
             format!("Remote branch {remote}/{branch}: Deleted")
         }
+        RepoCommandKind::DeleteRemoteBranches { remote, branches } => {
+            let noun = crate::name_summary::branch_noun(branches.len());
+            format!("{} remote {noun} on {remote}: Deleted", branches.len())
+        }
         RepoCommandKind::PushTag { remote, name } => {
             if output.stderr.contains("Everything up-to-date") {
                 format!("Tag {name} → {remote}: Already up-to-date")
@@ -1308,6 +1333,23 @@ fn summarize_command(
                 format!("Saved and staged → {}", path.display())
             } else {
                 format!("Saved → {}", path.display())
+            }
+        }
+        // Deliberately "added to .gitignore" rather than "ignored": a later
+        // negation, a nested .gitignore or .git/info/exclude can still win, and
+        // promising an outcome we did not verify would be a lie the user only
+        // catches when the file stays in the list.
+        // The worker skips the write when every pattern is already there, and
+        // announcing "Added …" for a run that changed nothing would send the
+        // user looking for a file that has not moved.
+        RepoCommandKind::AppendGitignorePatterns { patterns } => {
+            if output.stdout.trim() == gitcomet_core::gitignore::NOTHING_TO_ADD {
+                "Already in .gitignore; nothing added".to_string()
+            } else {
+                match patterns.as_slice() {
+                    [pattern] => format!("Added {pattern} to .gitignore"),
+                    patterns => format!("Added {} patterns to .gitignore", patterns.len()),
+                }
             }
         }
         RepoCommandKind::Reset { mode, target } => {
@@ -2116,6 +2158,13 @@ mod tests {
                 "Delete remote branch",
             ),
             (
+                RepoCommandKind::DeleteRemoteBranches {
+                    remote: "origin".into(),
+                    branches: vec!["feat/a".into(), "feat/b".into()],
+                },
+                "Delete remote branches",
+            ),
+            (
                 RepoCommandKind::PushTag {
                     remote: "origin".into(),
                     name: "v1".into(),
@@ -2202,6 +2251,43 @@ mod tests {
             None,
         );
         assert_eq!(fetch_summary, "Fetch: Synchronized");
+
+        let gitignore_command = RepoCommandKind::AppendGitignorePatterns {
+            patterns: vec!["/build/out.log".to_string()],
+        };
+        let (_, gitignore_written) = summarize_command(
+            &gitignore_command,
+            &command_output("Update .gitignore", "", ""),
+            true,
+            None,
+        );
+        assert_eq!(gitignore_written, "Added /build/out.log to .gitignore");
+
+        let (_, gitignore_noop) = summarize_command(
+            &gitignore_command,
+            &command_output(
+                "Update .gitignore",
+                gitcomet_core::gitignore::NOTHING_TO_ADD,
+                "",
+            ),
+            true,
+            None,
+        );
+        assert_eq!(
+            gitignore_noop, "Already in .gitignore; nothing added",
+            "the worker skipped the write, so announcing \"Added …\" would send \
+             the user looking for a change that never happened"
+        );
+
+        let (_, gitignore_many) = summarize_command(
+            &RepoCommandKind::AppendGitignorePatterns {
+                patterns: vec!["/a".to_string(), "/b".to_string()],
+            },
+            &command_output("Update .gitignore", "", ""),
+            true,
+            None,
+        );
+        assert_eq!(gitignore_many, "Added 2 patterns to .gitignore");
 
         let (_, pull_up_to_date) = summarize_command(
             &RepoCommandKind::Pull {
@@ -2515,22 +2601,6 @@ mod tests {
             "Current branch already has all the changes from the cherry-picked commit."
         );
 
-        let (_, range_summary) = summarize_command(
-            &RepoCommandKind::CherryPickRangeOntoNewBranch {
-                base: "main".into(),
-                range: "main".into(),
-                source: "feature".into(),
-                new_branch: "feature-copy".into(),
-            },
-            &command_output("git cherry-pick 3 commits onto feature-copy", "", ""),
-            true,
-            None,
-        );
-        assert_eq!(
-            range_summary,
-            "Cherry-picked feature onto main as feature-copy: Completed"
-        );
-
         let (_, merge_abort_summary) = summarize_command(
             &RepoCommandKind::MergeAbort,
             &command_output("git merge --abort", "", ""),
@@ -2735,5 +2805,36 @@ mod tests {
 
         clear_staged_git_auth_env();
         assert!(gitcomet_core::auth::take_staged_git_auth().is_none());
+    }
+}
+
+#[cfg(test)]
+mod delete_remote_branches_summary_tests {
+    use super::*;
+    use gitcomet_core::services::CommandOutput;
+
+    fn summary_for(branches: Vec<String>) -> String {
+        let (_message, summary) = super::summarize_command(
+            &RepoCommandKind::DeleteRemoteBranches {
+                remote: "origin".into(),
+                branches,
+            },
+            &CommandOutput::empty_success("git push --delete"),
+            true,
+            None,
+        );
+        summary
+    }
+
+    #[test]
+    fn summary_pluralises_on_the_branch_count() {
+        assert_eq!(
+            summary_for(vec!["feat/a".into()]),
+            "1 remote branch on origin: Deleted"
+        );
+        assert_eq!(
+            summary_for(vec!["feat/a".into(), "feat/b".into()]),
+            "2 remote branches on origin: Deleted"
+        );
     }
 }

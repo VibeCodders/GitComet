@@ -6,6 +6,7 @@ use gpui::{
     App, Bounds, ContentMask, DispatchPhase, HighlightStyle, Pixels, Styled, TextRun, TextStyle,
     Window, fill, point, px, size,
 };
+use palette::IntoColor;
 use rustc_hash::FxHasher;
 use std::cell::RefCell;
 use std::hash::{Hash, Hasher};
@@ -30,6 +31,21 @@ pub(super) struct ConflictChunkContext {
     pub(super) conflict_ix: usize,
     pub(super) has_base: bool,
     pub(super) selected_choices: Vec<conflict_resolver::ConflictChoice>,
+}
+
+/// KDiff3 manual diff help: what one source-column row offers to a manual
+/// alignment. Alt+click marks the line; Alt+Shift+click extends the mark.
+///
+/// Marking works on context rows too, not just inside conflict blocks — the
+/// whole point of a manual alignment is to pin lines the automatic alignment
+/// placed apart.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct AlignmentMarkContext {
+    pub(super) column: ThreeWayColumn,
+    /// Line in this column's own file. Padding rows have none and cannot be
+    /// marked, since there is no line there to pin.
+    pub(super) side_line: Option<usize>,
+    pub(super) marked: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -95,7 +111,7 @@ pub(super) fn split_conflict_row_canvas(
                     point(divider_x, prepaint.handle_bounds.top()),
                     size(px(1.0), prepaint.handle_bounds.size.height),
                 ),
-                theme.colors.border,
+                theme.colors.stroke.default,
             ));
 
             if show_line_numbers {
@@ -108,7 +124,7 @@ pub(super) fn split_conflict_row_canvas(
                             &left_line_no,
                             left_gutter.left() + pad,
                             y,
-                            theme.colors.text_muted,
+                            theme.colors.foreground.secondary,
                             line_metrics,
                             window,
                             cx,
@@ -124,15 +140,15 @@ pub(super) fn split_conflict_row_canvas(
                             &right_line_no,
                             right_gutter.left() + pad,
                             y,
-                            theme.colors.text_muted,
+                            theme.colors.foreground.secondary,
                             line_metrics,
                             window,
                             cx,
                         );
                     },
                 );
-                paint_gutter_divider(left_gutter, pad, theme.colors.border, window);
-                paint_gutter_divider(right_gutter, pad, theme.colors.border, window);
+                paint_gutter_divider(left_gutter, pad, theme.colors.stroke.default, window);
+                paint_gutter_divider(right_gutter, pad, theme.colors.stroke.default, window);
             }
 
             let left_text_bounds =
@@ -282,13 +298,17 @@ pub(super) fn single_column_conflict_canvas(
     chunk_context: Option<ConflictChunkContext>,
     chunk_menu_prefix: &'static str,
     is_three_way: bool,
+    semantic_nav_target: Option<usize>,
     active_conflict_marker: bool,
     // section 30 split: `Some(selected)` enables drag selection on this row
     // (`selected` paints the highlight); `None` disables it.
     row_selection: Option<bool>,
+    // kdiff3 manual diff help: `Some` enables Alt+click marking on this row.
+    alignment_mark: Option<AlignmentMarkContext>,
 ) -> AnyElement {
     let prepared = prepare_conflict_text_for_canvas(text, styled, reveal_whitespace_chars);
     let row_selected = row_selection == Some(true);
+    let alignment_marked = alignment_mark.is_some_and(|mark| mark.marked);
 
     keyed_canvas(
         (id_prefix, visible_row_ix),
@@ -307,7 +327,23 @@ pub(super) fn single_column_conflict_canvas(
             if row_selected {
                 window.paint_quad(fill(
                     bounds,
-                    with_alpha(theme.colors.accent, if theme.is_dark { 0.20 } else { 0.14 }),
+                    with_alpha(
+                        theme.colors.accent.foreground,
+                        if theme.is_dark { 0.20 } else { 0.14 },
+                    ),
+                ));
+            }
+
+            // kdiff3 manual diff help: marked lines use the warning hue so they
+            // stay distinguishable from an accent-tinted split selection, which
+            // can be active in the same columns at the same time.
+            if alignment_marked {
+                window.paint_quad(fill(
+                    bounds,
+                    with_alpha(
+                        theme.colors.status.warning.foreground,
+                        if theme.is_dark { 0.22 } else { 0.16 },
+                    ),
                 ));
             }
 
@@ -325,7 +361,7 @@ pub(super) fn single_column_conflict_canvas(
                     ),
                     gpui::size(px(3.0), bounds.size.height),
                 );
-                window.paint_quad(fill(bar, theme.colors.accent));
+                window.paint_quad(fill(bar, theme.colors.accent.foreground));
             }
 
             if show_line_numbers {
@@ -338,14 +374,14 @@ pub(super) fn single_column_conflict_canvas(
                             &line_no,
                             gutter_bounds.left() + pad,
                             y,
-                            theme.colors.text_muted,
+                            theme.colors.foreground.secondary,
                             line_metrics,
                             window,
                             cx,
                         );
                     },
                 );
-                paint_gutter_divider(gutter_bounds, pad, theme.colors.border, window);
+                paint_gutter_divider(gutter_bounds, pad, theme.colors.stroke.default, window);
             }
 
             let text_bounds = split_column_text_bounds(bounds, pad, gap, show_line_numbers);
@@ -362,6 +398,52 @@ pub(super) fn single_column_conflict_canvas(
                     paint_conflict_text(text_bounds, fg, y, line_metrics, &prepared, window, cx);
                 },
             );
+
+            // kdiff3 manual diff help: Alt+click marks this line for the next
+            // Ctrl+Y. Registered outside the conflict-block handler below so
+            // context rows can be marked too.
+            if let Some(mark) = alignment_mark
+                && let Some(side_line) = mark.side_line
+            {
+                let visible = bounds.intersect(&clip_bounds);
+                let view = view.clone();
+                window.on_mouse_event(move |event: &gpui::MouseDownEvent, phase, _window, cx| {
+                    if phase != DispatchPhase::Bubble
+                        || event.button != gpui::MouseButton::Left
+                        || !event.modifiers.alt
+                        || !visible.contains(&event.position)
+                    {
+                        return;
+                    }
+                    view.update(cx, |this, cx| {
+                        this.conflict_resolver_mark_alignment_line(
+                            mark.column,
+                            side_line,
+                            event.modifiers.shift,
+                            cx,
+                        );
+                    });
+                });
+            }
+
+            if chunk_context.is_none()
+                && let Some(target_index) = semantic_nav_target
+            {
+                let visible = bounds.intersect(&clip_bounds);
+                let view = view.clone();
+                window.on_mouse_event(move |event: &gpui::MouseDownEvent, phase, _window, cx| {
+                    if phase != DispatchPhase::Bubble
+                        || event.button != gpui::MouseButton::Left
+                        || event.modifiers.alt
+                        || !visible.contains(&event.position)
+                    {
+                        return;
+                    }
+                    view.update(cx, |this, cx| {
+                        this.conflict_jump_to_nav_target(target_index, cx);
+                    });
+                });
+            }
 
             if let Some(chunk_context) = chunk_context.clone() {
                 let visible = bounds.intersect(&clip_bounds);
@@ -398,6 +480,11 @@ pub(super) fn single_column_conflict_canvas(
                             return;
                         }
                         if event.button == gpui::MouseButton::Left {
+                            // Alt+click belongs to the manual-alignment handler
+                            // above; it must not also start a split drag.
+                            if event.modifiers.alt {
+                                return;
+                            }
                             let conflict_ix = chunk_context.conflict_ix;
                             view.update(cx, |this, cx| {
                                 if row_selection.is_some() {
@@ -795,17 +882,17 @@ fn paint_gutter_text(
         return;
     }
     let mut style = diff_text_style(window);
-    style.color = color.into();
+    style.color = color.into_color();
     let key = {
         let mut hasher = FxHasher::default();
         text.as_ref().hash(&mut hasher);
         metrics.font_size.hash(&mut hasher);
         style.font_family.hash(&mut hasher);
         style.font_weight.hash(&mut hasher);
-        color.r.to_bits().hash(&mut hasher);
-        color.g.to_bits().hash(&mut hasher);
-        color.b.to_bits().hash(&mut hasher);
-        color.a.to_bits().hash(&mut hasher);
+        color.red.to_bits().hash(&mut hasher);
+        color.green.to_bits().hash(&mut hasher);
+        color.blue.to_bits().hash(&mut hasher);
+        color.alpha.to_bits().hash(&mut hasher);
         hasher.finish()
     };
 
@@ -846,7 +933,7 @@ fn paint_conflict_text(
     }
 
     let mut base_style = diff_text_style(window);
-    base_style.color = fg.into();
+    base_style.color = fg.into_color();
     base_style.white_space = gpui::WhiteSpace::Nowrap;
     base_style.text_overflow = None;
 
@@ -931,10 +1018,10 @@ fn conflict_layout_key(
     metrics.font_size.hash(&mut hasher);
     base_style.font_family.hash(&mut hasher);
     base_style.font_weight.hash(&mut hasher);
-    fg.r.to_bits().hash(&mut hasher);
-    fg.g.to_bits().hash(&mut hasher);
-    fg.b.to_bits().hash(&mut hasher);
-    fg.a.to_bits().hash(&mut hasher);
+    fg.red.to_bits().hash(&mut hasher);
+    fg.green.to_bits().hash(&mut hasher);
+    fg.blue.to_bits().hash(&mut hasher);
+    fg.alpha.to_bits().hash(&mut hasher);
     hasher.finish()
 }
 

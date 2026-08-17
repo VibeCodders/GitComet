@@ -5,9 +5,11 @@ use std::rc::Rc;
 
 pub(super) const CLIENT_SIDE_DECORATION_INSET_PX: f32 = 10.0;
 pub(super) const TITLE_BAR_HEIGHT_PX: f32 = 38.0;
-/// Empty title-bar width kept beside repository tabs so the window always has
-/// an easy-to-hit drag surface, even when the tab strip overflows.
-const REPO_TABS_TRAILING_DRAG_WIDTH_PX: f32 = 64.0;
+/// Empty title-bar width kept beside repository tabs so a full tab strip still
+/// leaves somewhere to grab the window. Deliberately near the smallest usable
+/// grab target: every pixel here is width the tab strip can never use, so it
+/// narrows tabs before the bar is even full.
+const REPO_TABS_TRAILING_DRAG_WIDTH_PX: f32 = 24.0;
 const MACOS_TRAFFIC_LIGHTS_SAFE_INSET_PX: f32 = 78.0;
 #[cfg(test)]
 pub(super) const CLIENT_SIDE_DECORATION_INSET: Pixels = px(CLIENT_SIDE_DECORATION_INSET_PX);
@@ -182,10 +184,10 @@ pub(super) fn titlebar_control_button(
 
 fn mix(mut a: gpui::Rgba, b: gpui::Rgba, t: f32) -> gpui::Rgba {
     let t = t.clamp(0.0, 1.0);
-    a.r = a.r + (b.r - a.r) * t;
-    a.g = a.g + (b.g - a.g) * t;
-    a.b = a.b + (b.b - a.b) * t;
-    a.a = a.a + (b.a - a.a) * t;
+    a.red = a.red + (b.red - a.red) * t;
+    a.green = a.green + (b.green - a.green) * t;
+    a.blue = a.blue + (b.blue - a.blue) * t;
+    a.alpha = a.alpha + (b.alpha - a.alpha) * t;
     a
 }
 
@@ -199,11 +201,11 @@ fn lighten(color: gpui::Rgba, amount: f32) -> gpui::Rgba {
 pub(in crate::view) fn title_bar_background(theme: AppTheme, window_is_active: bool) -> gpui::Rgba {
     if window_is_active {
         lighten(
-            theme.colors.surface_bg,
+            theme.colors.surface.panel,
             if theme.is_dark { 0.06 } else { 0.03 },
         )
     } else {
-        theme.colors.surface_bg
+        theme.colors.surface.panel
     }
 }
 
@@ -258,9 +260,12 @@ pub(in crate::view) fn client_frame_corner_rounding(
 
 fn window_frame_outline_color(theme: AppTheme) -> gpui::Rgba {
     if cfg!(target_os = "macos") {
-        with_alpha(theme.colors.border, if theme.is_dark { 0.96 } else { 0.90 })
+        with_alpha(
+            theme.colors.stroke.default,
+            if theme.is_dark { 0.96 } else { 0.90 },
+        )
     } else {
-        theme.colors.border
+        theme.colors.stroke.default
     }
 }
 
@@ -442,12 +447,23 @@ impl Render for TitleBarView {
                 .upgrade()
                 .is_some_and(|root| show_titlebar_repo_tabs(root.read(cx).view_mode));
         let app_menu_open = self.app_menu_open;
-        let app_menu_open_bg =
-            with_alpha(theme.colors.accent, if theme.is_dark { 0.30 } else { 0.24 });
-        let app_menu_open_active_bg =
-            with_alpha(theme.colors.accent, if theme.is_dark { 0.48 } else { 0.38 });
+        let app_menu_open_bg = with_alpha(
+            theme.colors.accent.foreground,
+            if theme.is_dark { 0.30 } else { 0.24 },
+        );
+        let app_menu_open_active_bg = with_alpha(
+            theme.colors.accent.foreground,
+            if theme.is_dark { 0.48 } else { 0.38 },
+        );
         let app_menu_hover_bg = theme.titlebar_hover_overlay();
         let app_menu_active_bg = theme.titlebar_active_overlay();
+        // Matches `ButtonStyle::Transparent`'s hover border exactly, so the
+        // hand-rolled repo-picker div and the `Button`s either side of it grow
+        // the same outline under the cursor.
+        let titlebar_hover_border = with_alpha(
+            theme.colors.foreground.secondary,
+            if theme.is_dark { 0.40 } else { 0.30 },
+        );
         let bar_bg = title_bar_background(theme, window.is_window_active());
         let app_menu_focus_handle = self.app_menu_focus_handle.clone();
 
@@ -460,11 +476,10 @@ impl Render for TitleBarView {
                 components::Button::new("app_menu_btn", "")
                     .start_slot(svg_icon(
                         "icons/menu.svg",
-                        theme.colors.text,
+                        theme.colors.foreground.primary,
                         scaled_px(16.0),
                     ))
                     .style(components::ButtonStyle::Transparent)
-                    .borderless()
                     .selected(app_menu_open)
                     .selected_bg(app_menu_open_bg)
                     .focus_handle(app_menu_focus_handle)
@@ -479,7 +494,7 @@ impl Render for TitleBarView {
                     // content is what actually matches the two ends of the bar.
                     .h(scaled_px(26.0))
                     .w(scaled_px(32.0))
-                    .rounded(px(theme.radii.pill))
+                    .rounded(px(theme.radii.control))
                     .block_mouse_except_scroll()
                     .debug_selector(|| "app_menu".to_string())
                     .gitcomet_tooltip(theme, "Application menu".into()),
@@ -508,11 +523,16 @@ impl Render for TitleBarView {
                     .items_center()
                     .justify_center()
                     .cursor(CursorStyle::PointingHand)
-                    .rounded(px(theme.radii.pill))
+                    .rounded(px(theme.radii.control))
+                    // Reserved at rest so gaining the hover outline does not
+                    // shift the chevron by a pixel.
+                    .border_1()
+                    .border_color(gpui::transparent_black())
                     // Stay lit in the pressed/open color while the picker popover
                     // is open, mirroring the app-menu button.
                     .when(repo_picker_open, move |s| s.bg(app_menu_open_bg))
                     .hover(move |s| {
+                        let s = s.border_color(titlebar_hover_border);
                         if repo_picker_open {
                             s.bg(app_menu_open_bg)
                         } else {
@@ -528,7 +548,7 @@ impl Render for TitleBarView {
                     })
                     .child(svg_icon(
                         "icons/chevron_down.svg",
-                        theme.colors.text,
+                        theme.colors.foreground.primary,
                         scaled_px(16.0),
                     ))
                     .block_mouse_except_scroll()
@@ -622,8 +642,8 @@ impl Render for TitleBarView {
             ui_scale_percent,
             "win_min_btn",
             "icons/generic_minimize.svg",
-            theme.colors.text_muted,
-            theme.colors.text,
+            theme.colors.foreground.secondary,
+            theme.colors.foreground.primary,
         )
         .id("win_min")
         .debug_selector(|| "titlebar_win_min".to_string())
@@ -648,8 +668,8 @@ impl Render for TitleBarView {
             ui_scale_percent,
             "win_max_btn",
             max_icon,
-            theme.colors.text_muted,
-            theme.colors.text,
+            theme.colors.foreground.secondary,
+            theme.colors.foreground.primary,
         )
         .id("win_max")
         .debug_selector(|| "titlebar_win_max".to_string())
@@ -666,8 +686,8 @@ impl Render for TitleBarView {
             ui_scale_percent,
             "win_close_btn",
             "icons/generic_close.svg",
-            theme.colors.text_muted,
-            theme.colors.danger,
+            theme.colors.foreground.secondary,
+            theme.colors.status.danger.foreground,
         )
         .id("win_close")
         .debug_selector(|| "titlebar_win_close".to_string())
@@ -677,60 +697,6 @@ impl Render for TitleBarView {
             cx.stop_propagation();
             crate::app::close_window_or_warn(window, cx);
         }));
-
-        let free_badge_bg = with_alpha(
-            theme.colors.text_muted,
-            if theme.is_dark { 0.22 } else { 0.16 },
-        );
-        let free_badge_border = with_alpha(
-            theme.colors.text_muted,
-            if theme.is_dark { 0.34 } else { 0.28 },
-        );
-        let free_badge_text =
-            with_alpha(theme.colors.text, if theme.is_dark { 0.72 } else { 0.62 });
-        let free_badge_hover_bg =
-            with_alpha(theme.colors.accent, if theme.is_dark { 0.18 } else { 0.12 });
-        let free_badge_hover_border =
-            with_alpha(theme.colors.accent, if theme.is_dark { 0.42 } else { 0.34 });
-        let free_badge_active_bg =
-            with_alpha(theme.colors.accent, if theme.is_dark { 0.28 } else { 0.20 });
-        let free_badge_active_border =
-            with_alpha(theme.colors.accent, if theme.is_dark { 0.58 } else { 0.46 });
-        let free_badge_tooltip: SharedString = "See GitComet editions".into();
-        let free_badge = div()
-            .id("free_badge")
-            .debug_selector(|| "titlebar_free_badge".to_string())
-            .h(scaled_px(18.0))
-            .px(scaled_px(6.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(theme.radii.pill))
-            .cursor(CursorStyle::PointingHand)
-            .bg(free_badge_bg)
-            .border_1()
-            .border_color(free_badge_border)
-            .text_size(scaled_px(11.0))
-            .line_height(scaled_px(12.0))
-            .font_weight(FontWeight::NORMAL)
-            .text_color(free_badge_text)
-            .hover(move |s| {
-                s.bg(free_badge_hover_bg)
-                    .border_color(free_badge_hover_border)
-                    .text_color(theme.colors.accent)
-            })
-            .active(move |s| {
-                s.bg(free_badge_active_bg)
-                    .border_color(free_badge_active_border)
-                    .text_color(theme.colors.accent)
-            })
-            .block_mouse_except_scroll()
-            .on_click(cx.listener(|_this, _e: &ClickEvent, _window, cx| {
-                cx.stop_propagation();
-                cx.open_url(EDITIONS_URL);
-            }))
-            .gitcomet_tooltip(theme, free_badge_tooltip.clone())
-            .child("FREE");
 
         // Leading and trailing clusters center on the full bar height; tab
         // labels compensate for their bottom fusion (see `Tab::render`) so
@@ -821,7 +787,6 @@ impl Render for TitleBarView {
                     .items_center()
                     .h_full()
                     .gap(scaled_px(4.0))
-                    .child(free_badge)
                     .when(!is_macos, |d| d.child(min).child(max).child(close))
                     .pr(scaled_px(8.0)),
             )
@@ -855,7 +820,7 @@ pub(crate) fn window_frame(
         .id("window_surface")
         .size_full()
         .relative()
-        .bg(theme.colors.window_bg);
+        .bg(theme.colors.surface.canvas);
 
     if !suppress_frame {
         let draw_outline = should_draw_window_frame_outline();
@@ -894,8 +859,8 @@ mod tests {
                     ui_scale::DEFAULT_UI_SCALE_PERCENT,
                     "test_btn_1",
                     "icons/generic_minimize.svg",
-                    theme.colors.text_muted,
-                    theme.colors.text,
+                    theme.colors.foreground.secondary,
+                    theme.colors.foreground.primary,
                 );
             })
             .is_ok()
@@ -906,8 +871,8 @@ mod tests {
                     ui_scale::DEFAULT_UI_SCALE_PERCENT,
                     "test_btn_2",
                     "icons/generic_close.svg",
-                    theme.colors.text_muted,
-                    theme.colors.danger,
+                    theme.colors.foreground.secondary,
+                    theme.colors.status.danger.foreground,
                 );
             })
             .is_ok()
@@ -937,18 +902,21 @@ mod tests {
         {
             assert_eq!(
                 window_frame_outline_color(dark),
-                with_alpha(dark.colors.border, 0.96)
+                with_alpha(dark.colors.stroke.default, 0.96)
             );
             assert_eq!(
                 window_frame_outline_color(light),
-                with_alpha(light.colors.border, 0.90)
+                with_alpha(light.colors.stroke.default, 0.90)
             );
         }
 
         #[cfg(not(target_os = "macos"))]
         {
-            assert_eq!(window_frame_outline_color(dark), dark.colors.border);
-            assert_eq!(window_frame_outline_color(light), light.colors.border);
+            assert_eq!(window_frame_outline_color(dark), dark.colors.stroke.default);
+            assert_eq!(
+                window_frame_outline_color(light),
+                light.colors.stroke.default
+            );
         }
     }
 

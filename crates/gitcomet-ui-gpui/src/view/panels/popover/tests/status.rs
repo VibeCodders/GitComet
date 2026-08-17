@@ -414,6 +414,179 @@ fn status_file_menu_hides_external_mergetool_for_staged_conflicts(cx: &mut gpui:
 }
 
 #[gpui::test]
+fn status_file_menu_hides_permalink_for_local_only_branch(cx: &mut gpui::TestAppContext) {
+    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (view, cx) =
+        cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
+    let repo_id = RepoId(8);
+    let workdir = std::env::temp_dir().join(format!(
+        "gitcomet_ui_test_{}_status_menu_local_only_permalink",
+        std::process::id()
+    ));
+    let path = std::path::PathBuf::from("a.txt");
+
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            let mut repo = RepoState::new_opening(
+                repo_id,
+                gitcomet_core::domain::RepoSpec {
+                    workdir: workdir.clone(),
+                },
+            );
+            repo.status = Loadable::Ready(
+                gitcomet_core::domain::RepoStatus {
+                    staged: vec![],
+                    unstaged: vec![gitcomet_core::domain::FileStatus {
+                        path: path.clone(),
+                        kind: gitcomet_core::domain::FileStatusKind::Modified,
+                        conflict: None,
+                    }],
+                }
+                .into(),
+            );
+            // `permalink-copy` exists only locally: a `blob/<branch>` link
+            // would point at a nonexistent source on the forge.
+            repo.head_branch = Loadable::Ready("permalink-copy".to_string());
+            repo.remotes = Loadable::Ready(Arc::new(vec![gitcomet_core::domain::Remote {
+                name: "origin".to_string(),
+                url: Some("git@github.com:Auto-Explore/GitComet.git".to_string()),
+            }]));
+            repo.remote_branches =
+                Loadable::Ready(Arc::new(vec![gitcomet_core::domain::RemoteBranch {
+                    remote: "origin".to_string(),
+                    name: "main".to_string(),
+                    target: gitcomet_core::domain::CommitId("deadbeef".into()),
+                }]));
+
+            let state = Arc::new(AppState {
+                repos: vec![repo],
+                active_repo: Some(repo_id),
+                ..Default::default()
+            });
+            this.state = Arc::clone(&state);
+            this._ui_model
+                .update(cx, |model, cx| model.set_state(state, cx));
+            cx.notify();
+        });
+    });
+
+    cx.update(|_window, app| {
+        let model = view
+            .update(app, |this, cx| {
+                this.popover_host.update(cx, |host, cx| {
+                    host.context_menu_model(
+                        &PopoverKind::StatusFileMenu {
+                            repo_id,
+                            area: DiffArea::Unstaged,
+                            path: path.clone(),
+                        },
+                        cx,
+                    )
+                })
+            })
+            .expect("expected status file context menu model");
+
+        let has_permalink = model.items.iter().any(|item| match item {
+            ContextMenuItem::Entry { label, .. } => label.as_ref() == "Copy file permalink",
+            _ => false,
+        });
+        assert!(!has_permalink);
+    });
+}
+
+#[gpui::test]
+fn status_file_menu_offers_permalink_for_pushed_branch(cx: &mut gpui::TestAppContext) {
+    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (view, cx) =
+        cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
+    let repo_id = RepoId(9);
+    let workdir = std::env::temp_dir().join(format!(
+        "gitcomet_ui_test_{}_status_menu_pushed_permalink",
+        std::process::id()
+    ));
+    let path = std::path::PathBuf::from("a.txt");
+
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            let mut repo = RepoState::new_opening(
+                repo_id,
+                gitcomet_core::domain::RepoSpec {
+                    workdir: workdir.clone(),
+                },
+            );
+            repo.status = Loadable::Ready(
+                gitcomet_core::domain::RepoStatus {
+                    staged: vec![],
+                    unstaged: vec![gitcomet_core::domain::FileStatus {
+                        path: path.clone(),
+                        kind: gitcomet_core::domain::FileStatusKind::Modified,
+                        conflict: None,
+                    }],
+                }
+                .into(),
+            );
+            // `main` has a remote counterpart, so the permalink resolves.
+            repo.head_branch = Loadable::Ready("main".to_string());
+            repo.remotes = Loadable::Ready(Arc::new(vec![gitcomet_core::domain::Remote {
+                name: "origin".to_string(),
+                url: Some("git@github.com:Auto-Explore/GitComet.git".to_string()),
+            }]));
+            repo.remote_branches =
+                Loadable::Ready(Arc::new(vec![gitcomet_core::domain::RemoteBranch {
+                    remote: "origin".to_string(),
+                    name: "main".to_string(),
+                    target: gitcomet_core::domain::CommitId("deadbeef".into()),
+                }]));
+
+            let state = Arc::new(AppState {
+                repos: vec![repo],
+                active_repo: Some(repo_id),
+                ..Default::default()
+            });
+            this.state = Arc::clone(&state);
+            this._ui_model
+                .update(cx, |model, cx| model.set_state(state, cx));
+            cx.notify();
+        });
+    });
+
+    cx.update(|_window, app| {
+        let model = view
+            .update(app, |this, cx| {
+                this.popover_host.update(cx, |host, cx| {
+                    host.context_menu_model(
+                        &PopoverKind::StatusFileMenu {
+                            repo_id,
+                            area: DiffArea::Unstaged,
+                            path: path.clone(),
+                        },
+                        cx,
+                    )
+                })
+            })
+            .expect("expected status file context menu model");
+
+        let permalink = model.items.iter().find_map(|item| match item {
+            ContextMenuItem::Entry { label, action, .. }
+                if label.as_ref() == "Copy file permalink" =>
+            {
+                Some((**action).clone())
+            }
+            _ => None,
+        });
+        match permalink {
+            Some(ContextMenuAction::CopyText { text }) => {
+                assert_eq!(
+                    text,
+                    "https://github.com/Auto-Explore/GitComet/blob/main/a.txt"
+                );
+            }
+            _ => panic!("expected Copy file permalink to copy the branch permalink"),
+        }
+    });
+}
+
+#[gpui::test]
 fn status_file_menu_open_from_details_pane_does_not_double_lease_panic(
     cx: &mut gpui::TestAppContext,
 ) {
@@ -471,4 +644,197 @@ fn status_file_menu_open_from_details_pane_does_not_double_lease_panic(
             );
         });
     });
+}
+
+/// Seed a repo whose unstaged lane holds `entries`, optionally with `selection`
+/// marked in the unstaged bucket, and return the status-file menu for `clicked`.
+fn status_menu_for(
+    cx: &mut gpui::TestAppContext,
+    entries: &[(&str, gitcomet_core::domain::FileStatusKind)],
+    selection: &[&str],
+    clicked: &str,
+) -> ContextMenuModel {
+    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (view, cx) =
+        cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
+    let repo_id = RepoId(7);
+    let workdir = std::env::temp_dir().join(format!(
+        "gitcomet_ui_test_{}_gitignore_menu",
+        std::process::id()
+    ));
+
+    let unstaged: Vec<_> = entries
+        .iter()
+        .map(|(path, kind)| gitcomet_core::domain::FileStatus {
+            path: std::path::PathBuf::from(path),
+            kind: *kind,
+            conflict: None,
+        })
+        .collect();
+    let selection: Vec<std::path::PathBuf> =
+        selection.iter().map(std::path::PathBuf::from).collect();
+
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            let mut repo = RepoState::new_opening(
+                repo_id,
+                gitcomet_core::domain::RepoSpec {
+                    workdir: workdir.clone(),
+                },
+            );
+            repo.status = Loadable::Ready(
+                gitcomet_core::domain::RepoStatus {
+                    staged: vec![],
+                    unstaged,
+                }
+                .into(),
+            );
+            let state = Arc::new(AppState {
+                repos: vec![repo],
+                active_repo: Some(repo_id),
+                ..Default::default()
+            });
+            this.state = Arc::clone(&state);
+            // In the running app the host mirrors the UI model through an
+            // observer; seed it directly so the menu model sees the repo.
+            this.popover_host.update(cx, |host, _cx| {
+                host.state = Arc::clone(&state);
+            });
+            if selection.len() > 1 {
+                this.details_pane.update(cx, |pane, cx| {
+                    pane.status_multi_selection.insert(
+                        repo_id,
+                        StatusMultiSelection {
+                            untracked: vec![],
+                            untracked_anchor: None,
+                            unstaged: selection.clone(),
+                            unstaged_anchor: selection.first().cloned(),
+                            unstaged_anchor_index: None,
+                            unstaged_anchor_status_rev: None,
+                            staged: vec![],
+                            staged_anchor: None,
+                            staged_anchor_index: None,
+                            staged_anchor_status_rev: None,
+                        },
+                    );
+                    cx.notify();
+                });
+            }
+            cx.notify();
+        });
+    });
+
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            this.popover_host.update(cx, |host, cx| {
+                host.context_menu_model(
+                    &PopoverKind::StatusFileMenu {
+                        repo_id,
+                        area: DiffArea::Unstaged,
+                        path: std::path::PathBuf::from(clicked),
+                    },
+                    cx,
+                )
+            })
+        })
+        .expect("expected status file context menu model")
+    })
+}
+
+fn gitignore_entry_label(model: &ContextMenuModel) -> Option<String> {
+    model.items.iter().find_map(|item| match item {
+        ContextMenuItem::Entry { label, .. } if label.contains(".gitignore") => {
+            Some(label.to_string())
+        }
+        _ => None,
+    })
+}
+
+#[gpui::test]
+fn status_file_menu_offers_gitignore_only_for_untracked(cx: &mut gpui::TestAppContext) {
+    use gitcomet_core::domain::FileStatusKind;
+
+    let entries = &[
+        ("build/out.log", FileStatusKind::Untracked),
+        ("src/lib.rs", FileStatusKind::Modified),
+    ];
+
+    let untracked = status_menu_for(cx, entries, &[], "build/out.log");
+    assert_eq!(
+        gitignore_entry_label(&untracked).as_deref(),
+        Some("Add to .gitignore…")
+    );
+
+    let tracked = status_menu_for(cx, entries, &[], "src/lib.rs");
+    assert_eq!(
+        gitignore_entry_label(&tracked),
+        None,
+        "a tracked file keeps being tracked no matter what .gitignore says, so \
+         the entry must not be offered at all"
+    );
+}
+
+#[gpui::test]
+fn status_file_menu_gitignore_entry_counts_the_selection(cx: &mut gpui::TestAppContext) {
+    use gitcomet_core::domain::FileStatusKind;
+
+    let model = status_menu_for(
+        cx,
+        &[
+            ("build/a.log", FileStatusKind::Untracked),
+            ("build/b.log", FileStatusKind::Untracked),
+            ("build/c.log", FileStatusKind::Untracked),
+        ],
+        &["build/a.log", "build/b.log", "build/c.log"],
+        "build/a.log",
+    );
+
+    assert_eq!(
+        gitignore_entry_label(&model).as_deref(),
+        Some("Add 3 files to .gitignore…")
+    );
+
+    let action = model.items.iter().find_map(|item| match item {
+        ContextMenuItem::Entry { label, action, .. } if label.contains(".gitignore") => {
+            Some((**action).clone())
+        }
+        _ => None,
+    });
+    match action {
+        Some(ContextMenuAction::AddToGitignoreSelectionOrPath {
+            repo_id: _,
+            area,
+            path,
+        }) => {
+            assert_eq!(area, DiffArea::Unstaged);
+            assert_eq!(
+                path,
+                std::path::PathBuf::from("build/a.log"),
+                "the payload carries the clicked row only; the selection is \
+                 re-derived so cancelling the dialog cannot lose it"
+            );
+        }
+        _ => panic!("expected AddToGitignoreSelectionOrPath"),
+    }
+}
+
+#[gpui::test]
+fn status_file_menu_hides_gitignore_for_a_mixed_selection(cx: &mut gpui::TestAppContext) {
+    use gitcomet_core::domain::FileStatusKind;
+
+    let model = status_menu_for(
+        cx,
+        &[
+            ("build/a.log", FileStatusKind::Untracked),
+            ("src/lib.rs", FileStatusKind::Modified),
+        ],
+        &["build/a.log", "src/lib.rs"],
+        "build/a.log",
+    );
+
+    assert_eq!(
+        gitignore_entry_label(&model),
+        None,
+        "one tracked path in the selection would get a pattern that does nothing"
+    );
 }

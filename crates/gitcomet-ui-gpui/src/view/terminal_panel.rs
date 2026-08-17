@@ -5,11 +5,31 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::Flags;
+use palette::IntoColor;
 use rustc_hash::FxHasher;
 #[cfg(unix)]
 use rustix::process::{Pid, Signal, kill_process_group};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+
+/// How long a save-and-close waits for the dispatched writes to land before
+/// closing anyway. A wedged command must not leave the user unable to quit.
+const UNSAVED_FILE_EDITS_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const UNSAVED_FILE_EDITS_FLUSH_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+/// Minimum time to wait before believing an in-flight count of zero. A
+/// `dispatch` is a channel send; the worker needs a turn to reduce it into a
+/// running command, and until it has, "nothing in flight" means "not started".
+const UNSAVED_FILE_EDITS_FLUSH_GRACE: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Re-run whatever the unsaved-edits prompt interrupted.
+fn retry_close_action(action: UnsavedFileEditsAction, cx: &mut gpui::App) {
+    match action {
+        UnsavedFileEditsAction::CloseWindow(window_id) => {
+            crate::app::close_window_by_id_or_warn(cx, window_id)
+        }
+        UnsavedFileEditsAction::QuitApp => crate::app::quit_app_or_warn(cx),
+    }
+}
 
 const TERMINAL_PANEL_MIN_HEIGHT_PX: f32 = 120.0;
 const TERMINAL_FONT_SCALE: f32 = 0.92;
@@ -2289,8 +2309,163 @@ impl GitCometView {
         true
     }
 
-    pub(crate) fn request_close_window_or_warn(&mut self, cx: &mut gpui::Context<Self>) -> bool {
+    pub(crate) fn request_close_window_or_warn(
+        &mut self,
+        window_id: gpui::WindowId,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        if self
+            .request_unsaved_file_edits_prompt(UnsavedFileEditsAction::CloseWindow(window_id), cx)
+        {
+            return true;
+        }
         self.request_terminal_shutdown_action(TerminalShutdownAction::CloseWindow, cx)
+    }
+
+    /// [`Self::request_unsaved_file_edits_prompt`] for a quit, callable from
+    /// the app-level shutdown path (which cannot name the action enum).
+    pub(crate) fn request_quit_unsaved_file_edits_prompt(
+        &mut self,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        self.request_unsaved_file_edits_prompt(UnsavedFileEditsAction::QuitApp, cx)
+    }
+
+    /// Queue the unsaved-edits dialog if the editor is holding writes that
+    /// closing would throw away. Returns whether it took over the action.
+    ///
+    /// Resolving it re-runs the original request rather than closing directly,
+    /// so a window with both unsaved edits and a running command still gets the
+    /// terminal warning afterwards.
+    pub(in crate::view) fn request_unsaved_file_edits_prompt(
+        &mut self,
+        action: UnsavedFileEditsAction,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        // `pending_*_prompt` is `take()`n by `Render` when it opens the popover,
+        // so it is `None` for as long as the dialog is actually on screen. Ask
+        // the popover host whether the dialog is up rather than mirroring that
+        // into a bool: a mirror only stays true, and every way the popover can
+        // go away without being closed — `open_popover` replacing it, say —
+        // would leave it stuck and the window permanently unclosable.
+        if self.pending_unsaved_file_edits_prompt.is_some()
+            || self.unsaved_file_edits_dialog_open(cx)
+        {
+            return true;
+        }
+        // With auto-save on, a buffer inside its 800 ms quiet period is not an
+        // unsaved edit — it is a write that has not fired yet, so the user is
+        // asked nothing. But flushing only *dispatches* the write, and returning
+        // `false` here let the caller quit out from under it: the store never
+        // reduced the message and the edits were lost. Take over the close and
+        // let it through once the write has actually drained.
+        let flushed_a_pending_write = self.main_pane.update(cx, |pane, cx| {
+            let pending = pane.auto_save_file_edits && !pane.unsaved_file_edit_labels().is_empty();
+            pane.flush_file_editor_buffer(cx);
+            pending
+        });
+        if flushed_a_pending_write {
+            self.retry_once_file_edit_writes_drain(action, cx);
+            return true;
+        }
+        let files = self.main_pane.read(cx).unsaved_file_edit_labels();
+        if files.is_empty() {
+            return false;
+        }
+        self.pending_unsaved_file_edits_prompt = Some(UnsavedFileEditsPrompt { action, files });
+        cx.notify();
+        true
+    }
+
+    /// Whether the unsaved-edits dialog is the popover currently on screen.
+    fn unsaved_file_edits_dialog_open(&self, cx: &gpui::App) -> bool {
+        self.popover_host
+            .read(cx)
+            .showing_unsaved_file_edits_prompt()
+    }
+
+    pub(in crate::view) fn clear_pending_unsaved_file_edits_prompt(
+        &mut self,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.pending_unsaved_file_edits_prompt = None;
+        cx.notify();
+    }
+
+    /// Save or discard the unsaved buffers, then retry what the user asked for.
+    ///
+    /// Discarding can retry immediately, but saving cannot: the writes go
+    /// through the store's command executor, and `cx.quit()` on the next flush
+    /// would race them — the app would exit with some files still unwritten.
+    /// `local_actions_in_flight` is the store's own count of exactly those
+    /// commands, so the retry waits for it to drain (bounded, so a wedged
+    /// command cannot trap the user in an app that will not close).
+    pub(in crate::view) fn resolve_unsaved_file_edits(
+        &mut self,
+        action: UnsavedFileEditsAction,
+        save: bool,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.pending_unsaved_file_edits_prompt = None;
+        self.main_pane.update(cx, |pane, cx| {
+            if save {
+                pane.save_all_file_edits(cx);
+            } else {
+                pane.discard_all_file_edits(cx);
+            }
+        });
+
+        if !save {
+            // Ordering note: the caller's `close_popover` defers a clear of
+            // `pending_unsaved_file_edits_prompt`, and it runs *after* this
+            // retry. If the retry finds edits still outstanding and queues a
+            // fresh prompt, that clear would silently swallow it and the close
+            // would do nothing — so the retry is deferred behind the clear.
+            cx.defer(move |cx| cx.defer(move |cx| retry_close_action(action, cx)));
+            return;
+        }
+        self.retry_once_file_edit_writes_drain(action, cx);
+    }
+
+    /// Re-run `action` once the dispatched worktree writes have landed.
+    ///
+    /// `dispatch` is a channel send, so the store worker needs a turn before
+    /// `local_actions_in_flight` means anything — quitting on the count it reads
+    /// immediately would exit with the writes still queued.
+    fn retry_once_file_edit_writes_drain(
+        &mut self,
+        action: UnsavedFileEditsAction,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.pending_unsaved_file_edits_flush = Some(cx.spawn(async move |view, cx| {
+            let started = std::time::Instant::now();
+            let deadline = started + UNSAVED_FILE_EDITS_FLUSH_TIMEOUT;
+            loop {
+                cx.background_executor()
+                    .timer(UNSAVED_FILE_EDITS_FLUSH_POLL)
+                    .await;
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                if now.duration_since(started) < UNSAVED_FILE_EDITS_FLUSH_GRACE {
+                    continue;
+                }
+                let drained = view
+                    .read_with(cx, |view, _cx| {
+                        !view
+                            .state
+                            .repos
+                            .iter()
+                            .any(|repo| repo.local_actions_in_flight > 0)
+                    })
+                    .unwrap_or(true);
+                if drained {
+                    break;
+                }
+            }
+            cx.update(move |cx| cx.defer(move |cx| retry_close_action(action, cx)));
+        }));
     }
 
     pub(crate) fn request_quit_or_warn(
@@ -2575,9 +2750,9 @@ impl GitCometView {
             // transparent when unfocused) so toggling focus never shifts layout.
             .border_t_2()
             .border_color(if terminal_focused {
-                theme.colors.focus_ring
+                theme.colors.interaction.focus_ring
             } else {
-                with_alpha(theme.colors.focus_ring, 0.0)
+                with_alpha(theme.colors.interaction.focus_ring, 0.0)
             })
             .child(header)
             .child(viewport_element)
@@ -2592,7 +2767,7 @@ impl GitCometView {
                         div()
                             .px(px(8.0))
                             .py(px(4.0))
-                            .text_color(theme.colors.text_muted)
+                            .text_color(theme.colors.foreground.secondary)
                             .child(format!("Terminal — {status}")),
                     )
                     .child(panel)
@@ -2625,8 +2800,8 @@ impl GitCometView {
                 .size(px(22.0))
                 .rounded(px(theme.radii.row))
                 .cursor(CursorStyle::PointingHand)
-                .hover(move |s| s.bg(theme.colors.hover))
-                .child(svg_icon(icon, theme.colors.text, px(14.0)))
+                .hover(move |s| s.bg(theme.colors.interaction.hover_background))
+                .child(svg_icon(icon, theme.colors.foreground.primary, px(14.0)))
                 .gitcomet_tooltip(theme, tip.into())
         };
 
@@ -2644,14 +2819,14 @@ impl GitCometView {
         for (i, title) in tabs.iter().enumerate() {
             let is_active = i == active_index;
             let tab_bg = if is_active {
-                theme.colors.active_section
+                theme.colors.interaction.selected_background
             } else {
-                theme.colors.surface_bg
+                theme.colors.surface.panel
             };
             let text_color = if is_active {
-                theme.colors.text
+                theme.colors.interaction.selected_foreground
             } else {
-                theme.colors.text_muted
+                theme.colors.foreground.secondary
             };
 
             let close = div()
@@ -2662,7 +2837,7 @@ impl GitCometView {
                 .size(px(14.0))
                 .rounded(px(theme.radii.row))
                 .cursor(CursorStyle::PointingHand)
-                .hover(move |s| s.bg(with_alpha(theme.colors.danger, 0.18)))
+                .hover(move |s| s.bg(with_alpha(theme.colors.status.danger.foreground, 0.18)))
                 .child(svg_icon("icons/generic_close.svg", text_color, px(10.0)))
                 .on_mouse_down(
                     MouseButton::Left,
@@ -2686,7 +2861,9 @@ impl GitCometView {
                 .text_size(px(12.0))
                 .flex_none()
                 .cursor(CursorStyle::PointingHand)
-                .when(!is_active, |d| d.hover(move |s| s.bg(theme.colors.hover)))
+                .when(!is_active, |d| {
+                    d.hover(move |s| s.bg(theme.colors.interaction.hover_background))
+                })
                 .child(svg_icon("icons/terminal.svg", text_color, px(12.0)))
                 .child(title.clone())
                 .child(close)
@@ -2710,8 +2887,12 @@ impl GitCometView {
             .size(px(20.0))
             .rounded(px(theme.radii.row))
             .cursor(CursorStyle::PointingHand)
-            .hover(move |s| s.bg(theme.colors.hover))
-            .child(svg_icon("icons/plus.svg", theme.colors.text, px(12.0)))
+            .hover(move |s| s.bg(theme.colors.interaction.hover_background))
+            .child(svg_icon(
+                "icons/plus.svg",
+                theme.colors.foreground.primary,
+                px(12.0),
+            ))
             .gitcomet_tooltip(theme, "New terminal".into())
             .on_mouse_down(
                 MouseButton::Left,
@@ -2729,9 +2910,9 @@ impl GitCometView {
             .gap(px(2.0))
             .px(px(4.0))
             .py(px(4.0))
-            .bg(theme.colors.surface_bg)
+            .bg(theme.colors.surface.panel)
             .border_b_1()
-            .border_color(theme.colors.border_variant)
+            .border_color(theme.colors.stroke.subtle)
             .child(tabs_row)
             .when(focused, |row| {
                 // Badge that explains why the usual app shortcuts (Ctrl+P, etc.)
@@ -2747,12 +2928,17 @@ impl GitCometView {
                         .px(px(6.0))
                         .py(px(2.0))
                         .rounded(px(theme.radii.row))
-                        .bg(with_alpha(theme.colors.accent, 0.15))
-                        .child(div().size(px(6.0)).rounded(px(3.0)).bg(theme.colors.accent))
+                        .bg(with_alpha(theme.colors.accent.foreground, 0.15))
+                        .child(
+                            div()
+                                .size(px(6.0))
+                                .rounded(px(3.0))
+                                .bg(theme.colors.accent.foreground),
+                        )
                         .child(
                             div()
                                 .text_size(px(11.0))
-                                .text_color(theme.colors.text)
+                                .text_color(theme.colors.foreground.primary)
                                 .child("Keyboard captured"),
                         )
                         .gitcomet_tooltip(
@@ -2870,7 +3056,7 @@ impl GitCometView {
                 "terminal_panel_resize",
                 components::ResizeGripAxis::Horizontal,
                 self.terminal_panel_resize.is_some(),
-                Some(theme.colors.border_variant),
+                Some(theme.colors.stroke.subtle),
             ))
             .on_drag(TerminalPanelResizeDrag, |_payload, _offset, _window, cx| {
                 cx.new(|_cx| super::mod_helpers::ResizeDragGhost)
@@ -3016,7 +3202,7 @@ where
     style.font_features = gpui::FontFeatures::disable_ligatures();
     style.font_weight = FontWeight::NORMAL;
     style.font_style = gpui::FontStyle::Normal;
-    style.color = terminal_default_foreground(theme).into();
+    style.color = terminal_default_foreground(theme).into_color();
     style.white_space = gpui::WhiteSpace::Nowrap;
     style.text_overflow = None;
     style
@@ -3152,7 +3338,7 @@ fn paint_terminal_canvas_state(
     for rect in paint_state.selection_rects {
         window.paint_quad(fill(
             rect,
-            with_alpha(theme.colors.accent, TERMINAL_SELECTION_ALPHA),
+            with_alpha(theme.colors.accent.foreground, TERMINAL_SELECTION_ALPHA),
         ));
     }
     for (line, origin, line_height) in paint_state.lines {

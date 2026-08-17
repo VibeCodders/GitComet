@@ -825,6 +825,7 @@ fn selected_submodule_command_reloads_selected_summary() {
             area: DiffArea::Unstaged,
         };
         repo.diff_state.inline_submodule_diff = Some(crate::model::InlineSubmoduleDiffState {
+            origin: crate::model::ForeignDiffOrigin::Submodule,
             submodule_repo_path: PathBuf::from("/tmp/repo/vendor/lib"),
             parent_submodule_path: command_path.to_path_buf(),
             entries: vec![crate::model::InlineSubmoduleDiffEntry {
@@ -2277,6 +2278,27 @@ fn additional_routing_messages_emit_effects_and_update_counters() {
             ..
         }]
     ));
+
+    let effects = reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::AppendGitignorePatterns {
+            repo_id,
+            patterns: vec!["/build/out.log".to_string(), "*.tmp".to_string()],
+        },
+    );
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::AppendGitignorePatterns {
+                repo_id: RepoId(1),
+                patterns,
+            }] if patterns.as_slice() == ["/build/out.log", "*.tmp"]
+        ),
+        "the patterns must reach the effect verbatim: the reducer is not allowed \
+         to re-derive or reorder them"
+    );
 
     let effects = reduce(
         &mut repos,

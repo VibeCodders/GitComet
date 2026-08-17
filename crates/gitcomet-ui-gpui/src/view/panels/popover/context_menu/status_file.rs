@@ -22,6 +22,19 @@ pub(super) fn model(
         (use_selection, selected_count)
     };
 
+    // A file git reports as deleted has nothing on disk to open in the editor.
+    let is_deleted = this
+        .state
+        .repos
+        .iter()
+        .find(|r| r.id == repo_id)
+        .is_some_and(|repo| {
+            matches!(
+                repo.status_entry_for_path(area, path).map(|s| s.kind),
+                Some(gitcomet_core::domain::FileStatusKind::Deleted)
+            )
+        });
+
     let (is_conflicted, is_unstaged_conflicted, has_unstaged_for_path, is_staged_added) = this
         .state
         .repos
@@ -90,6 +103,12 @@ pub(super) fn model(
         );
     }
 
+    // Same helper the dialog seeds itself from, so the entry can never offer an
+    // action the dialog would then refuse.
+    let can_add_to_gitignore = this
+        .add_to_gitignore_target(repo_id, area, &path.to_path_buf(), cx)
+        .is_some();
+
     // Keep context menu opening fast. Validate precisely when the action runs instead.
     let can_discard_worktree_changes = if is_conflicted {
         false
@@ -141,6 +160,34 @@ pub(super) fn model(
             path: path.to_path_buf(),
         }),
     });
+    items.push(ContextMenuItem::Entry {
+        label: "Edit file".into(),
+        icon: Some("icons/pencil.svg".into()),
+        shortcut: None,
+        disabled: is_deleted || crate::view::should_bypass_text_file_preview_for_path(path),
+        action: Box::new(ContextMenuAction::EditFile {
+            repo_id,
+            path: path.to_path_buf(),
+        }),
+    });
+    // Shown only while the editor is holding unsaved text for this file, so it
+    // cannot be mistaken for the "Discard changes" that reverts the file itself.
+    if this
+        .main_pane
+        .read(cx)
+        .file_edits_are_unsaved_for(repo_id, path)
+    {
+        items.push(ContextMenuItem::Entry {
+            label: "Discard unsaved edits".into(),
+            icon: Some("icons/undo.svg".into()),
+            shortcut: None,
+            disabled: false,
+            action: Box::new(ContextMenuAction::DiscardFileEdits {
+                repo_id,
+                path: path.to_path_buf(),
+            }),
+        });
+    }
     items.push(ContextMenuItem::Entry {
         label: "Open file location".into(),
         icon: Some("icons/folder.svg".into()),
@@ -297,11 +344,29 @@ pub(super) fn model(
         });
     }
 
+    // Only untracked paths: `.gitignore` has no effect on anything already in
+    // the index, so offering this for a tracked file would write a line that
+    // changes nothing and leave the row exactly where it was. Hidden rather
+    // than disabled — there is no action to explain.
+    if can_add_to_gitignore {
+        items.push(ContextMenuItem::Entry {
+            label: if use_selection {
+                format!("Add {selected_count} files to .gitignore…").into()
+            } else {
+                "Add to .gitignore…".into()
+            },
+            icon: Some("icons/unlink.svg".into()),
+            shortcut: None,
+            disabled: false,
+            action: Box::new(ContextMenuAction::AddToGitignoreSelectionOrPath {
+                repo_id,
+                area,
+                path: path.to_path_buf(),
+            }),
+        });
+    }
+
     items.push(ContextMenuItem::Separator);
-    let copy_path_text = this
-        .resolve_workdir_path(repo_id, path)
-        .map(|p| path_text_for_copy(&p))
-        .unwrap_or_else(|_| path_text_for_copy(path));
     // The working-tree file is referenced by the current branch: a permalink
     // points at the last committed version, which is what reviewers can open.
     let file_permalink = this
@@ -309,18 +374,37 @@ pub(super) fn model(
         .repos
         .iter()
         .find(|repo| repo.id == repo_id)
-        .and_then(|repo| match (&repo.remotes, &repo.head_branch) {
-            (Loadable::Ready(remotes), Loadable::Ready(head))
-                if !head.is_empty() && head != "HEAD" =>
-            {
-                crate::view::permalink::file_permalink(
-                    remotes,
-                    head,
-                    &path.display().to_string(),
-                )
-            }
-            _ => None,
-        });
+        .and_then(
+            |repo| match (&repo.remotes, &repo.head_branch, &repo.remote_branches) {
+                (Loadable::Ready(remotes), Loadable::Ready(head), remote_branches)
+                    if !head.is_empty() && head != "HEAD" =>
+                {
+                    // A `blob/<branch>` permalink only resolves while the branch
+                    // exists on the permalink's remote; a local-only branch would
+                    // point at a nonexistent source, so skip the action there.
+                    let branch_is_pushed = match remote_branches {
+                        Loadable::Ready(remote_branches) => {
+                            crate::view::permalink::branch_exists_on_permalink_remote(
+                                remotes,
+                                remote_branches,
+                                head,
+                            )
+                        }
+                        // Remote branches not loaded yet: keep offering the
+                        // permalink rather than hiding it on incomplete data.
+                        _ => true,
+                    };
+                    branch_is_pushed.then(|| {
+                        crate::view::permalink::file_permalink(
+                            remotes,
+                            head,
+                            &path.display().to_string(),
+                        )
+                    })?
+                }
+                _ => None,
+            },
+        );
     if let Some(permalink) = file_permalink {
         items.push(ContextMenuItem::Entry {
             label: "Copy file permalink".into(),
@@ -343,15 +427,15 @@ pub(super) fn model(
             },
         }),
     });
-    items.push(ContextMenuItem::Entry {
-        label: "Copy path".into(),
-        icon: Some("icons/copy.svg".into()),
-        shortcut: Some(secondary_shortcut("Shift+C").into()),
-        disabled: false,
-        action: Box::new(ContextMenuAction::CopyText {
-            text: copy_path_text,
-        }),
-    });
+    // The diff panel's Ctrl+Shift+C has always copied the repo-relative path,
+    // so the label sits on the entry that matches it.
+    push_copy_path_entries(
+        &mut items,
+        this,
+        repo_id,
+        path,
+        Some(secondary_shortcut("Shift+C").into()),
+    );
 
     ContextMenuModel::new(items)
 }
@@ -501,19 +585,13 @@ fn submodule_status_model(
     }
 
     items.push(ContextMenuItem::Separator);
-    let copy_path_text = this
-        .resolve_workdir_path(repo_id, path)
-        .map(|p| path_text_for_copy(&p))
-        .unwrap_or_else(|_| path_text_for_copy(path));
-    items.push(ContextMenuItem::Entry {
-        label: "Copy path".into(),
-        icon: Some("icons/copy.svg".into()),
-        shortcut: Some(secondary_shortcut("Shift+C").into()),
-        disabled: false,
-        action: Box::new(ContextMenuAction::CopyText {
-            text: copy_path_text,
-        }),
-    });
+    push_copy_path_entries(
+        &mut items,
+        this,
+        repo_id,
+        path,
+        Some(secondary_shortcut("Shift+C").into()),
+    );
 
     ContextMenuModel::new(items)
 }

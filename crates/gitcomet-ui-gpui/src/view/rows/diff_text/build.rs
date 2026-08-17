@@ -1,5 +1,6 @@
 use super::*;
 use crate::view::panes::main::diff_search::{DiffSearchMatcher, normalize_diff_search_query};
+use palette::IntoColor;
 
 fn maybe_expand_tabs(s: &str) -> SharedString {
     if !s.contains('\t') {
@@ -264,10 +265,10 @@ pub(super) fn hash_text_content(text: &str) -> u64 {
 }
 
 pub(in crate::view::rows) fn hash_rgba_bits(hasher: &mut FxHasher, rgba: gpui::Rgba) {
-    rgba.r.to_bits().hash(hasher);
-    rgba.g.to_bits().hash(hasher);
-    rgba.b.to_bits().hash(hasher);
-    rgba.a.to_bits().hash(hasher);
+    rgba.red.to_bits().hash(hasher);
+    rgba.green.to_bits().hash(hasher);
+    rgba.blue.to_bits().hash(hasher);
+    rgba.alpha.to_bits().hash(hasher);
 }
 
 pub(super) fn syntax_theme_signature(theme: AppTheme) -> u64 {
@@ -417,10 +418,35 @@ pub(super) fn styled_text_to_cached_from_buf(
 pub(super) fn segments_to_cached_styled_text(
     theme: AppTheme,
     segments: &[CachedDiffTextSegment],
-    word_color: Option<gpui::Rgba>,
+    word_kind: Option<crate::theme::DiffColorKind>,
 ) -> CachedDiffStyledText {
-    let (expanded_text, highlights) = styled_text_for_diff_segments(theme, segments, word_color);
+    let (expanded_text, highlights) = styled_text_for_diff_segments(theme, segments, word_kind);
     styled_text_to_cached(expanded_text, highlights)
+}
+
+/// The wash behind a word-diff run, and the text colour to pin under it.
+///
+/// Both come from the theme's own `diff.*.word_background` token, so a theme can
+/// tune the wash and every renderer follows -- including the streamed one, which
+/// used to derive its own and gave a long line a different word-diff colour from
+/// a short one in the same diff.
+///
+/// Dark themes carry that token as an alpha over the row and leave the text in
+/// its syntax colour; light themes carry it opaque, which would drown syntax
+/// colours, so the diff foreground is pinned instead.
+pub(in crate::view::rows) fn word_highlight_colors(
+    theme: AppTheme,
+    kind: crate::theme::DiffColorKind,
+) -> (gpui::Rgba, Option<gpui::Rgba>) {
+    let set = theme.colors.diff.set(kind);
+    let foreground = (!theme.is_dark).then_some(set.foreground);
+    (set.word_background, foreground)
+}
+
+/// Same shape for the search-match highlight, off `editor.search_match_*`.
+fn query_highlight_colors(theme: AppTheme) -> (gpui::Rgba, Option<gpui::Rgba>) {
+    let foreground = (!theme.is_dark).then_some(theme.colors.editor.search_match_foreground);
+    (theme.colors.editor.search_match_background, foreground)
 }
 
 /// Fused version of `build_diff_text_segments` + `segments_to_cached_styled_text`.
@@ -435,7 +461,7 @@ pub(super) fn build_styled_text_fused(
     let text = request.build.text;
     let word_ranges = request.build.word_ranges;
     let query = request.build.query;
-    let word_color = request.build.word_color;
+    let word_kind = request.build.word_kind;
     let DiffSyntaxConfig {
         language,
         mode: syntax_mode,
@@ -555,20 +581,31 @@ pub(super) fn build_styled_text_fused(
 
             let mut style = gpui::HighlightStyle::default();
 
-            if in_word && let Some(mut c) = word_color {
-                c.a = if theme.is_dark { 0.22 } else { 0.16 };
-                style.background_color = Some(c.into());
+            let mut semantic_word_foreground = None;
+            if in_word && let Some(c) = word_kind {
+                let (background, foreground) = word_highlight_colors(theme, c);
+                style.background_color = Some(background.into_color());
+                semantic_word_foreground = foreground;
             }
 
+            let mut semantic_query_foreground = None;
             if in_query {
-                style.background_color = Some(
-                    with_alpha(theme.colors.accent, if theme.is_dark { 0.22 } else { 0.16 }).into(),
-                );
+                let (background, foreground) = query_highlight_colors(theme);
+                style.background_color = Some(background.into_color());
+                semantic_query_foreground = foreground;
             }
 
             let syntax_fg = syntax_highlight_color(theme, syntax);
             if let Some(fg) = syntax_fg {
-                style.color = Some(fg.into());
+                style.color = Some(fg.into_color());
+            }
+            if syntax_fg.is_none()
+                && let Some(foreground) = semantic_word_foreground
+            {
+                style.color = Some(foreground.into_color());
+            }
+            if let Some(foreground) = semantic_query_foreground {
+                style.color = Some(foreground.into_color());
             }
 
             if style != gpui::HighlightStyle::default() && offset < next_offset {
@@ -615,7 +652,7 @@ pub(in super::super) fn build_cached_diff_styled_text(
     query: &str,
     language: Option<DiffSyntaxLanguage>,
     syntax_mode: DiffSyntaxMode,
-    word_color: Option<gpui::Rgba>,
+    word_kind: Option<crate::theme::DiffColorKind>,
 ) -> CachedDiffStyledText {
     build_cached_diff_styled_text_with_optional_palette(
         theme,
@@ -628,7 +665,7 @@ pub(in super::super) fn build_cached_diff_styled_text(
                 language,
                 mode: syntax_mode,
             },
-            word_color,
+            word_kind,
         },
         None,
     )
@@ -642,7 +679,7 @@ pub(in super::super) fn build_cached_diff_styled_text_with_source_identity(
     query: &str,
     language: Option<DiffSyntaxLanguage>,
     syntax_mode: DiffSyntaxMode,
-    word_color: Option<gpui::Rgba>,
+    word_kind: Option<crate::theme::DiffColorKind>,
 ) -> CachedDiffStyledText {
     build_cached_diff_styled_text_with_optional_palette(
         theme,
@@ -655,7 +692,7 @@ pub(in super::super) fn build_cached_diff_styled_text_with_source_identity(
                 language,
                 mode: syntax_mode,
             },
-            word_color,
+            word_kind,
         },
         source_identity,
     )
@@ -756,7 +793,7 @@ fn build_cached_diff_styled_text_with_optional_palette(
 
     if highlight_palette.is_none()
         && query.is_empty()
-        && request.word_color.is_none()
+        && request.word_kind.is_none()
         && !word_ranges.is_empty()
         && should_cache_single_line_styled_text(text)
     {
@@ -821,8 +858,9 @@ pub(in super::super) fn build_cached_diff_query_overlay_styled_text(
         }
 
         let base_highlights = base.highlights.as_ref();
-        let query_bg =
-            with_alpha(theme.colors.accent, if theme.is_dark { 0.22 } else { 0.16 }).into();
+        let (query_bg, query_fg) = query_highlight_colors(theme);
+        let query_bg: gpui::Hsla = query_bg.into_color();
+        let query_fg: Option<gpui::Hsla> = query_fg.map(IntoColor::into_color);
         if base_highlights.is_empty() {
             let mut merged = Vec::with_capacity(query_ranges.len());
             for range in query_ranges.iter().cloned() {
@@ -830,6 +868,7 @@ pub(in super::super) fn build_cached_diff_query_overlay_styled_text(
                     &mut merged,
                     range,
                     gpui::HighlightStyle {
+                        color: query_fg,
                         background_color: Some(query_bg),
                         ..gpui::HighlightStyle::default()
                     },
@@ -887,6 +926,9 @@ pub(in super::super) fn build_cached_diff_query_overlay_styled_text(
             let mut style = active_base.map(|(_, style)| *style).unwrap_or_default();
             if active_query.is_some() {
                 style.background_color = Some(query_bg);
+                if let Some(query_fg) = query_fg {
+                    style.color = Some(query_fg);
+                }
             }
 
             if style != default_style {
@@ -940,7 +982,7 @@ fn hash_highlights(highlights: &[(Range<usize>, gpui::HighlightStyle)]) -> u64 {
     let mut hasher = FxHasher::default();
     for (range, style) in highlights {
         range.hash(&mut hasher);
-        style.hash(&mut hasher);
+        crate::text_runs::hash_highlight_style(style, &mut hasher);
     }
     hasher.finish()
 }
@@ -952,7 +994,7 @@ fn hash_query_overlay_highlights(
 ) -> u64 {
     let mut hasher = FxHasher::default();
     base_highlights_hash.hash(&mut hasher);
-    query_bg.hash(&mut hasher);
+    crate::text_runs::hash_hsla(&query_bg, &mut hasher);
     for range in query_ranges {
         range.hash(&mut hasher);
     }
@@ -1021,7 +1063,7 @@ pub(super) fn syntax_highlight_style(
 ) -> Option<gpui::HighlightStyle> {
     let fg = syntax_highlight_color(theme, kind)?;
     let mut style = gpui::HighlightStyle {
-        color: Some(fg.into()),
+        color: Some(fg.into_color()),
         ..gpui::HighlightStyle::default()
     };
     match kind {
@@ -1281,6 +1323,10 @@ pub(in crate::view) struct PreparedDocumentByteRangeHighlights {
 }
 
 #[derive(Clone, Default)]
+#[cfg(any(test, feature = "benchmarks"))]
+// The bench warmup only wants the chunk-building side effect and drops the
+// result; the fields are read by the unit tests.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(in crate::view) struct PreparedDocumentLineHighlights {
     pub line_ix: usize,
     pub highlights: Vec<(Range<usize>, gpui::HighlightStyle)>,
@@ -1306,7 +1352,7 @@ pub(in crate::view) fn syntax_highlights_for_line(
 pub(super) fn styled_text_for_diff_segments(
     theme: AppTheme,
     segments: &[CachedDiffTextSegment],
-    word_color: Option<gpui::Rgba>,
+    word_kind: Option<crate::theme::DiffColorKind>,
 ) -> (SharedString, Vec<(Range<usize>, gpui::HighlightStyle)>) {
     let combined_len: usize = segments.iter().map(|s| s.text.len()).sum();
     let mut combined = String::with_capacity(combined_len);
@@ -1320,22 +1366,33 @@ pub(super) fn styled_text_for_diff_segments(
 
         let mut style = gpui::HighlightStyle::default();
 
+        let mut semantic_word_foreground = None;
         if seg.in_word
-            && let Some(mut c) = word_color
+            && let Some(c) = word_kind
         {
-            c.a = if theme.is_dark { 0.22 } else { 0.16 };
-            style.background_color = Some(c.into());
+            let (background, foreground) = word_highlight_colors(theme, c);
+            style.background_color = Some(background.into_color());
+            semantic_word_foreground = foreground;
         }
 
+        let mut semantic_query_foreground = None;
         if seg.in_query {
-            style.background_color = Some(
-                with_alpha(theme.colors.accent, if theme.is_dark { 0.22 } else { 0.16 }).into(),
-            );
+            let (background, foreground) = query_highlight_colors(theme);
+            style.background_color = Some(background.into_color());
+            semantic_query_foreground = foreground;
         }
 
         let syntax_fg = syntax_highlight_color(theme, seg.syntax);
         if let Some(fg) = syntax_fg {
-            style.color = Some(fg.into());
+            style.color = Some(fg.into_color());
+        }
+        if syntax_fg.is_none()
+            && let Some(foreground) = semantic_word_foreground
+        {
+            style.color = Some(foreground.into_color());
+        }
+        if let Some(foreground) = semantic_query_foreground {
+            style.color = Some(foreground.into_color());
         }
 
         if style != gpui::HighlightStyle::default() && offset < next_offset {
@@ -1416,29 +1473,29 @@ pub(in super::super) fn diff_line_colors(
 
     match (theme.is_dark, kind) {
         (_, Header) => (
-            theme.colors.window_bg,
-            theme.colors.text_muted,
-            theme.colors.text_muted,
+            theme.colors.editor.background,
+            theme.colors.editor.line_number,
+            theme.colors.editor.line_number,
         ),
         (_, Hunk) => (
-            theme.colors.window_bg,
-            theme.colors.accent,
-            theme.colors.text_muted,
+            theme.colors.editor.background,
+            theme.colors.accent.foreground,
+            theme.colors.editor.line_number,
         ),
         (_, Add) => (
-            theme.colors.diff_add_bg,
-            theme.colors.diff_add_text,
-            theme.colors.diff_add_text,
+            theme.colors.diff.added.background,
+            theme.colors.diff.added.foreground,
+            theme.colors.diff.added.foreground,
         ),
         (_, Remove) => (
-            theme.colors.diff_remove_bg,
-            theme.colors.diff_remove_text,
-            theme.colors.diff_remove_text,
+            theme.colors.diff.removed.background,
+            theme.colors.diff.removed.foreground,
+            theme.colors.diff.removed.foreground,
         ),
         (_, Context) => (
-            theme.colors.window_bg,
-            theme.colors.text,
-            theme.colors.text_muted,
+            theme.colors.editor.background,
+            theme.colors.editor.foreground,
+            theme.colors.editor.line_number,
         ),
     }
 }

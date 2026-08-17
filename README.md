@@ -14,7 +14,7 @@ GitComet is built for teams that want fast Git operations with local-first priva
 
 Available for Linux, Windows, and macOS.
 
-<img alt="GitComet demo" src="assets/gitcomet.gif"/>
+<img alt="GitComet demo" src="assets/gitcomet-0.2.0.gif"/>
 
 ### Download
 
@@ -258,10 +258,6 @@ backtrace.
 SourceTree, GitKraken, Zed, GPUI, KDiff3, Meld, Github Desktop, Git, Gix, Rust, Smol, and many more.
 
 This project has been created with the help of AI tools, including OpenAI Codex and Claude Code.
-
-### Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=Auto-Explore/gitcomet&type=Date)](https://star-history.com/#Auto-Explore/gitcomet&Date)
 
 ### License
 

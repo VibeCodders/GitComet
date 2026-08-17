@@ -10,6 +10,7 @@ pub(in crate::view) mod diff_cache;
 pub(in crate::view) mod diff_search;
 mod diff_stage;
 mod diff_text;
+mod file_editor;
 mod helpers;
 mod interactive_rebase;
 mod preview;
@@ -19,6 +20,10 @@ mod preview;
 pub(in crate::view) use diff_search::{
     AsciiCaseInsensitiveNeedle, DiffSearchQueryReuse, diff_search_query_reuse,
 };
+// The editor's free functions are exercised directly by the panel tests; the
+// pane itself reaches them through `impl MainPaneView`.
+#[cfg(test)]
+pub(in crate::view) use file_editor::*;
 pub(crate) use helpers::*;
 
 #[cfg(not(test))]
@@ -67,19 +72,16 @@ impl Render for MainPaneView {
         ));
         self.last_window_size = window.viewport_size();
         self.sync_root_layout_snapshot(cx);
+        // The file explorer marks and pins files with unsaved buffers, and those
+        // buffers live here rather than in the store, so nothing else can notice
+        // them changing.
+        self.sync_unsaved_file_edits_rev(cx);
         let history_content_width = self.main_pane_content_width(cx);
         self.history_view.update(cx, |v, _| {
             v.set_last_window_size(self.last_window_size);
             v.set_history_content_width(history_content_width);
         });
 
-        // Purple frame only when the content pane shows a file's content at a
-        // historical browse point — not when it shows a normal (staged/unstaged/
-        // commit) diff, even while a browse point is active.
-        let historical_content = self
-            .active_repo()
-            .is_some_and(|r| r.browsing_commit().is_some() && r.diff_state.content_preview);
-        let purple = crate::theme::historical_outline(self.theme.is_dark);
         let show_diff = self
             .active_repo()
             .and_then(|r| r.diff_state.diff_target.as_ref())
@@ -100,15 +102,10 @@ impl Render for MainPaneView {
         } else {
             self.history_view.clone().into_any_element()
         };
-        div()
-            .size_full()
-            .relative()
-            .child(inner)
-            .when(historical_content, |d| {
-                // Overlay the historical frame so entering browse mode does
-                // not inset or resize the content beneath it.
-                d.child(div().absolute().inset_0().border_2().border_color(purple))
-            })
+        // The historical-browse treatment lives inside `diff_view` now — as a
+        // tint on the file header and the content surface, see
+        // `historical_browse_content_active`.
+        div().size_full().relative().child(inner)
     }
 }
 

@@ -41,9 +41,9 @@ fn branch_row(
         "unapplied"
     };
     let status_color = if applied {
-        theme.colors.success
+        theme.colors.status.success.foreground
     } else {
-        theme.colors.text_muted
+        theme.colors.foreground.secondary
     };
 
     let toggle_button = if applied {
@@ -90,7 +90,7 @@ fn branch_row(
                     div()
                         .text_sm()
                         .font_weight(FontWeight::BOLD)
-                        .text_color(theme.colors.text)
+                        .text_color(theme.colors.foreground.primary)
                         .child(name),
                 )
                 .child(
@@ -146,7 +146,7 @@ pub(super) fn panel(
                 .child(
                     div()
                         .text_xs()
-                        .text_color(theme.colors.text_muted)
+                        .text_color(theme.colors.foreground.secondary)
                         .line_height(scaled_px(14.0))
                         .child("Group worktree changes and commit them separately"),
                 ),
@@ -199,7 +199,7 @@ pub(super) fn panel(
         let mut list = div().flex().flex_col().w_full();
         for branch in branches.iter() {
             list = list
-                .child(div().border_t_1().border_color(theme.colors.border_variant))
+                .child(div().border_t_1().border_color(theme.colors.stroke.subtle))
                 .child(branch_row(this, repo_id, branch, scaled_px, cx));
         }
         list.into_any_element()
@@ -207,7 +207,7 @@ pub(super) fn panel(
 
     let create_footer = div()
         .border_t_1()
-        .border_color(theme.colors.border)
+        .border_color(theme.colors.stroke.default)
         .px(scaled_px(8.0))
         .py(scaled_px(6.0))
         .flex()
@@ -227,7 +227,7 @@ pub(super) fn panel(
             .flex_col()
             .w(width.preferred_px(ui_scale))
             .child(header)
-            .child(div().border_t_1().border_color(theme.colors.border))
+            .child(div().border_t_1().border_color(theme.colors.stroke.default))
             .child(list)
             .child(create_footer),
     )

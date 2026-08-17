@@ -2,6 +2,7 @@ use crate::theme::{AppTheme, with_alpha};
 use crate::ui_scale::UiScale;
 use gpui::prelude::*;
 use gpui::{Div, FontWeight, SharedString, TextRun, div, point, px};
+use palette::IntoColor;
 
 pub const REPOSITORY_BADGE_SIZE_PX: f32 = 18.0;
 const REPOSITORY_BADGE_FONT_SIZE_PX: f32 = 8.5;
@@ -74,14 +75,23 @@ pub fn repository_initials_box(
 ) -> Div {
     let scale = scale.into();
     let foreground = if active {
-        theme.colors.accent
+        theme.colors.accent.foreground
     } else {
-        with_alpha(theme.colors.text, if theme.is_dark { 0.72 } else { 0.62 })
+        with_alpha(
+            theme.colors.foreground.primary,
+            if theme.is_dark { 0.72 } else { 0.62 },
+        )
     };
     let background = if active {
-        with_alpha(theme.colors.accent, if theme.is_dark { 0.28 } else { 0.18 })
+        with_alpha(
+            theme.colors.accent.foreground,
+            if theme.is_dark { 0.28 } else { 0.18 },
+        )
     } else {
-        with_alpha(theme.colors.text, if theme.is_dark { 0.16 } else { 0.11 })
+        with_alpha(
+            theme.colors.foreground.primary,
+            if theme.is_dark { 0.16 } else { 0.11 },
+        )
     };
     let size = scale.px(REPOSITORY_BADGE_SIZE_PX);
     let font_size = scale.px(REPOSITORY_BADGE_FONT_SIZE_PX);
@@ -100,10 +110,11 @@ pub fn repository_initials_box(
                     let run = TextRun {
                         len: initials.len(),
                         font,
-                        color: foreground.into(),
+                        color: foreground.into_color(),
                         background_color: None,
                         underline: None,
                         strikethrough: None,
+                        letter_spacing: None,
                     };
                     let shaped =
                         window

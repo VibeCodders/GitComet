@@ -5,6 +5,10 @@ mod repo_commands;
 mod repo_load;
 mod util;
 
+/// Called by the reducer as it drops a repo's handle, so the worktree scan's
+/// cached repository handles go with it. See [`repo_load`].
+pub(super) use repo_load::release_worktree_scan_handles;
+
 use crate::model::AppState;
 use crate::msg::{Effect, Msg, RepoActionKind, RepoCommandKind};
 use crate::session;
@@ -13,7 +17,7 @@ use gitcomet_core::error::{Error, ErrorKind};
 use gitcomet_core::process::GitRuntimeState;
 use gitcomet_core::services::{CancellationToken, GitBackend, GitRepository};
 use rustc_hash::FxHashMap as HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use super::RepoId;
 use super::executor::TaskExecutor;
@@ -24,6 +28,12 @@ use super::worker_channel::StoreWorkerSender;
 pub(super) struct RepoTaskToken {
     pub(super) load_epoch: u64,
     pub(super) cancellation: CancellationToken,
+    /// Cancellation for the *current* log walk alone. An author-filtered walk
+    /// on a large repository runs for tens of seconds and the repo-load pool
+    /// has one or two threads, so a superseded walk has to be stopped for its
+    /// replacement to start at all — but stopping it must not disturb the
+    /// repository's other loads, which share [`Self::cancellation`].
+    log_cancellation: Arc<Mutex<CancellationToken>>,
 }
 
 impl RepoTaskToken {
@@ -31,7 +41,30 @@ impl RepoTaskToken {
         Self {
             load_epoch,
             cancellation: CancellationToken::new(),
+            log_cancellation: Arc::new(Mutex::new(CancellationToken::new())),
         }
+    }
+
+    /// Cancels the log walk in flight, if any, and hands out the token for the
+    /// walk that replaces it.
+    fn take_over_log(&self) -> CancellationToken {
+        let mut slot = self
+            .log_cancellation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        slot.cancel();
+        let next = CancellationToken::new();
+        *slot = next.clone();
+        next
+    }
+
+    /// Cancels every task running under this token, log walks included.
+    pub(super) fn cancel(&self) {
+        self.cancellation.cancel();
+        self.log_cancellation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cancel();
     }
 }
 
@@ -129,7 +162,7 @@ fn ensure_repo_task_token(
             previous.load_epoch,
             load_epoch
         );
-        previous.cancellation.cancel();
+        previous.cancel();
     } else {
         repo_load_trace::trace!(
             "repo_load_token create repo_id={:?} load_epoch={}",
@@ -149,6 +182,21 @@ fn repo_load_context(
     let token = ensure_repo_task_token(thread_state, repo_task_tokens, repo_id)?;
     let msg_tx = msg_tx.with_repo_load_guard(repo_id, token.load_epoch, token.cancellation.clone());
     Some((msg_tx, token.cancellation))
+}
+
+/// Like [`repo_load_context`], but for the log walk: the returned token covers
+/// this walk alone, and taking it cancels whichever walk it replaces. Messages
+/// still ride the repository-wide guard, so a cancelled walk's reply arrives
+/// and is dropped by the reducer rather than vanishing silently.
+fn log_load_context(
+    thread_state: &Arc<RwLock<Arc<AppState>>>,
+    repo_task_tokens: &mut HashMap<RepoId, RepoTaskToken>,
+    msg_tx: StoreWorkerSender,
+    repo_id: RepoId,
+) -> Option<(StoreWorkerSender, CancellationToken)> {
+    let token = ensure_repo_task_token(thread_state, repo_task_tokens, repo_id)?;
+    let msg_tx = msg_tx.with_repo_load_guard(repo_id, token.load_epoch, token.cancellation.clone());
+    Some((msg_tx, token.take_over_log()))
 }
 
 fn effect_requires_available_git(effect: &Effect) -> bool {
@@ -199,9 +247,8 @@ fn send_unavailable_git_effect_result(
         | Effect::PersistRecentRepo { .. }
         | Effect::PersistRepoHistoryMode { .. }
         | Effect::PersistRepoHistoryModesBatch { .. }
-        | Effect::PersistRepoHistoryAuthorFilter { .. }
-        | Effect::PersistVirtualBranches { .. }
-        | Effect::CancelRepoLoads { .. } => {}
+        | Effect::PersistRepoHistoryAuthorFilter { .. }        | Effect::PersistVirtualBranches { .. }
+          | Effect::CancelRepoLoads { .. } => {}
         Effect::OpenRepo { repo_id, path } => {
             send(Msg::Internal(crate::msg::InternalMsg::RepoOpenedErr {
                 repo_id,
@@ -259,12 +306,14 @@ fn send_unavailable_git_effect_result(
         )),
         Effect::LoadLog {
             repo_id,
+            seq,
             scope,
             author,
             cursor,
             ..
         } => send(Msg::Internal(crate::msg::InternalMsg::LogLoaded {
             repo_id,
+            seq,
             scope,
             author,
             cursor,
@@ -366,6 +415,13 @@ fn send_unavailable_git_effect_result(
                 result: Err(git_unavailable_error(runtime)),
             },
         )),
+        Effect::AppendGitignorePatterns { repo_id, patterns } => send(Msg::Internal(
+            crate::msg::InternalMsg::RepoCommandFinished {
+                repo_id,
+                command: RepoCommandKind::AppendGitignorePatterns { patterns },
+                result: Err(git_unavailable_error(runtime)),
+            },
+        )),
         Effect::LoadFileHistory { repo_id, path, .. } => {
             send(Msg::Internal(crate::msg::InternalMsg::FileHistoryLoaded {
                 repo_id,
@@ -385,6 +441,18 @@ fn send_unavailable_git_effect_result(
         })),
         Effect::LoadWorktrees { repo_id } => {
             send(Msg::Internal(crate::msg::InternalMsg::WorktreesLoaded {
+                repo_id,
+                result: Err(git_unavailable_error(runtime)),
+            }))
+        }
+        Effect::LoadWorktreeDirty { repo_id, .. } => send(Msg::Internal(
+            crate::msg::InternalMsg::WorktreeDirtyLoaded {
+                repo_id,
+                result: Err(git_unavailable_error(runtime)),
+            },
+        )),
+        Effect::LoadRefMetadata { repo_id } => {
+            send(Msg::Internal(crate::msg::InternalMsg::RefMetadataLoaded {
                 repo_id,
                 result: Err(git_unavailable_error(runtime)),
             }))
@@ -454,6 +522,20 @@ fn send_unavailable_git_effect_result(
             crate::msg::InternalMsg::CommitDetailsLoaded {
                 repo_id,
                 commit_id,
+                result: Err(git_unavailable_error(runtime)),
+            },
+        )),
+        Effect::LoadHoverCommitMessage { repo_id, commit_id } => send(Msg::Internal(
+            crate::msg::InternalMsg::HoverCommitMessageLoaded {
+                repo_id,
+                commit_id,
+                result: Err(git_unavailable_error(runtime)),
+            },
+        )),
+        Effect::ResolveCommitForReveal { repo_id, reference } => send(Msg::Internal(
+            crate::msg::InternalMsg::CommitRevealResolved {
+                repo_id,
+                reference,
                 result: Err(git_unavailable_error(runtime)),
             },
         )),
@@ -740,6 +822,9 @@ fn send_unavailable_git_effect_result(
         }
         Effect::ForceDeleteBranch { repo_id, .. } => {
             send_repo_action_unavailable(repo_id, RepoActionKind::ForceDeleteBranch, runtime, &send)
+        }
+        Effect::DeleteBranches { repo_id, .. } => {
+            send_repo_action_unavailable(repo_id, RepoActionKind::DeleteBranches, runtime, &send)
         }
         Effect::StagePath { repo_id, .. } => {
             send_repo_action_unavailable(repo_id, RepoActionKind::StagePath, runtime, &send)
@@ -1076,6 +1161,18 @@ fn send_unavailable_git_effect_result(
             crate::msg::InternalMsg::RepoCommandFinished {
                 repo_id,
                 command: RepoCommandKind::DeleteRemoteBranch { remote, branch },
+                result: Err(git_unavailable_error(runtime)),
+            },
+        )),
+        Effect::DeleteRemoteBranches {
+            repo_id,
+            remote,
+            branches,
+            ..
+        } => send(Msg::Internal(
+            crate::msg::InternalMsg::RepoCommandFinished {
+                repo_id,
+                command: RepoCommandKind::DeleteRemoteBranches { remote, branches },
                 result: Err(git_unavailable_error(runtime)),
             },
         )),
@@ -1484,7 +1581,7 @@ pub(super) fn schedule_effect(
                 .is_some_and(|token| token.load_epoch == load_epoch)
                 && let Some(token) = repo_task_tokens.remove(&repo_id)
             {
-                token.cancellation.cancel();
+                token.cancel();
             }
         }
         Effect::LoadBranches { repo_id } => {
@@ -1593,19 +1690,21 @@ pub(super) fn schedule_effect(
         }
         Effect::LoadLog {
             repo_id,
+            seq,
             scope,
             author,
             limit,
             cursor,
         } => {
             if let Some((msg_tx, cancellation)) =
-                repo_load_context(thread_state, repo_task_tokens, msg_tx, repo_id)
+                log_load_context(thread_state, repo_task_tokens, msg_tx, repo_id)
             {
                 repo_load::schedule_load_log(
                     repo_load_executor,
                     repos,
                     msg_tx,
                     repo_id,
+                    seq,
                     scope,
                     author,
                     limit,
@@ -1738,6 +1837,11 @@ pub(super) fn schedule_effect(
         } => repo_commands::schedule_save_worktree_file(
             executor, repos, msg_tx, repo_id, path, contents, stage,
         ),
+        Effect::AppendGitignorePatterns { repo_id, patterns } => {
+            repo_commands::schedule_append_gitignore_patterns(
+                executor, repos, msg_tx, repo_id, patterns,
+            )
+        }
         Effect::LoadFileHistory {
             repo_id,
             path,
@@ -1768,6 +1872,39 @@ pub(super) fn schedule_effect(
             {
                 repo_load::schedule_load_worktrees(
                     repo_load_executor,
+                    repos,
+                    msg_tx,
+                    repo_id,
+                    cancellation,
+                );
+            }
+        }
+        Effect::LoadWorktreeDirty {
+            repo_id,
+            workdir,
+            files_for,
+        } => {
+            if let Some((msg_tx, cancellation)) =
+                repo_load_context(thread_state, repo_task_tokens, msg_tx, repo_id)
+            {
+                repo_load::schedule_load_worktree_dirty(
+                    repo_load_executor,
+                    backend.clone(),
+                    repos,
+                    msg_tx,
+                    repo_id,
+                    workdir,
+                    files_for,
+                    cancellation,
+                );
+            }
+        }
+        Effect::LoadRefMetadata { repo_id } => {
+            if let Some((msg_tx, cancellation)) =
+                repo_load_context(thread_state, repo_task_tokens, msg_tx, repo_id)
+            {
+                repo_load::schedule_load_ref_metadata(
+                    metadata_executor,
                     repos,
                     msg_tx,
                     repo_id,
@@ -1870,6 +2007,24 @@ pub(super) fn schedule_effect(
             {
                 repo_load::schedule_load_commit_details(
                     executor, repos, msg_tx, repo_id, commit_id,
+                );
+            }
+        }
+        Effect::LoadHoverCommitMessage { repo_id, commit_id } => {
+            if let Some((msg_tx, _)) =
+                repo_load_context(thread_state, repo_task_tokens, msg_tx, repo_id)
+            {
+                repo_load::schedule_load_hover_commit_message(
+                    executor, repos, msg_tx, repo_id, commit_id,
+                );
+            }
+        }
+        Effect::ResolveCommitForReveal { repo_id, reference } => {
+            if let Some((msg_tx, _)) =
+                repo_load_context(thread_state, repo_task_tokens, msg_tx, repo_id)
+            {
+                repo_load::schedule_resolve_commit_for_reveal(
+                    executor, repos, msg_tx, repo_id, reference,
                 );
             }
         }
@@ -2165,6 +2320,13 @@ pub(super) fn schedule_effect(
         Effect::ForceDeleteBranch { repo_id, name } => {
             repo_actions::schedule_force_delete_branch(executor, repos, msg_tx, repo_id, name);
         }
+        Effect::DeleteBranches {
+            repo_id,
+            names,
+            force,
+        } => {
+            repo_actions::schedule_delete_branches(executor, repos, msg_tx, repo_id, names, force);
+        }
         Effect::CloneRepo { url, dest, auth } => {
             clone::schedule_clone_repo(executor, msg_tx, url, dest, auth)
         }
@@ -2420,6 +2582,14 @@ pub(super) fn schedule_effect(
             auth,
         } => repo_commands::schedule_delete_remote_branch(
             executor, repos, msg_tx, repo_id, remote, branch, auth,
+        ),
+        Effect::DeleteRemoteBranches {
+            repo_id,
+            remote,
+            branches,
+            auth,
+        } => repo_commands::schedule_delete_remote_branches(
+            executor, repos, msg_tx, repo_id, remote, branches, auth,
         ),
         Effect::Reset {
             repo_id,

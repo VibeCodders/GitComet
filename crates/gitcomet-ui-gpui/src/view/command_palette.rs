@@ -7,6 +7,7 @@ use gpui::{
     ScrollStrategy, SharedString, UniformListScrollHandle, WeakEntity, Window, div, px,
     uniform_list,
 };
+use palette::IntoColor;
 
 use super::shortcut_labels::Shortcut;
 use super::{GitCometView, components, restrict_scroll_to_vertical_axis};
@@ -262,6 +263,14 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         },
         category: "Navigation",
         keywords: "",
+        requires_repo: true,
+    },
+    CommandEntry {
+        id: "locate-file-in-explorer",
+        label: "Show File in Explorer",
+        shortcut: Shortcut::Secondary("Shift+L"),
+        category: "Navigation",
+        keywords: "locate reveal find sidebar tree folder current",
         requires_repo: true,
     },
     CommandEntry {
@@ -825,7 +834,7 @@ impl CommandPaletteView {
         cx: &gpui::Context<Self>,
     ) -> AnyElement {
         let highlight = gpui::HighlightStyle {
-            color: Some(self.theme.colors.accent.into()),
+            color: Some(self.theme.colors.accent.foreground.into_color()),
             font_weight: Some(FontWeight::BOLD),
             ..gpui::HighlightStyle::default()
         };
@@ -839,7 +848,7 @@ impl CommandPaletteView {
         let focus_range = ranges.first().map(|(range, _)| range.clone());
         let mut text = components::TruncatedText::new(label.to_owned())
             .profile(components::TextTruncationProfile::End)
-            .text_color(self.theme.colors.text)
+            .text_color(self.theme.colors.foreground.primary)
             .text_sm();
         if let Some(focus_range) = focus_range {
             text = text.focus_range(Some(focus_range));
@@ -876,7 +885,7 @@ impl CommandPaletteView {
                             .px(scaled_px(14.0))
                             .text_xs()
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme.colors.text_muted)
+                            .text_color(theme.colors.foreground.secondary)
                             .child(title)
                             .into_any_element(),
                         false,
@@ -886,6 +895,10 @@ impl CommandPaletteView {
                         let command_id: SharedString = command.id.into();
                         let command_id_for_click = command_id.clone();
                         let command_row = div()
+                            // Without an id gpui never repaints on mouse-move,
+                            // so the hover fill below would be computed and
+                            // dropped every frame.
+                            .id(("command_palette_row", command_index))
                             .h(row_height)
                             .w_full()
                             .flex()
@@ -949,7 +962,7 @@ impl CommandPaletteView {
                                         .w(scaled_px(3.0))
                                         .rounded_tr(px(theme.radii.row))
                                         .rounded_br(px(theme.radii.row))
-                                        .bg(theme.colors.accent),
+                                        .bg(theme.colors.accent.foreground),
                                 )
                         })
                         .px(scaled_px(6.0))
@@ -989,7 +1002,7 @@ impl Render for CommandPaletteView {
                 .justify_center()
                 .px(scaled_px(12.0))
                 .text_sm()
-                .text_color(theme.colors.text_muted)
+                .text_color(theme.colors.foreground.secondary)
                 .child("No matching commands")
                 .into_any_element()
         } else {
@@ -1026,7 +1039,7 @@ impl Render for CommandPaletteView {
                     .items_center()
                     .px(scaled_px(14.0))
                     .border_b_1()
-                    .border_color(theme.colors.border_variant)
+                    .border_color(theme.colors.stroke.subtle)
                     .child(self.query_input.clone()),
             )
             .child(list_body);
@@ -1189,6 +1202,26 @@ mod tests {
             command_list_item_index(&results, 0, true),
             1,
             "search results have one shared header"
+        );
+    }
+
+    #[test]
+    fn locate_file_in_explorer_is_a_repository_command() {
+        assert_eq!(
+            filtered_commands(true, "show file in explorer")
+                .first()
+                .map(|command| command.id),
+            Some("locate-file-in-explorer")
+        );
+        // Also findable by the word the user is more likely to reach for.
+        assert!(
+            filtered_commands(true, "locate")
+                .iter()
+                .any(|command| command.id == "locate-file-in-explorer")
+        );
+        assert!(
+            filtered_commands(false, "show file in explorer").is_empty(),
+            "there is no file to show without a repository"
         );
     }
 

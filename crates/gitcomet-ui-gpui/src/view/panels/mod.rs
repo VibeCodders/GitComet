@@ -7,6 +7,10 @@ const COMMIT_MESSAGE_INPUT_MAX_HEIGHT_PX: f32 = 200.0;
 #[derive(Clone)]
 pub(in crate::view) enum AppMenuAction {
     CommandPalette,
+    /// Reveal the open file in the sidebar's file explorer. Like every other
+    /// variant here, whether it can run is carried by the menu item's own
+    /// `disabled` flag rather than duplicated in the payload.
+    LocateFileInExplorer,
     Settings,
     OpenInCodeEditor {
         path: Option<std::path::PathBuf>,
@@ -59,6 +63,77 @@ pub(in crate::view) enum ContextMenuAction {
         source: gitcomet_core::domain::FileSource,
         path: std::path::PathBuf,
     },
+    /// Open the working-tree file in GitComet's own editor. Carries no source:
+    /// editing is always of the workspace copy, whatever view it was invoked
+    /// from.
+    EditFile {
+        repo_id: RepoId,
+        path: std::path::PathBuf,
+    },
+    /// Throw away the editor's unsaved buffer for this file and reload it from
+    /// disk. Handled in the view rather than dispatched: the buffer lives in
+    /// `MainPaneView`, and the store has no message for it.
+    DiscardFileEdits {
+        repo_id: RepoId,
+        path: std::path::PathBuf,
+    },
+    /// Open or close one folder in the file explorer — the menu's counterpart
+    /// to clicking the row.
+    ToggleFileBrowserDir {
+        repo_id: RepoId,
+        path: std::path::PathBuf,
+    },
+    /// Flip one sidebar collapse key — the branch tree's counterpart to
+    /// clicking a group or section header.
+    ToggleSidebarCollapseKey {
+        collapse_key: SharedString,
+    },
+    /// Drive one sidebar collapse key to an explicit state.
+    ///
+    /// For rows whose rendered state can diverge from the stored key — a live
+    /// branch filter force-expands the pinned sections — where a flip would
+    /// move the key the opposite way from what the entry's label promised.
+    SetSidebarCollapseKey {
+        collapse_key: SharedString,
+        collapsed: bool,
+    },
+    /// Open or close a branch group together with every group beneath it.
+    SetBranchGroupCollapsedRecursive {
+        section: BranchSection,
+        remote: Option<String>,
+        path: String,
+        collapsed: bool,
+    },
+    /// Drop every pin in one branch section.
+    UnpinAllBranches {
+        repo_id: RepoId,
+        section: BranchSection,
+    },
+    /// Resolve a branch group's members and open the delete confirmation.
+    ///
+    /// Carries the group rather than the resolved names: the menu model is
+    /// rebuilt on every repaint while it is open, and materialising a few
+    /// hundred branch names per frame to render one count is waste. The confirm
+    /// still freezes the list it is handed.
+    ConfirmDeleteBranchGroup {
+        repo_id: RepoId,
+        section: BranchSection,
+        remote: Option<String>,
+        path: String,
+        group_label: String,
+    },
+    /// Open or close a folder together with every directory beneath it.
+    SetFileBrowserDirExpandedRecursive {
+        repo_id: RepoId,
+        path: std::path::PathBuf,
+        expanded: bool,
+    },
+    /// Scroll the history to a commit referenced from somewhere else and
+    /// show its details.
+    RevealHistoryCommit {
+        repo_id: RepoId,
+        commit_id: CommitId,
+    },
     BrowseRepositoryAtCommit {
         repo_id: RepoId,
         commit_id: CommitId,
@@ -78,6 +153,21 @@ pub(in crate::view) enum ContextMenuAction {
     CloseRepos {
         repo_ids: Vec<RepoId>,
         activate_after: Option<RepoId>,
+    },
+    /// Keep a repository in the picker's Pinned section. Pins outlive both the
+    /// recents cap and the repository being closed, so this is what keeps one
+    /// reachable for good.
+    PinRepository {
+        path: std::path::PathBuf,
+    },
+    UnpinRepository {
+        path: std::path::PathBuf,
+    },
+    /// Drop a repository from the session's recent list. A pinned repository is
+    /// refused: the pin is what keeps a closed repository listed at all, so
+    /// forgetting one would strand it with nothing to bring it back.
+    ForgetRecentRepository {
+        path: std::path::PathBuf,
     },
     OpenSubmoduleDiffInTab {
         path: std::path::PathBuf,
@@ -188,6 +278,11 @@ pub(in crate::view) enum ContextMenuAction {
         area: DiffArea,
         path: std::path::PathBuf,
     },
+    AddToGitignoreSelectionOrPath {
+        repo_id: RepoId,
+        area: DiffArea,
+        path: std::path::PathBuf,
+    },
     CheckoutConflictSideSelectionOrPath {
         repo_id: RepoId,
         area: DiffArea,
@@ -285,6 +380,10 @@ pub(in crate::view) enum ContextMenuAction {
         conflict_ix: usize,
     },
     ConflictResolverSplitSelection,
+    /// kdiff3 manual diff help: pin the marked lines onto one another.
+    ConflictResolverAlignManually,
+    /// kdiff3 manual diff help: drop every pin and replan automatically.
+    ConflictResolverClearManualAlignments,
     ConflictResolverJoinRegions {
         target: ConflictResolverJoinTarget,
     },
@@ -389,6 +488,25 @@ enum ContextMenuItem {
         disabled: bool,
         action: Box<ContextMenuAction>,
     },
+    /// A caption plus a segmented control, for settings whose options are
+    /// mutually exclusive and read better side by side than as a checked list
+    /// (the merge tool's view mode). Segments are clicked, not
+    /// keyboard-selected, so the row is skipped by arrow navigation.
+    Segmented {
+        label: SharedString,
+        segments: Vec<ContextMenuSegment>,
+    },
+}
+
+/// One option inside a [`ContextMenuItem::Segmented`] row.
+#[derive(Clone)]
+struct ContextMenuSegment {
+    /// Stable element id, also used as the debug selector.
+    id: SharedString,
+    label: SharedString,
+    tooltip: Option<SharedString>,
+    selected: bool,
+    action: ContextMenuAction,
 }
 
 #[derive(Clone)]
@@ -490,6 +608,12 @@ mod repo_tabs_bar;
 pub(super) use action_bar::{ActionBarView, action_bar_height};
 pub(super) use bottom_status_bar::BottomStatusBarView;
 pub(super) use popover::PopoverHost;
+#[cfg(feature = "benchmarks")]
+pub(in crate::view) use popover::{benchmark_branch_checkout_rows, benchmark_workspace_rows};
+/// Layout guards outside this module assert against the tab padding, so they
+/// follow the constant instead of hardcoding the current value.
+#[cfg(test)]
+pub(in crate::view) use repo_tabs_bar::REPO_TAB_SIDE_PADDING_PX;
 pub(super) use repo_tabs_bar::RepoTabsBarView;
 #[allow(unused_imports)]
 pub(in crate::view) use repo_tabs_bar::repo_tab_insert_before_for_drag_cursor;

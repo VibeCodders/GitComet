@@ -101,7 +101,7 @@ const REPO_TAB_CONTENT_HEIGHT_PX: f32 = 18.0;
 const REPO_TAB_STATUS_SIZE_PX: f32 = components::REPOSITORY_BADGE_SIZE_PX;
 const REPO_TAB_LABEL_GAP_PX: f32 = 6.0;
 const REPO_TAB_CLOSE_FADE_WIDTH_PX: f32 = 16.0;
-const REPO_TAB_SIDE_PADDING_PX: f32 = 10.0;
+pub(in crate::view) const REPO_TAB_SIDE_PADDING_PX: f32 = 14.0;
 const REPO_TAB_HOVER_BOX_X_OVERHANG_PX: f32 = 4.0;
 const REPO_TAB_HOVER_BOX_Y_OVERHANG_PX: f32 = 3.0;
 const REPO_TAB_HOVER_BOX_RADIUS_PX: f32 = 4.0;
@@ -140,22 +140,25 @@ fn repo_tab_text_width(label: SharedString, font_size: Pixels, window: &mut Wind
         .width
 }
 
+/// Hover/pressed plate behind the tab's close action. Same danger tint the
+/// picker rows' remove button wears (`components::REMOVE_BUTTON_*`), except it
+/// is composited into an opaque fill: this button overlays repository text, so
+/// a translucent plate would let the label show through.
 fn repo_tab_close_button_fill(
     theme: AppTheme,
     background: gpui::Rgba,
     pressed: bool,
 ) -> gpui::Rgba {
-    let amount = match (theme.is_dark, pressed) {
-        (true, false) => 0.44,
-        (true, true) => 0.60,
-        (false, false) => 0.22,
-        (false, true) => 0.32,
+    let amount = if pressed {
+        components::REMOVE_BUTTON_PRESSED_ALPHA
+    } else {
+        components::REMOVE_BUTTON_HOVER_ALPHA
     };
-    let mut fill =
-        crate::theme::composite_over(background, with_alpha(theme.colors.shadow, amount));
-    // The hover plate must fully cover repository text beneath the overlaid
-    // close action rather than depend on stacked alpha compositing.
-    fill.a = 1.0;
+    let mut fill = crate::theme::composite_over(
+        background,
+        with_alpha(theme.colors.status.danger.foreground, amount),
+    );
+    fill.alpha = 1.0;
     fill
 }
 
@@ -773,9 +776,9 @@ impl Render for RepoTabsBarView {
             let label = repo_tab_labels[ix].clone();
             let initials: SharedString = components::repository_initials(label.as_ref()).into();
             let label_bg = if is_active || context_menu_active {
-                theme.colors.sidebar_bg
+                theme.colors.surface.chrome
             } else if is_pressed {
-                theme.colors.active
+                theme.colors.interaction.pressed_background
             } else if is_hovered {
                 hovered_tab_bg
             } else {
@@ -806,9 +809,9 @@ impl Render for RepoTabsBarView {
                 .hover(move |s| s.bg(close_hover_bg))
                 .active(move |s| s.bg(close_pressed_bg))
                 .child(svg_icon(
-                    "icons/repo_tab_close.svg",
-                    theme.colors.danger,
-                    scaled_px(REPO_TAB_STATUS_SIZE_PX),
+                    components::REMOVE_BUTTON_ICON,
+                    theme.colors.status.danger.foreground,
+                    scaled_px(components::REMOVE_BUTTON_ICON_SIZE_PX),
                 ))
                 .on_click(cx.listener(move |this, _e: &ClickEvent, _w, cx| {
                     cx.stop_propagation();
@@ -835,10 +838,12 @@ impl Render for RepoTabsBarView {
 
             let show_missing_warning = Self::repo_tab_shows_missing_warning(repo, show_spinner);
             let show_initials = !show_spinner && !show_missing_warning;
-            let status_color =
-                with_alpha(theme.colors.text, if theme.is_dark { 0.72 } else { 0.62 });
+            let status_color = with_alpha(
+                theme.colors.foreground.primary,
+                if theme.is_dark { 0.72 } else { 0.62 },
+            );
             let badge_color = if is_active {
-                theme.colors.accent
+                theme.colors.accent.foreground
             } else {
                 status_color
             };
@@ -880,7 +885,7 @@ impl Render for RepoTabsBarView {
                         .when(show_missing_warning, |d| {
                             d.child(svg_icon(
                                 "icons/warning.svg",
-                                theme.colors.warning,
+                                theme.colors.status.warning.foreground,
                                 scaled_px(12.0),
                             ))
                         })
@@ -917,7 +922,7 @@ impl Render for RepoTabsBarView {
                             .debug_selector(move || format!("repo_tab_terminal_{}", repo_id.0))
                             .child(svg_icon(
                                 "icons/terminal.svg",
-                                theme.colors.accent,
+                                theme.colors.accent.foreground,
                                 scaled_px(REPO_TAB_STATUS_SIZE_PX),
                             )),
                     )
@@ -934,10 +939,10 @@ impl Render for RepoTabsBarView {
                                 format!("repo_tab_separator_after_{}", repo_id.0)
                             })
                             .absolute()
-                            // Each tab has 4px horizontal margins. Paint in
-                            // their shared gap so the divider sits between the
-                            // two idle tab shapes rather than on either one.
-                            .right(scaled_px(-4.0))
+                            // Paint in the margin the two neighbouring tabs
+                            // share, so the divider sits in their gap rather
+                            // than on either tab shape.
+                            .right(scaled_px(-components::Tab::HORIZONTAL_MARGIN_PX))
                             .top(scaled_px(7.0))
                             .w(px(1.0))
                             .h(scaled_px(16.0))
@@ -1090,11 +1095,10 @@ impl Render for RepoTabsBarView {
                 components::Button::new("add_repo_menu", "")
                     .start_slot(svg_icon(
                         "icons/plus.svg",
-                        theme.colors.text_muted,
+                        theme.colors.foreground.secondary,
                         scaled_px(14.0),
                     ))
                     .style(components::ButtonStyle::Transparent)
-                    .borderless()
                     .on_click_with_bounds(theme, cx, move |_this, _e, bounds, window, cx| {
                         cx.stop_propagation();
                         let _ = root_view.update(cx, |root, cx| {
@@ -1263,20 +1267,32 @@ mod tests {
     }
 
     #[test]
-    fn repo_tab_close_hover_uses_an_opaque_darker_fill() {
+    fn repo_tab_close_hover_uses_an_opaque_danger_tint() {
         for theme in [
             crate::theme::AppTheme::gitcomet_dark(),
             crate::theme::AppTheme::gitcomet_light(),
         ] {
-            let background = theme.colors.sidebar_bg;
+            let background = theme.colors.surface.chrome;
             let hover = repo_tab_close_button_fill(theme, background, false);
             let pressed = repo_tab_close_button_fill(theme, background, true);
-            let brightness = |color: gpui::Rgba| color.r + color.g + color.b;
+            let danger = theme.colors.status.danger.foreground;
+            let distance_to_danger = |color: gpui::Rgba| {
+                (color.red - danger.red).abs()
+                    + (color.green - danger.green).abs()
+                    + (color.blue - danger.blue).abs()
+            };
 
-            assert_eq!(hover.a, 1.0, "hover background must be solid");
-            assert_eq!(pressed.a, 1.0, "pressed background must be solid");
-            assert!(brightness(hover) < brightness(background));
-            assert!(brightness(pressed) < brightness(hover));
+            // Opaque, because the button overlays repository label text.
+            assert_eq!(hover.alpha, 1.0, "hover background must be solid");
+            assert_eq!(pressed.alpha, 1.0, "pressed background must be solid");
+            assert!(
+                distance_to_danger(hover) < distance_to_danger(background),
+                "hover plate must lean toward the danger colour, like the picker rows' remove button"
+            );
+            assert!(
+                distance_to_danger(pressed) < distance_to_danger(hover),
+                "pressed plate must lean further toward danger than hover"
+            );
         }
     }
 

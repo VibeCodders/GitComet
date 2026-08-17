@@ -260,16 +260,51 @@ impl MainPaneView {
 
         let mut handled = false;
 
+        // While the editable buffer has focus every keystroke belongs to it, with
+        // one exception: Ctrl/Cmd+S saves and returns to the originating view.
+        // Outside the editor that chord stages the file, and both meanings can
+        // coexist precisely because they are separated by focus.
+        if self
+            .file_editor_input
+            .read(cx)
+            .focus_handle()
+            .is_focused(window)
+        {
+            if (mods.control || mods.platform)
+                && !mods.alt
+                && !mods.shift
+                && !mods.function
+                && key == "s"
+            {
+                self.save_file_editor_buffer_and_exit(window, cx);
+                return true;
+            }
+            if key == "escape" && !mods.control && !mods.alt && !mods.platform && !mods.function {
+                self.toggle_file_editor(window, cx);
+                return true;
+            }
+            // Deliberately *not* Alt+E: on macOS Option+E is the acute-accent
+            // dead key, and swallowing it here would stop the buffer composing
+            // `é`. Escape above is the way out from inside the editor; Alt+E
+            // only enters it, from a view where nothing is being typed.
+            return false;
+        }
+
         // When the editable resolved-output pane is focused the user is typing
         // free text: every text-producing keystroke (space, a/b/c/d, etc.)
         // belongs to that editor, not to the diff/conflict shortcut table.
         // Letting them through here staged the conflict file on the first space
         // typed (StagePath → the file leaves Conflicted → the resolver closes
-        // mid-edit). Two deliberate carve-outs:
+        // mid-edit). Three deliberate carve-outs:
         //   * Ctrl+1/2/3 pick aliases are chords with no text-input collision,
         //     so they stay live while editing (kdiff3 parity).
-        //   * Ctrl+Home/End/PgUp/PgDn are intentionally NOT handled here, so the
-        //     editor keeps them for cursor movement (kdiff3 parity).
+        //   * Shift+F2/F3 (previous/next unresolved conflict) likewise: an
+        //     F-key produces no text and the editor binds only the unmodified
+        //     `f2`/`f3`, so the chord is free here — and jumping to the next
+        //     open conflict is exactly what you want *while* editing the
+        //     merged result, which is why it is not left outside.
+        //   * GitComet's Ctrl+Home/End resolver bindings are intentionally NOT
+        //     handled here, so the editor keeps them for cursor movement.
         if self
             .conflict_resolver_input
             .read(cx)
@@ -280,17 +315,50 @@ impl MainPaneView {
                 && (mods.control || mods.platform)
                 && !mods.alt
                 && !mods.function
-                && !mods.shift
-                && self.conflict_resolver_conflict_count() > 0
                 && let Some(choice) = conflict_resolver::conflict_ctrl_pick_choice_for_key(
                     key,
                     self.conflict_resolver.view_mode,
                 )
             {
-                self.conflict_resolver_pick_active_conflict(choice, cx);
+                if mods.shift {
+                    self.conflict_resolver_choose_everywhere(choice, cx);
+                    return true;
+                }
+                if self.conflict_resolver_has_active_pick_target() {
+                    self.conflict_resolver_pick_active_conflict(choice, cx);
+                    return true;
+                }
+            }
+            if self.is_conflict_resolver_active()
+                && matches!(key, "f2" | "f3")
+                && mods.shift
+                && !mods.control
+                && !mods.alt
+                && !mods.platform
+                && !mods.function
+                && !self.conflict_resolver.nav_targets.is_empty()
+            {
+                if key == "f2" {
+                    self.conflict_jump_prev_unresolved(cx);
+                } else {
+                    self.conflict_jump_next_unresolved(cx);
+                }
                 return true;
             }
             return false;
+        }
+
+        // kdiff3 manual diff help: Escape abandons pending alignment marks
+        // before reaching the resolver's other escape behaviors, so a
+        // mis-marked line does not cost the user their selection or view.
+        if key == "escape"
+            && !mods.control
+            && !mods.alt
+            && !mods.platform
+            && !mods.function
+            && self.conflict_resolver_clear_alignment_marks(cx)
+        {
+            return true;
         }
 
         if key == "escape" && !mods.control && !mods.alt && !mods.platform && !mods.function {
@@ -315,6 +383,32 @@ impl MainPaneView {
 
         if !handled && mods.secondary() && mods.number_of_modifiers() == 1 && key == "f" {
             handled = self.open_search_for_active_view(window, cx);
+        }
+
+        // Shift+F2/F3 step between *unresolved* conflicts — the resolved ones
+        // are skipped, which is what separates this from plain F2/F3.
+        //
+        // It sits ahead of the diff-search block below deliberately: this is a
+        // distinct chord, so letting it become "previous/next search match"
+        // whenever the search box happens to be open would be surprising. The
+        // resolver guard keeps that scoped — outside the conflict resolver
+        // Shift+F2/F3 falls through and means exactly what it always did.
+        if !handled
+            && matches!(key, "f2" | "f3")
+            && mods.shift
+            && !mods.control
+            && !mods.alt
+            && !mods.platform
+            && !mods.function
+            && self.is_conflict_resolver_active()
+            && !self.conflict_resolver.nav_targets.is_empty()
+        {
+            if key == "f2" {
+                self.conflict_jump_prev_unresolved(cx);
+            } else {
+                self.conflict_jump_next_unresolved(cx);
+            }
+            handled = true;
         }
 
         if !handled
@@ -715,6 +809,39 @@ impl MainPaneView {
             }
         }
 
+        // Ahead of the file-preview early return below, which would otherwise
+        // swallow it: the toggle has to work from the content view as well as
+        // from a diff. Behind the focused-editor carve-out above, so it never
+        // competes with what the buffer is composing.
+        // Not while a text field owns the keyboard: on macOS Option+E is the
+        // acute-accent dead key, and the search and raw-diff inputs compose with
+        // it exactly as the buffer does. The Ctrl/Cmd branch below excludes the
+        // same two inputs for the same reason.
+        let text_input_focused = self
+            .diff_search_input
+            .read(cx)
+            .focus_handle()
+            .is_focused(window)
+            || self
+                .diff_raw_input
+                .read(cx)
+                .focus_handle()
+                .is_focused(window);
+        if mods.alt
+            && !mods.control
+            && !mods.platform
+            && !mods.function
+            && !mods.shift
+            && key == "e"
+            && !text_input_focused
+            && !self.is_conflict_resolver_active()
+            && !self.is_markdown_preview_active()
+            && self.can_edit_current_target()
+        {
+            self.toggle_file_editor(window, cx);
+            return true;
+        }
+
         let copy_target_is_focused = self
             .diff_raw_input
             .read(cx)
@@ -874,7 +1001,7 @@ impl MainPaneView {
                 .read(cx)
                 .focus_handle()
                 .is_focused(window)
-            && self.conflict_resolver_conflict_count() > 0
+            && self.conflict_resolver_has_active_pick_target()
         {
             if let Some(choice) = conflict_resolver::conflict_quick_pick_choice_for_key(
                 key,
@@ -889,6 +1016,24 @@ impl MainPaneView {
             }
         }
 
+        // KDiff3-compatible Ctrl+Shift+1/2/3: choose A/B/C on every delta,
+        // including blocks that were selected automatically and have no
+        // conflict markers.
+        if !handled
+            && conflict_resolver_active
+            && (mods.control || mods.platform)
+            && mods.shift
+            && !mods.alt
+            && !mods.function
+            && let Some(choice) = conflict_resolver::conflict_ctrl_pick_choice_for_key(
+                key,
+                self.conflict_resolver.view_mode,
+            )
+        {
+            self.conflict_resolver_choose_everywhere(choice, cx);
+            handled = true;
+        }
+
         // section 30: kdiff3-compatible Ctrl+1/2/3 pick aliases. When the output
         // editor is focused these are handled by the carve-out at the top of this
         // fn; this block covers the case where focus is elsewhere.
@@ -898,7 +1043,7 @@ impl MainPaneView {
             && !mods.alt
             && !mods.function
             && !mods.shift
-            && self.conflict_resolver_conflict_count() > 0
+            && self.conflict_resolver_has_active_pick_target()
             && let Some(choice) = conflict_resolver::conflict_ctrl_pick_choice_for_key(
                 key,
                 self.conflict_resolver.view_mode,
@@ -908,16 +1053,33 @@ impl MainPaneView {
             handled = true;
         }
 
-        // section 30: kdiff3-compatible delta navigation — Ctrl+Home/End jump to the
-        // first/last delta, Ctrl+PgUp/PgDn to the previous/next unresolved
-        // conflict.
+        // kdiff3 manual diff help: Ctrl+Y pins the lines marked in the source
+        // columns onto one another; Ctrl+Shift+Y drops every pin and returns
+        // the file to its automatic alignment.
+        if !handled
+            && conflict_resolver_active
+            && (mods.control || mods.platform)
+            && !mods.alt
+            && !mods.function
+            && key == "y"
+        {
+            handled = if mods.shift {
+                self.conflict_resolver_clear_manual_alignments(cx)
+            } else {
+                self.conflict_resolver_align_manually(cx)
+            };
+        }
+
+        // GitComet resolver navigation: Ctrl+Home/End jump to the first/last
+        // delta. (Previous/next *unresolved* conflict is Shift+F2/F3, handled
+        // above — Ctrl+PgUp/PgDn belongs to the repository tabs.)
         if !handled
             && conflict_resolver_active
             && (mods.control || mods.platform)
             && !mods.alt
             && !mods.function
             && !mods.shift
-            && self.conflict_resolver_conflict_count() > 0
+            && !self.conflict_resolver.nav_targets.is_empty()
         {
             match key {
                 "home" => {
@@ -926,14 +1088,6 @@ impl MainPaneView {
                 }
                 "end" => {
                     self.conflict_jump_last(cx);
-                    handled = true;
-                }
-                "pageup" => {
-                    self.conflict_jump_prev_unresolved(cx);
-                    handled = true;
-                }
-                "pagedown" => {
-                    self.conflict_jump_next_unresolved(cx);
                     handled = true;
                 }
                 _ => {}
@@ -1115,7 +1269,10 @@ impl MainPaneView {
             }
         };
         let selected_bg = if errored {
-            with_alpha(theme.colors.danger, if theme.is_dark { 0.30 } else { 0.20 })
+            with_alpha(
+                theme.colors.status.danger.foreground,
+                if theme.is_dark { 0.30 } else { 0.20 },
+            )
         } else {
             selected_bg
         };
@@ -1140,6 +1297,202 @@ impl MainPaneView {
             })
             .debug_selector(|| "diff_annotate".to_string())
             .gitcomet_tooltip(theme, tooltip)
+    }
+
+    /// The "Edit" toggle, shared by the diff toolbar and the file content view.
+    ///
+    /// Turning it on always goes through `OpenFileEditor`, which re-targets the
+    /// working tree — so pressing Edit on a commit's diff or content opens the
+    /// workspace copy of that file, which is the only copy that can be written.
+    fn file_edit_toggle_button(
+        &self,
+        theme: AppTheme,
+        selected_bg: gpui::Rgba,
+        editing: bool,
+        cx: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        let dirty = editing && self.file_editor_is_dirty();
+        let path = self.editable_path_for_current_target();
+        // A rendered preview has no buffer to type into, and a file with no
+        // working-tree path (a range comparison, a whole-tree diff) has nothing
+        // to edit.
+        let blocked_by_preview = self.is_markdown_preview_active();
+        let blocked_by_kind = path
+            .as_ref()
+            .is_some_and(|p| self.content_preview_is_picture(p));
+        let disabled = path.is_none() || blocked_by_preview || blocked_by_kind;
+        let tooltip: SharedString = if blocked_by_preview {
+            "Editing is unavailable in the rendered preview\nSwitch to Text to edit".into()
+        } else if blocked_by_kind {
+            "This file is not text; editing is not supported".into()
+        } else if path.is_none() {
+            "This view has no working-tree file to edit".into()
+        } else if dirty {
+            format!(
+                "Unsaved changes — {} saves",
+                crate::view::shortcut_labels::secondary_shortcut("S")
+            )
+            .into()
+        } else {
+            format!(
+                "Edit the working-tree file ({})",
+                crate::view::shortcut_labels::alt_shortcut("E")
+            )
+            .into()
+        };
+
+        components::Button::new("diff_edit", if dirty { "Edit •" } else { "Edit" })
+            .borderless()
+            .style(components::ButtonStyle::Subtle)
+            .disabled(disabled)
+            .selected(editing)
+            .selected_bg(selected_bg)
+            .on_click(theme, cx, move |this, _e, window, cx| {
+                this.toggle_file_editor(window, cx);
+            })
+            .debug_selector(|| "diff_edit".to_string())
+            .gitcomet_tooltip(theme, tooltip)
+    }
+
+    /// Whether the file on screen has text the editor can open.
+    ///
+    /// Pictures have none — but an SVG showing its Code *is* source, and editing
+    /// it is exactly what that toggle was for. Shared by the toolbar button, the
+    /// Alt+E shortcut and the context-menu entries so the three cannot disagree
+    /// about what is editable.
+    pub(in crate::view) fn can_edit_current_target(&self) -> bool {
+        self.editable_path_for_current_target()
+            .is_some_and(|path| !self.content_preview_is_picture(&path))
+    }
+
+    /// Enter or leave the editor for the file on screen.
+    pub(in crate::view) fn toggle_file_editor(
+        &mut self,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(repo_id) = self.active_repo_id() else {
+            return;
+        };
+        if self.is_file_editor_active() {
+            // Whatever is unsaved is either written or kept, never dropped.
+            self.flush_file_editor_buffer(cx);
+            self.store.dispatch(Msg::ExitDiffEditMode { repo_id });
+            self.restore_diff_panel_focus_after_toolbar_action(window, cx);
+            cx.notify();
+            return;
+        }
+        let Some(path) = self.editable_path_for_current_target() else {
+            return;
+        };
+        self.store.dispatch(Msg::OpenFileEditor { repo_id, path });
+        // The buffer is seeded a frame later, so focus has to wait for it.
+        let input = self.file_editor_input.clone();
+        window.on_next_frame(move |window, cx| {
+            let handle = input.read(cx).focus_handle().clone();
+            window.focus(&handle, cx);
+            input.update(cx, |_, cx| cx.notify());
+        });
+        cx.notify();
+    }
+
+    /// Throw the buffer away and restore the view that opened the editor.
+    ///
+    /// Discarding is the user saying they are done with this edit, so it exits
+    /// the way Escape and the Edit toggle do rather than leaving them parked in
+    /// an editor over text they just abandoned. Deliberately *not* routed
+    /// through `toggle_file_editor`, whose exit path flushes the buffer — it
+    /// would stash the very edits this is dropping.
+    pub(in crate::view) fn discard_file_editor_buffer_and_exit(
+        &mut self,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.discard_file_editor_buffer(cx);
+        let Some(repo_id) = self.active_repo_id() else {
+            return;
+        };
+        self.store.dispatch(Msg::ExitDiffEditMode { repo_id });
+        self.restore_diff_panel_focus_after_toolbar_action(window, cx);
+        cx.notify();
+    }
+
+    /// Save the editable buffer and restore the view that opened it.
+    pub(in crate::view) fn save_file_editor_buffer_and_exit(
+        &mut self,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        // The toolbar button is disabled in these states, but the keyboard
+        // shortcut can still arrive. A no-op save must not unexpectedly act as
+        // an editor-close shortcut.
+        if self.file_editor_loading
+            || !self.file_editor_is_dirty()
+            || self.file_editor_key.is_none()
+        {
+            return;
+        }
+        self.save_file_editor_buffer(cx);
+        let Some(repo_id) = self.active_repo_id() else {
+            return;
+        };
+        self.store.dispatch(Msg::ExitDiffEditMode { repo_id });
+        self.restore_diff_panel_focus_after_toolbar_action(window, cx);
+        cx.notify();
+    }
+
+    /// The explicit "Save" button, shown while editing with auto-save off.
+    fn file_editor_save_button(
+        &self,
+        theme: AppTheme,
+        cx: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        components::Button::new("file_editor_save", "Save")
+            .style(components::ButtonStyle::Outlined)
+            .disabled(!self.file_editor_is_dirty())
+            .on_click(theme, cx, |this, _e, window, cx| {
+                this.save_file_editor_buffer_and_exit(window, cx);
+            })
+            .debug_selector(|| "file_editor_save".to_string())
+            .gitcomet_tooltip(
+                theme,
+                format!(
+                    "Save the file and return ({})",
+                    crate::view::shortcut_labels::secondary_shortcut("S")
+                )
+                .into(),
+            )
+    }
+
+    /// "Discard", shown beside Save while editing.
+    ///
+    /// Throws the buffer away and re-reads the file, with no confirmation: the
+    /// button is only enabled while there is something to discard, and it sits
+    /// next to the Save that is the alternative. The close/quit dialog is the
+    /// place that asks, because there the choice is being forced on the user
+    /// rather than made by them.
+    fn file_editor_discard_button(
+        &self,
+        theme: AppTheme,
+        cx: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        let dirty = self.file_editor_is_dirty();
+        components::Button::new("file_editor_discard", "Discard")
+            .style(components::ButtonStyle::Subtle)
+            .borderless()
+            .disabled(!dirty)
+            .on_click(theme, cx, |this, _e, window, cx| {
+                this.discard_file_editor_buffer_and_exit(window, cx);
+            })
+            .debug_selector(|| "file_editor_discard".to_string())
+            .gitcomet_tooltip(
+                theme,
+                if dirty {
+                    "Throw away the unsaved changes and return to the previous view".into()
+                } else {
+                    SharedString::from("No unsaved changes")
+                },
+            )
     }
 
     pub(in crate::view) fn open_search_for_active_view(
@@ -1185,12 +1538,14 @@ impl MainPaneView {
             format!("{}/{}", ix + 1, self.diff_search_matches.len()).into()
         };
         let match_label_color = if regex_invalid && !query.is_empty() {
-            theme.colors.danger
+            theme.colors.status.danger.foreground
         } else {
-            theme.colors.text_muted
+            theme.colors.foreground.secondary
         };
-        let option_selected_bg =
-            with_alpha(theme.colors.accent, if theme.is_dark { 0.34 } else { 0.24 });
+        let option_selected_bg = with_alpha(
+            theme.colors.accent.foreground,
+            if theme.is_dark { 0.34 } else { 0.24 },
+        );
         let options = self.diff_search_options;
         let compact_control_height = px(26.0);
         let compact_icon_button_width = px(22.0);
@@ -1205,8 +1560,8 @@ impl MainPaneView {
             .py(px(2.0))
             .rounded(px(theme.radii.control))
             .border_1()
-            .border_color(theme.colors.border)
-            .bg(theme.colors.surface_bg_elevated)
+            .border_color(theme.colors.stroke.default)
+            .bg(theme.colors.surface.raised)
             .shadow(crate::theme::shadow_surface(theme))
             .child(
                 div()
@@ -1241,7 +1596,7 @@ impl MainPaneView {
                 components::Button::new("diff_search_newline", "")
                     .start_slot(svg_icon(
                         "icons/line_break.svg",
-                        theme.colors.text,
+                        theme.colors.foreground.primary,
                         px(14.0),
                     ))
                     .borderless()
@@ -1322,7 +1677,7 @@ impl MainPaneView {
                 components::Button::new("diff_search_close", "")
                     .start_slot(svg_icon(
                         "icons/generic_close.svg",
-                        theme.colors.text_muted,
+                        theme.colors.foreground.secondary,
                         px(12.0),
                     ))
                     .style(components::ButtonStyle::Transparent)
@@ -1459,18 +1814,28 @@ impl MainPaneView {
 
                 let status_badge = |status: SubmoduleStatus| {
                     let (label, color) = match status {
-                        SubmoduleStatus::UpToDate => ("Loaded", theme.colors.success),
+                        SubmoduleStatus::UpToDate => {
+                            ("Loaded", theme.colors.status.success.foreground)
+                        }
                         SubmoduleStatus::NotInitialized => (
                             "Not loaded",
                             with_alpha(
-                                theme.colors.text_muted,
+                                theme.colors.foreground.secondary,
                                 if theme.is_dark { 0.86 } else { 0.94 },
                             ),
                         ),
-                        SubmoduleStatus::HeadMismatch => ("Head mismatch", theme.colors.warning),
-                        SubmoduleStatus::MergeConflict => ("Conflict", theme.colors.danger),
-                        SubmoduleStatus::MissingMapping => ("Missing mapping", theme.colors.danger),
-                        SubmoduleStatus::Unknown(_) => ("Unknown", theme.colors.text_muted),
+                        SubmoduleStatus::HeadMismatch => {
+                            ("Head mismatch", theme.colors.status.warning.foreground)
+                        }
+                        SubmoduleStatus::MergeConflict => {
+                            ("Conflict", theme.colors.status.danger.foreground)
+                        }
+                        SubmoduleStatus::MissingMapping => {
+                            ("Missing mapping", theme.colors.status.danger.foreground)
+                        }
+                        SubmoduleStatus::Unknown(_) => {
+                            ("Unknown", theme.colors.foreground.secondary)
+                        }
                     };
 
                     div()
@@ -1487,12 +1852,18 @@ impl MainPaneView {
 
                 let change_row_icon = |kind: FileStatusKind| match kind {
                     FileStatusKind::Untracked | FileStatusKind::Added => {
-                        ("icons/plus.svg", theme.colors.success)
+                        ("icons/plus.svg", theme.colors.status.success.foreground)
                     }
-                    FileStatusKind::Modified => ("icons/pencil.svg", theme.colors.warning),
-                    FileStatusKind::Deleted => ("icons/minus.svg", theme.colors.danger),
-                    FileStatusKind::Renamed => ("icons/swap.svg", theme.colors.accent),
-                    FileStatusKind::Conflicted => ("icons/warning.svg", theme.colors.danger),
+                    FileStatusKind::Modified => {
+                        ("icons/pencil.svg", theme.colors.status.warning.foreground)
+                    }
+                    FileStatusKind::Deleted => {
+                        ("icons/minus.svg", theme.colors.status.danger.foreground)
+                    }
+                    FileStatusKind::Renamed => ("icons/swap.svg", theme.colors.accent.foreground),
+                    FileStatusKind::Conflicted => {
+                        ("icons/warning.svg", theme.colors.status.danger.foreground)
+                    }
                 };
 
                 let render_change_rows =
@@ -1508,7 +1879,7 @@ impl MainPaneView {
                                     .px_2()
                                     .py_1()
                                     .text_sm()
-                                    .text_color(theme.colors.text_muted)
+                                    .text_color(theme.colors.foreground.secondary)
                                     .child("No inner changes.")
                                     .into_any_element(),
                             ];
@@ -1580,7 +1951,7 @@ impl MainPaneView {
                                         .font_family(
                                             crate::font_preferences::EDITOR_MONOSPACE_FONT_FAMILY,
                                         )
-                                        .text_color(theme.colors.success)
+                                        .text_color(theme.colors.status.success.foreground)
                                         .child(additions),
                                 )
                                 .child(
@@ -1589,19 +1960,22 @@ impl MainPaneView {
                                         .font_family(
                                             crate::font_preferences::EDITOR_MONOSPACE_FONT_FAMILY,
                                         )
-                                        .text_color(theme.colors.danger)
+                                        .text_color(theme.colors.status.danger.foreground)
                                         .child(deletions),
                                 );
 
                                 if let Some(target) = target {
                                     row = row
                                         .cursor(CursorStyle::PointingHand)
-                                        .hover(move |row| row.bg(theme.colors.hover))
+                                        .hover(move |row| {
+                                            row.bg(theme.colors.interaction.hover_background)
+                                        })
                                         .on_click(cx.listener(
                                             move |this, _e: &ClickEvent, _window, cx| {
                                                 let selected_ix = inline_selected_ix.unwrap_or(0);
                                                 this.store.dispatch(Msg::OpenInlineSubmoduleDiff {
                                                     repo_id,
+                                                    origin: gitcomet_state::model::ForeignDiffOrigin::Submodule,
                                                     submodule_repo_path: repo_path_for_click
                                                         .clone(),
                                                     parent_submodule_path: summary_path_for_inline
@@ -1664,7 +2038,7 @@ impl MainPaneView {
                                     .px_2()
                                     .pt_1()
                                     .text_xs()
-                                    .text_color(theme.colors.text_muted)
+                                    .text_color(theme.colors.foreground.secondary)
                                     .child(title),
                             )
                             .children(render_change_rows(
@@ -1712,12 +2086,15 @@ impl MainPaneView {
                         .rounded(px(theme.radii.row))
                         .border_1()
                         .border_color(if emphasized {
-                            theme.colors.active
+                            theme.colors.interaction.pressed_background
                         } else {
-                            theme.colors.border
+                            theme.colors.stroke.default
                         })
                         .bg(if emphasized {
-                            with_alpha(theme.colors.hover, if theme.is_dark { 0.28 } else { 0.48 })
+                            with_alpha(
+                                theme.colors.interaction.hover_background,
+                                if theme.is_dark { 0.28 } else { 0.48 },
+                            )
                         } else {
                             gpui::rgba(0x00000000)
                         })
@@ -1733,7 +2110,7 @@ impl MainPaneView {
                                 .child(
                                     div()
                                         .text_sm()
-                                        .text_color(theme.colors.text_muted)
+                                        .text_color(theme.colors.foreground.secondary)
                                         .child(submodule_range_label(range.kind)),
                                 )
                                 .child(
@@ -1743,9 +2120,9 @@ impl MainPaneView {
                                             crate::font_preferences::EDITOR_MONOSPACE_FONT_FAMILY,
                                         )
                                         .text_color(if changed {
-                                            theme.colors.text
+                                            theme.colors.foreground.primary
                                         } else {
-                                            theme.colors.text_muted
+                                            theme.colors.foreground.secondary
                                         })
                                         .child(format!(
                                             "{} -> {}",
@@ -1762,7 +2139,7 @@ impl MainPaneView {
                                 .child(
                                     div()
                                         .text_xs()
-                                        .text_color(theme.colors.text_muted)
+                                        .text_color(theme.colors.foreground.secondary)
                                         .child("Hashes"),
                                 )
                                 .child(
@@ -1780,7 +2157,7 @@ impl MainPaneView {
                             div()
                                 .px_2()
                                 .text_sm()
-                                .text_color(theme.colors.text_muted)
+                                .text_color(theme.colors.foreground.secondary)
                                 .child(reason.clone()),
                         );
                     }
@@ -1804,7 +2181,7 @@ impl MainPaneView {
                     .min_h(px(0.0))
                     .overflow_y_scroll()
                     .gap_2()
-                    .bg(theme.colors.window_bg)
+                    .bg(theme.colors.surface.canvas)
                     .child(
                         div()
                             .px_2()
@@ -1822,16 +2199,20 @@ impl MainPaneView {
                                         "icons/box.svg",
                                         match summary_status.unwrap_or(SubmoduleStatus::UpToDate) {
                                             SubmoduleStatus::NotInitialized => with_alpha(
-                                                theme.colors.text_muted,
+                                                theme.colors.foreground.secondary,
                                                 if theme.is_dark { 0.82 } else { 0.94 },
                                             ),
-                                            SubmoduleStatus::HeadMismatch => theme.colors.warning,
+                                            SubmoduleStatus::HeadMismatch => {
+                                                theme.colors.status.warning.foreground
+                                            }
                                             SubmoduleStatus::MergeConflict
                                             | SubmoduleStatus::MissingMapping => {
-                                                theme.colors.danger
+                                                theme.colors.status.danger.foreground
                                             }
                                             SubmoduleStatus::UpToDate
-                                            | SubmoduleStatus::Unknown(_) => theme.colors.accent,
+                                            | SubmoduleStatus::Unknown(_) => {
+                                                theme.colors.accent.foreground
+                                            }
                                         },
                                         px(14.0),
                                     ))
@@ -1989,7 +2370,27 @@ impl MainPaneView {
         let supports_diff_content_toggle = (inline_submodule_diff_active || !has_submodule_summary)
             && self.supports_diff_content_mode_toggle(is_file_preview);
 
-        if is_file_preview {
+        // Browsing a historical commit: tint the header and the content surface
+        // instead of framing the pane, and only while the content on screen is
+        // the browsed commit's.
+        let historical_browse = is_file_preview && self.historical_browse_content_active();
+        let content_bg = if historical_browse {
+            crate::theme::historical_surface_bg(theme, theme.colors.surface.canvas)
+        } else {
+            theme.colors.surface.canvas
+        };
+
+        // Deliberately not gated on `is_file_preview`: that predicate also asks
+        // whether the path is *previewable*, and a file the preview declines
+        // (an unknown extension, say) is still a file the editor can open — it
+        // does its own UTF-8 check and reports the failure in place.
+        let is_file_editor = self.is_file_editor_active()
+            && untracked_directory_notice.is_none()
+            && !has_submodule_summary
+            && !inline_submodule_diff_active;
+        if is_file_editor {
+            self.ensure_file_editor_loaded(cx);
+        } else if is_file_preview {
             self.ensure_selected_file_preview_loaded(cx);
         } else if (has_submodule_summary
             || inline_submodule_diff_active
@@ -2119,11 +2520,13 @@ impl MainPaneView {
                 theme,
                 cx,
             );
-        } else if !is_file_preview {
-            let view_toggle_selected_bg =
-                with_alpha(theme.colors.accent, if theme.is_dark { 0.26 } else { 0.20 });
+        } else if !is_file_preview && !is_file_editor {
+            let view_toggle_selected_bg = with_alpha(
+                theme.colors.accent.foreground,
+                if theme.is_dark { 0.26 } else { 0.20 },
+            );
             let view_toggle_border = with_alpha(
-                theme.colors.text_muted,
+                theme.colors.foreground.secondary,
                 if theme.is_dark { 0.38 } else { 0.28 },
             );
             let view_toggle_divider = with_alpha(view_toggle_border, 0.90);
@@ -2145,15 +2548,17 @@ impl MainPaneView {
                         .px_1()
                         .h(components::control_height(ui_scale_percent))
                         .rounded(px(theme.radii.row))
-                        .when(diff_mode_active, |d| d.bg(theme.colors.active))
+                        .when(diff_mode_active, |d| {
+                            d.bg(theme.colors.interaction.pressed_background)
+                        })
                         .hover(move |s| {
                             if diff_mode_active {
-                                s.bg(theme.colors.active)
+                                s.bg(theme.colors.interaction.pressed_background)
                             } else {
-                                s.bg(with_alpha(theme.colors.hover, 0.55))
+                                s.bg(with_alpha(theme.colors.interaction.hover_background, 0.55))
                             }
                         })
-                        .active(move |s| s.bg(theme.colors.active))
+                        .active(move |s| s.bg(theme.colors.interaction.pressed_background))
                         .cursor(CursorStyle::PointingHand)
                         .child(
                             div()
@@ -2165,7 +2570,7 @@ impl MainPaneView {
                         )
                         .child(svg_icon(
                             "icons/chevron_down.svg",
-                            theme.colors.text_muted,
+                            theme.colors.foreground.secondary,
                             px(12.0),
                         ))
                         .on_click(cx.listener(move |this, e: &ClickEvent, window, cx| {
@@ -2196,7 +2601,11 @@ impl MainPaneView {
                 .is_some();
 
                 let prev_hunk_btn = components::Button::new("diff_prev_hunk", "")
-                    .start_slot(svg_icon("icons/arrow_up.svg", theme.colors.text, px(14.0)))
+                    .start_slot(svg_icon(
+                        "icons/arrow_up.svg",
+                        theme.colors.foreground.primary,
+                        px(14.0),
+                    ))
                     .style(components::ButtonStyle::Outlined)
                     .disabled(!can_nav_prev)
                     .on_click(theme, cx, |this, _e, _w, cx| {
@@ -2215,7 +2624,7 @@ impl MainPaneView {
                 let next_hunk_btn = components::Button::new("diff_next_hunk", "")
                     .start_slot(svg_icon(
                         "icons/arrow_down.svg",
-                        theme.colors.text,
+                        theme.colors.foreground.primary,
                         px(14.0),
                     ))
                     .style(components::ButtonStyle::Outlined)
@@ -2291,6 +2700,9 @@ impl MainPaneView {
                         .into(),
                     );
 
+                let diff_edit_btn = self
+                    .file_edit_toggle_button(theme, view_toggle_selected_bg, is_file_editor, cx)
+                    .into_any_element();
                 let diff_annotate_btn =
                     self.diff_annotate_toggle_button(theme, view_toggle_selected_bg, cx);
 
@@ -2314,19 +2726,49 @@ impl MainPaneView {
                     .child(next_hunk_btn)
                     .when_some(next_file_btn, |d, btn| d.child(btn))
                     .child(view_toggle)
-                    .child(diff_annotate_btn);
+                    .child(diff_edit_btn)
+                    .child(diff_annotate_btn)
+                    // `is_file_editor`, not `is_file_editor_active`: edit mode
+                    // can be on while a submodule summary or an
+                    // untracked-directory notice owns the body, and a Save
+                    // control over a body with no buffer is a trap.
+                    // Discard sits before Save, so the pair reads as the two
+                    // ways out of an unsaved buffer in the order they are meant.
+                    .when(is_file_editor && !self.auto_save_file_edits, |d| {
+                        d.child(self.file_editor_discard_button(theme, cx))
+                            .child(self.file_editor_save_button(theme, cx))
+                    });
             } else {
                 controls = controls.when_some(next_file_btn, |d, btn| d.child(btn));
             }
         } else {
             // File content view (e.g. a file shown at a commit): expose the
             // Blame toggle here too so annotations can be walked through history.
-            let annotate_selected_bg =
-                with_alpha(theme.colors.accent, if theme.is_dark { 0.26 } else { 0.20 });
+            let annotate_selected_bg = with_alpha(
+                theme.colors.accent.foreground,
+                if theme.is_dark { 0.26 } else { 0.20 },
+            );
+            // Reached by the file-content view *and* by the editor, including
+            // for a file the preview declines: an editable buffer must never sit
+            // under Inline/Split and hunk arrows that navigate a diff which is
+            // not on screen.
             controls = controls
                 .when_some(prev_file_btn, |d, btn| d.child(btn))
                 .when_some(next_file_btn, |d, btn| d.child(btn))
-                .child(self.diff_annotate_toggle_button(theme, annotate_selected_bg, cx));
+                .child(self.file_edit_toggle_button(
+                    theme,
+                    annotate_selected_bg,
+                    is_file_editor,
+                    cx,
+                ))
+                .child(self.diff_annotate_toggle_button(theme, annotate_selected_bg, cx))
+                // Saving is explicit only when auto-save is off; with it on the
+                // button would never be enabled long enough to click, and
+                // neither would the Discard beside it.
+                .when(is_file_editor && !self.auto_save_file_edits, |d| {
+                    d.child(self.file_editor_discard_button(theme, cx))
+                        .child(self.file_editor_save_button(theme, cx))
+                });
         }
 
         if !is_conflict_resolver && let Some(preview_kind) = rendered_view_toggle_kind {
@@ -2408,10 +2850,14 @@ impl MainPaneView {
                 .is_some_and(|id| id == &diff_action_invoker);
             controls = controls.child(
                 components::Button::new(cog_id, "")
-                    .start_slot(svg_icon("icons/cog.svg", theme.colors.text_muted, px(14.0)))
+                    .start_slot(svg_icon(
+                        "icons/cog.svg",
+                        theme.colors.foreground.secondary,
+                        px(14.0),
+                    ))
                     .style(components::ButtonStyle::Transparent)
                     .selected(diff_action_active)
-                    .selected_bg(theme.colors.active)
+                    .selected_bg(theme.colors.interaction.pressed_background)
                     .on_click(theme, cx, move |this, e, window, cx| {
                         this.activate_context_menu_invoker(diff_action_invoker.clone(), cx);
                         this.open_popover_at(cog_kind.clone(), e.position(), window, cx);
@@ -2423,7 +2869,7 @@ impl MainPaneView {
                 components::Button::new("diff_close", "")
                     .start_slot(svg_icon(
                         "icons/generic_close.svg",
-                        theme.colors.text_muted,
+                        theme.colors.foreground.secondary,
                         px(12.0),
                     ))
                     .style(components::ButtonStyle::Transparent)
@@ -2473,6 +2919,8 @@ impl MainPaneView {
             self.render_submodule_summary(theme, cx)
         } else if let Some(message) = untracked_directory_notice {
             components::empty_state(theme, "Directory", message).into_any_element()
+        } else if is_file_editor {
+            self.render_file_editor(theme, cx)
         } else if is_file_preview {
             if is_markdown_preview_view {
                 match &self.worktree_preview {
@@ -2556,7 +3004,7 @@ impl MainPaneView {
                                         .relative()
                                         .h_full()
                                         .min_h(px(0.0))
-                                        .bg(theme.colors.window_bg)
+                                        .bg(content_bg)
                                         .child(
                                             div()
                                                 .id("worktree_markdown_preview_document")
@@ -2598,7 +3046,7 @@ impl MainPaneView {
                         });
                         div()
                             .id("worktree_preview_error_scroll")
-                            .bg(theme.colors.window_bg)
+                            .bg(content_bg)
                             .font_family(editor_font_family.clone())
                             .flex()
                             .flex_col()
@@ -2646,7 +3094,7 @@ impl MainPaneView {
                                 .relative()
                                 .h_full()
                                 .min_h(px(0.0))
-                                .bg(theme.colors.window_bg)
+                                .bg(content_bg)
                                 .font_family(editor_font_family.clone())
                                 .child(
                                     div()
@@ -2725,12 +3173,20 @@ impl MainPaneView {
                                 "Theirs (deleted)".into()
                             };
 
+                            // The body reserves this gutter for its vertical scrollbar; the
+                            // header has to reserve it too or the two halves split a wider
+                            // box than the rows do and the labels drift off their columns.
+                            let compare_scrollbar_gutter = components::Scrollbar::visible_gutter(
+                                self.diff_scroll.clone(),
+                                components::ScrollbarAxis::Vertical,
+                            );
                             let columns_header = components::split_columns_header(
                                 theme,
                                 ui_scale_percent,
                                 ours_label,
                                 theirs_label,
-                            );
+                            )
+                            .pr(compare_scrollbar_gutter);
 
                             let diff_len = self.conflict_resolver.two_way_split_visible_len();
 
@@ -2758,7 +3214,7 @@ impl MainPaneView {
                                     .flex_col()
                                     .h_full()
                                     .min_h(px(0.0))
-                                    .bg(theme.colors.window_bg)
+                                    .bg(theme.colors.surface.canvas)
                                     .font_family(editor_font_family.clone())
                                     .child(columns_header)
                                     .child(
@@ -2771,10 +3227,7 @@ impl MainPaneView {
                                                 div()
                                                     .h_full()
                                                     .min_h(px(0.0))
-                                                    .pr(components::Scrollbar::visible_gutter(
-                                                        self.diff_scroll.clone(),
-                                                        components::ScrollbarAxis::Vertical,
-                                                    ))
+                                                    .pr(compare_scrollbar_gutter)
                                                     .child(list),
                                             )
                                             .child(
@@ -2882,7 +3335,7 @@ impl MainPaneView {
                                                 .relative()
                                                 .h_full()
                                                 .min_h(px(0.0))
-                                                .bg(theme.colors.window_bg)
+                                                .bg(theme.colors.surface.canvas)
                                                 .font_family(editor_font_family.clone())
                                                 .child(
                                                     div()
@@ -2990,13 +3443,13 @@ impl MainPaneView {
                                                 left_label,
                                                 collapsed_file_stat.map(|(_, removed)| removed),
                                                 '-',
-                                                theme.colors.diff_remove_text,
+                                                theme.colors.diff.removed.foreground,
                                             );
                                             let right_header = Self::split_column_header_label(
                                                 right_label,
                                                 collapsed_file_stat.map(|(added, _)| added),
                                                 '+',
-                                                theme.colors.diff_add_text,
+                                                theme.colors.diff.added.foreground,
                                             );
 
                                             let split_dragging = self.diff_split_resize.is_some();
@@ -3013,7 +3466,7 @@ impl MainPaneView {
                                                         id,
                                                         components::ResizeGripAxis::Vertical,
                                                         split_dragging,
-                                                        Some(theme.colors.border),
+                                                        Some(theme.colors.stroke.default),
                                                     ))
                                                     .on_drag(
                                                         DiffSplitResizeHandle::Divider,
@@ -3118,14 +3571,19 @@ impl MainPaneView {
                                                     "diff_split_columns_header".to_string()
                                                 })
                                                 .w_full()
+                                                // Same right inset as the body below, so both rows
+                                                // divide the identical content box and the column
+                                                // divider lines up. Padding keeps the band and its
+                                                // bottom border full-bleed.
+                                                .pr(shared_scrollbar_gutter)
                                                 .h(components::control_height(ui_scale_percent))
                                                 .flex()
                                                 .items_center()
                                                 .text_xs()
-                                                .text_color(theme.colors.text_muted)
-                                                .bg(theme.colors.surface_bg_elevated)
+                                                .text_color(theme.colors.foreground.secondary)
+                                                .bg(crate::theme::content_header_bg(theme))
                                                 .border_b_1()
-                                                .border_color(theme.colors.border)
+                                                .border_color(theme.colors.stroke.default)
                                                 .child(
                                                     div()
                                                         .w(left_w)
@@ -3155,7 +3613,7 @@ impl MainPaneView {
                                                 .min_h(px(0.0))
                                                 .flex()
                                                 .flex_col()
-                                                .bg(theme.colors.window_bg)
+                                                .bg(theme.colors.surface.canvas)
                                                 .font_family(editor_font_family.clone())
                                                 .child(columns_header)
                                                 .child(
@@ -3331,8 +3789,10 @@ impl MainPaneView {
             .w_full()
             .h_full()
             .min_h(px(0.0))
-            .bg(theme.colors.surface_bg_elevated)
-            .when(diff_editor_menu_active, |d| d.bg(theme.colors.active))
+            .bg(crate::theme::content_header_bg(theme))
+            .when(diff_editor_menu_active, |d| {
+                d.bg(theme.colors.interaction.pressed_background)
+            })
             .track_focus(&self.diff_panel_focus_handle)
             .on_action(
                 cx.listener(|this, _: &crate::view::TextInputDiffPrevFile, window, cx| {
@@ -3404,9 +3864,16 @@ impl MainPaneView {
                 header
                     .h(components::control_height_md(ui_scale_percent))
                     .px_2()
-                    .bg(theme.colors.surface_bg_elevated)
+                    .bg(if historical_browse {
+                        crate::theme::historical_header_bg(
+                            theme,
+                            crate::theme::content_header_bg(theme),
+                        )
+                    } else {
+                        crate::theme::content_header_bg(theme)
+                    })
                     .border_b_1()
-                    .border_color(theme.colors.border),
+                    .border_color(theme.colors.stroke.default),
             )
             .child(
                 div()

@@ -12,7 +12,7 @@ use gitcomet_state::store::AppStore;
 use gpui::prelude::*;
 use gpui::{
     ClipboardItem, Decorations, KeyBinding, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent,
-    Pixels, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString, Tiling, div, px,
+    Pixels, ScrollDelta, ScrollHandle, ScrollWheelEvent, Tiling, div, px,
 };
 use std::fs;
 use std::path::Path;
@@ -73,7 +73,7 @@ fn simulate_key_press(cx: &mut gpui::VisualTestContext, key: &str) {
 fn builds_pure_components_without_panics() {
     for theme in [AppTheme::gitcomet_dark(), AppTheme::gitcomet_light()] {
         assert_no_panic("components::pill", || {
-            let _ = components::pill(theme, "Label", theme.colors.accent);
+            let _ = components::pill(theme, "Label", theme.colors.accent.foreground);
         });
 
         assert_no_panic("components::empty_state", || {
@@ -124,7 +124,7 @@ fn builds_pure_components_without_panics() {
                 .style(components::ButtonStyle::Outlined)
                 .render(theme, ui_scale::DEFAULT_UI_SCALE_PERCENT);
             let _ = components::SplitButton::new(left, right)
-                .style(components::SplitButtonStyle::Outlined)
+                .style(components::SplitButtonStyle::Borderless)
                 .render(theme, ui_scale::DEFAULT_UI_SCALE_PERCENT);
         });
 
@@ -2316,18 +2316,24 @@ fn branch_worktree_badge_aligns_to_edge_and_branch_menu_opens_on_right_click(
     cx.run_until_parked();
     sync_view_for_tests(cx, &view);
 
-    // The trailing menu-dots slot is reserved in the row layout, so the worktree
-    // badge sits to its left rather than overlapping it.
-    let dots_bounds = cx
-        .debug_bounds(debug_selector("branch_dots", badge_ix))
-        .expect("expected the reserved branch menu dots slot");
+    // Nothing is revealed on hover at the trailing edge any more: the `⋮` button
+    // is gone, so the worktree badge owns the row's right edge, one trailing pad
+    // in from it.
     assert!(
-        badge_bounds.right() <= dots_bounds.left(),
-        "expected branch worktree badge to sit left of the menu dots slot"
+        cx.debug_bounds(debug_selector("branch_dots", badge_ix))
+            .is_none(),
+        "expected the branch row's `⋮` slot to be gone"
+    );
+    assert!(
+        (row_bounds.right() - badge_bounds.right() - px(4.0)).abs() <= px(1.0),
+        "expected branch worktree badge to sit one trailing pad off the row's right edge, \
+         row right {:?} badge right {:?}",
+        row_bounds.right(),
+        badge_bounds.right()
     );
 
     // Right-click over the label (near the leading edge) rather than the center:
-    // the trailing area holds the worktree badge and menu-dots slot.
+    // the trailing area holds the worktree badge, which opens its own menu.
     let row_label_point = gpui::point(row_bounds.left() + px(48.0), row_center.y);
     cx.simulate_mouse_down(row_label_point, MouseButton::Right, Modifiers::default());
     cx.run_until_parked();
@@ -3081,7 +3087,7 @@ impl gpui::Render for PanelLayoutTestView {
                     .child(scrollbar.render(theme))
             });
 
-        div().size_full().bg(theme.colors.window_bg).child(
+        div().size_full().bg(theme.colors.surface.canvas).child(
             components::panel(theme, "Panel", None, body)
                 .flex_1()
                 .h_full(),
@@ -3175,23 +3181,32 @@ impl gpui::Render for PickerPromptScrollbarTestView {
         _window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) -> impl IntoElement {
-        let items = (0..50)
-            .map(|ix| SharedString::from(format!("Commit {ix:02}  Synthetic history entry")))
-            .collect::<Vec<_>>();
+        let items: std::rc::Rc<[components::PickerPromptItem]> = (0..50)
+            .map(|ix| {
+                components::PickerPromptItem::plain(format!(
+                    "Commit {ix:02}  Synthetic history entry"
+                ))
+            })
+            .collect::<Vec<_>>()
+            .into();
+        let layout = std::rc::Rc::new(components::picker_prompt_layout(&items, ""));
 
-        div().size_full().bg(self.theme.colors.window_bg).child(
-            div().w(px(360.0)).child(
-                components::PickerPrompt::new(self.input.clone(), self.scroll_handle.clone())
-                    .items(items)
-                    .max_height(px(120.0))
-                    .render(
-                        self.theme,
-                        ui_scale::DEFAULT_UI_SCALE_PERCENT,
-                        cx,
-                        |_this, _ix, _event, _window, _cx| {},
-                    ),
-            ),
-        )
+        div()
+            .size_full()
+            .bg(self.theme.colors.surface.canvas)
+            .child(
+                div().w(px(360.0)).child(
+                    components::PickerPrompt::new(self.input.clone(), self.scroll_handle.clone())
+                        .prebuilt_items(items, layout)
+                        .max_height(px(120.0))
+                        .render(
+                            self.theme,
+                            ui_scale::DEFAULT_UI_SCALE_PERCENT,
+                            cx,
+                            |_this, _ix, _event, _window, _cx| {},
+                        ),
+                ),
+            )
     }
 }
 
@@ -3539,88 +3554,6 @@ fn repo_tab_strip_plus_button_opens_add_repo_menu(cx: &mut gpui::TestAppContext)
 }
 
 #[gpui::test]
-fn titlebar_free_badge_opens_editions_page_and_updates_tooltip_on_hover(
-    cx: &mut gpui::TestAppContext,
-) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
-    let (view, cx) = cx.add_window_view(|window, cx| {
-        crate::view::GitCometView::new(store, events, None, window, cx)
-    });
-
-    cx.update(|window, app| {
-        let _ = window.draw(app);
-    });
-
-    let badge_bounds = cx
-        .debug_bounds("titlebar_free_badge")
-        .expect("expected titlebar free badge bounds");
-    let badge_center = badge_bounds.center();
-
-    cx.simulate_mouse_move(badge_center, None, Modifiers::default());
-    crate::view::test_support::wait_for_native_tooltip(cx);
-    assert_eq!(
-        crate::view::test_support::tooltip_text(cx, &view),
-        Some("See GitComet editions".into())
-    );
-
-    cx.simulate_mouse_down(badge_center, MouseButton::Left, Modifiers::default());
-    cx.simulate_mouse_up(badge_center, MouseButton::Left, Modifiers::default());
-    cx.run_until_parked();
-
-    assert_eq!(cx.opened_url(), Some(crate::view::EDITIONS_URL.to_string()));
-    cx.update(|_window, app| {
-        assert!(
-            !crate::view::test_support::popover_is_open(view.read(app), app),
-            "expected titlebar free badge click to leave popovers closed"
-        );
-    });
-
-    cx.simulate_mouse_move(gpui::point(px(120.0), px(18.0)), None, Modifiers::default());
-    assert_eq!(crate::view::test_support::tooltip_text(cx, &view), None);
-}
-
-#[gpui::test]
-fn titlebar_free_badge_keeps_the_same_size_across_ui_zoom(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
-    let (view, cx) = cx.add_window_view(|window, cx| {
-        crate::view::GitCometView::new(store, events, None, window, cx)
-    });
-
-    cx.update(|window, app| {
-        let _ = window.draw(app);
-    });
-
-    let default_bounds = cx
-        .debug_bounds("titlebar_free_badge")
-        .expect("expected titlebar free badge bounds at the default zoom");
-    let default_width: f32 = default_bounds.size.width.into();
-    let default_height: f32 = default_bounds.size.height.into();
-
-    cx.update(|window, app| {
-        view.update(app, |this, cx| {
-            this.apply_ui_scale_percent(200, window, cx);
-        });
-        let _ = window.draw(app);
-    });
-    cx.run_until_parked();
-
-    let zoomed_bounds = cx
-        .debug_bounds("titlebar_free_badge")
-        .expect("expected titlebar free badge bounds after zooming");
-    let zoomed_width: f32 = zoomed_bounds.size.width.into();
-    let zoomed_height: f32 = zoomed_bounds.size.height.into();
-
-    assert!(
-        (zoomed_width - default_width).abs() <= 0.5,
-        "expected the FREE badge width to stay fixed across zoom (default={default_width}, zoomed={zoomed_width})"
-    );
-    assert!(
-        (zoomed_height - default_height).abs() <= 0.5,
-        "expected the FREE badge height to stay fixed across zoom (default={default_height}, zoomed={zoomed_height})"
-    );
-}
-
-#[gpui::test]
 fn titlebar_window_controls_update_tooltip_on_hover(cx: &mut gpui::TestAppContext) {
     if cfg!(target_os = "macos") {
         // The custom Min/Max/Close controls are only rendered on non-macOS.
@@ -3711,7 +3644,7 @@ impl gpui::Render for ScrollbarTestView {
             })
             .collect::<Vec<_>>();
 
-        div().size_full().bg(theme.colors.window_bg).child(
+        div().size_full().bg(theme.colors.surface.canvas).child(
             div()
                 .id("scroll_container")
                 .relative()
@@ -3913,7 +3846,7 @@ impl gpui::Render for ScrollbarMismatchedBoundsView {
 
         // Render the scrollbar in a *larger* container than the scroll surface to ensure the
         // scrollbar uses its own bounds (not the scroll handle's bounds) for hit-testing/metrics.
-        div().size_full().bg(theme.colors.window_bg).child(
+        div().size_full().bg(theme.colors.surface.canvas).child(
             div()
                 .id("outer_scrollbar_container")
                 .relative()
@@ -4297,7 +4230,9 @@ fn repository_tabs_shrink_long_names_before_short_names(cx: &mut gpui::TestAppCo
     // Keep the cap between the medium and long natural widths: only the long
     // tab should have to yield at this pressure level.
     let long_only_cap = (natural[1] + natural[2]) / 2.0;
-    let outer_chrome = px(36.0 + 6.0 * repo_ids.len() as f32);
+    // The strip viewport holds only the tabs, so the sole extra width to fund
+    // is each tab's gutter on both sides.
+    let outer_chrome = px(components::Tab::HORIZONTAL_MARGIN_PX * 2.0 * repo_ids.len() as f32);
     resize_repo_tab_strip_to(
         cx,
         &view,
@@ -4324,9 +4259,9 @@ fn repository_tabs_shrink_long_names_before_short_names(cx: &mut gpui::TestAppCo
         "the longest tab should fade first"
     );
 
-    // Push the common cap below the shortest natural tab but above the 102px
-    // floor. At this threshold all three tabs should shrink together.
-    let all_tabs_cap = (px(102.0) + natural[0]) / 2.0;
+    // Push the common cap below the shortest natural tab but above the minimum
+    // width floor. At this threshold all three tabs should shrink together.
+    let all_tabs_cap = (px(components::Tab::MIN_WIDTH_PX) + natural[0]) / 2.0;
     resize_repo_tab_strip_to(
         cx,
         &view,

@@ -30,6 +30,7 @@ pub enum RepoActionKind {
     RenameBranch,
     DeleteBranch,
     ForceDeleteBranch,
+    DeleteBranches,
     StagePath,
     StagePaths,
     UnstagePath,
@@ -75,12 +76,27 @@ impl ConflictAutosolveMode {
     }
 }
 
+/// A KDiff3-style source choice applied in bulk. The blocks it reaches depend
+/// on the [`ConflictBulkScope`] it is dispatched with.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConflictBulkChoice {
     Base,
     Ours,
     Theirs,
     Both,
+}
+
+/// Which blocks a bulk choice reaches, mirroring KDiff3's `chooseGlobal`
+/// `bConflictsOnly` / `bWhiteSpaceOnly` pair.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ConflictBulkScope {
+    /// "Choose A/B/C Everywhere": every merge-plan delta, including the ones
+    /// the planner already selected automatically.
+    #[default]
+    AllDeltas,
+    /// "Choose A/B/C for All Unsolved Whitespace Conflicts": only blocks still
+    /// unresolved and classified as whitespace-only, skipping hand-edited ones.
+    UnsolvedWhitespace,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -123,6 +139,9 @@ pub enum RepoWatchDegradedReason {
     WatchLimitReached { unwatched_dirs: usize },
 }
 
+// Dispatch keeps internal messages inline so the hot reducer path does not
+// require an additional allocation for every effect completion.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Msg {
     OpenRepo(PathBuf),
@@ -257,6 +276,7 @@ pub enum Msg {
     },
     OpenInlineSubmoduleDiff {
         repo_id: RepoId,
+        origin: crate::model::ForeignDiffOrigin,
         submodule_repo_path: PathBuf,
         parent_submodule_path: PathBuf,
         entries: Vec<crate::model::InlineSubmoduleDiffEntry>,
@@ -302,6 +322,12 @@ pub enum Msg {
         range: String,
         source: String,
     },
+    /// Full `%B` message of a single commit, for the history hover card.
+    /// Message-only, so it skips the tree diff `commit_details` pays for.
+    LoadHoverCommitMessage {
+        repo_id: RepoId,
+        commit_id: CommitId,
+    },
     LoadFileHistory {
         repo_id: RepoId,
         path: PathBuf,
@@ -313,6 +339,23 @@ pub enum Msg {
         source: gitcomet_core::domain::BlameSource,
     },
     LoadWorktrees {
+        repo_id: RepoId,
+    },
+    /// Uncommitted-change counts for the other linked worktrees. Opens a
+    /// throwaway handle per worktree path, so it is scheduled deliberately
+    /// rather than on every refresh.
+    LoadWorktreeDirty {
+        repo_id: RepoId,
+    },
+    /// Select the history row for a linked worktree's uncommitted changes, so
+    /// the details pane shows that worktree's files instead of a commit.
+    SelectWorktreeUncommitted {
+        repo_id: RepoId,
+        path: PathBuf,
+    },
+    /// On-demand load of tip-commit author/date/summary for every ref. Only
+    /// requested by pickers that render it.
+    LoadRefMetadata {
         repo_id: RepoId,
     },
     LoadSubmodules {
@@ -335,9 +378,23 @@ pub enum Msg {
         repo_id: RepoId,
         path: PathBuf,
     },
+    /// Expand or collapse `path` in the file explorer together with every
+    /// directory beneath it. The whole tree is enumerated up front, so the
+    /// descendants are already known without loading anything.
+    SetFileBrowserDirExpandedRecursive {
+        repo_id: RepoId,
+        path: PathBuf,
+        expanded: bool,
+    },
     SetFileBrowserSearch {
         repo_id: RepoId,
         query: String,
+    },
+    /// Expand every directory leading to `path` in the file explorer, so the
+    /// row for that file becomes visible. Clears any active file search.
+    RevealFileBrowserPath {
+        repo_id: RepoId,
+        path: PathBuf,
     },
     SetFileBrowserSource {
         repo_id: RepoId,
@@ -347,6 +404,19 @@ pub enum Msg {
         repo_id: RepoId,
         source: FileSource,
         path: PathBuf,
+    },
+    /// Open `path` as an editable buffer over the working-tree file. Always
+    /// edits the workspace copy, so it re-targets the working tree even when it
+    /// was invoked from a commit's file list.
+    OpenFileEditor {
+        repo_id: RepoId,
+        path: PathBuf,
+    },
+    /// Leave the editor, restoring the diff or read-only content preview that
+    /// opened it. *Entering* always goes through `OpenFileEditor`, which
+    /// re-targets the working tree while retaining that return destination.
+    ExitDiffEditMode {
+        repo_id: RepoId,
     },
     /// Open the given file as it was in the parent of `commit_id` (the
     /// revision just before that commit's change). The parent is resolved
@@ -369,6 +439,20 @@ pub enum Msg {
     BrowseRepositoryAtCommit {
         repo_id: RepoId,
         commit_id: CommitId,
+    },
+    /// Show a commit referenced from elsewhere — a SHA in a commit message, a
+    /// branch tip — without waiting for the history walk to reach its row.
+    ///
+    /// `reference` may be abbreviated. It is resolved against the object
+    /// database, so an ambiguous or unknown reference is reported instead of
+    /// sending the log on a walk that can only end in silence.
+    RevealCommit {
+        repo_id: RepoId,
+        reference: CommitId,
+    },
+    /// The history view has finished (or given up on) the pending reveal.
+    FinishCommitReveal {
+        repo_id: RepoId,
     },
     ResetBrowseToLive {
         repo_id: RepoId,
@@ -465,6 +549,17 @@ pub enum Msg {
     ForceDeleteBranch {
         repo_id: RepoId,
         name: String,
+    },
+    /// Delete every named local branch in one action.
+    ///
+    /// `force` picks `-D` over `-d` for the whole batch: a folder of finished
+    /// feature branches is exactly the case where an unforced delete fails on
+    /// every one of them, so the choice is made once up front rather than
+    /// escalated per branch.
+    DeleteBranches {
+        repo_id: RepoId,
+        names: Vec<String>,
+        force: bool,
     },
     CloneRepo {
         url: String,
@@ -569,6 +664,12 @@ pub enum Msg {
         contents: String,
         stage: bool,
     },
+    /// Append patterns to the repository-root `.gitignore`, creating it when
+    /// absent. Patterns already present are skipped, so re-running is a no-op.
+    AppendGitignorePatterns {
+        repo_id: RepoId,
+        patterns: Vec<String>,
+    },
     Commit {
         repo_id: RepoId,
         message: String,
@@ -642,6 +743,13 @@ pub enum Msg {
         repo_id: RepoId,
         remote: String,
         branch: String,
+    },
+    /// Delete several branches on one remote. Kept to a single remote so it
+    /// stays one `git push --delete` rather than a round trip per branch.
+    DeleteRemoteBranches {
+        repo_id: RepoId,
+        remote: String,
+        branches: Vec<String>,
     },
     Reset {
         repo_id: RepoId,
@@ -821,12 +929,43 @@ pub enum Msg {
         repo_id: RepoId,
         path: RepoPath,
         choice: ConflictBulkChoice,
+        scope: ConflictBulkScope,
     },
     ConflictSetRegionChoice {
         repo_id: RepoId,
         path: RepoPath,
         region_index: usize,
         choice: ConflictRegionChoice,
+    },
+    /// Toggle one merge source, appending it after already-selected sources.
+    ConflictToggleRegionSource {
+        repo_id: RepoId,
+        path: RepoPath,
+        region_index: usize,
+        source: gitcomet_core::merge::MergeSource,
+    },
+    /// Replace a region's complete ordered source selection.
+    ConflictReplaceRegionSelection {
+        repo_id: RepoId,
+        path: RepoPath,
+        region_index: usize,
+        selection: gitcomet_core::merge::OrderedSelection,
+    },
+    /// Toggle one source on a semantic merge-plan block. Unlike region
+    /// actions, this also addresses automatically selected deltas that do not
+    /// render conflict markers.
+    ConflictTogglePlanBlockSource {
+        repo_id: RepoId,
+        path: RepoPath,
+        block_id: gitcomet_core::merge::MergeBlockId,
+        source: gitcomet_core::merge::MergeSource,
+    },
+    /// Replace a semantic merge-plan block's complete ordered selection.
+    ConflictReplacePlanBlockSelection {
+        repo_id: RepoId,
+        path: RepoPath,
+        block_id: gitcomet_core::merge::MergeBlockId,
+        selection: gitcomet_core::merge::OrderedSelection,
     },
     ConflictSyncRegionResolutions {
         repo_id: RepoId,
@@ -843,8 +982,8 @@ pub enum Msg {
         repo_id: RepoId,
         path: RepoPath,
     },
-    /// section 30 split: rewrite one conflict-marker block into 2–3 blocks at
-    /// block-local line boundaries and persist the rewritten marker text.
+    /// section 30 split: rewrite one in-memory conflict block into 2–3 blocks
+    /// at block-local line boundaries.
     ConflictSplitRegion {
         repo_id: RepoId,
         path: RepoPath,
@@ -852,6 +991,22 @@ pub enum Msg {
         boundaries: gitcomet_core::conflict_session::ConflictRegionSplitBoundaries,
         /// Resolver revision from which the region index and boundaries were
         /// calculated. Stale requests are rejected before editing the session.
+        expected_conflict_rev: u64,
+    },
+    /// KDiff3 manual diff help: pin one line range per source so the planner
+    /// must align them, then replan the file around that constraint.
+    ConflictAddManualAlignment {
+        repo_id: RepoId,
+        path: RepoPath,
+        alignment: gitcomet_core::merge::ManualAlignment,
+        /// Resolver revision the pinned ranges were read from. Stale requests
+        /// are rejected before replanning.
+        expected_conflict_rev: u64,
+    },
+    /// Drop every manual alignment and replan from the automatic one.
+    ConflictClearManualAlignments {
+        repo_id: RepoId,
+        path: RepoPath,
         expected_conflict_rev: u64,
     },
     /// section 30 join: merge conflict blocks `region_index` and `region_index + 1`,
@@ -948,10 +1103,21 @@ pub enum InternalMsg {
     },
     LogLoaded {
         repo_id: RepoId,
+        seq: crate::model::LogLoadSeq,
         scope: LogScope,
         author: Option<String>,
         cursor: Option<LogCursor>,
         result: Result<LogPage, Error>,
+    },
+    /// A partially built log page, reported while the walk is still running so
+    /// an author filter on a large repository shows what it has found instead
+    /// of nothing. `commits` is the page so far — successive chunks are
+    /// prefixes of each other — and `scanned` counts commits visited.
+    LogChunkLoaded {
+        repo_id: RepoId,
+        seq: crate::model::LogLoadSeq,
+        commits: Vec<Commit>,
+        scanned: u64,
     },
     TagsLoaded {
         repo_id: RepoId,
@@ -1021,6 +1187,11 @@ pub enum InternalMsg {
         repo_id: RepoId,
         result: Result<Option<String>, Error>,
     },
+    HoverCommitMessageLoaded {
+        repo_id: RepoId,
+        commit_id: CommitId,
+        result: Result<String, Error>,
+    },
     FileHistoryLoaded {
         repo_id: RepoId,
         path: PathBuf,
@@ -1041,6 +1212,14 @@ pub enum InternalMsg {
     WorktreesLoaded {
         repo_id: RepoId,
         result: Result<Vec<Worktree>, Error>,
+    },
+    WorktreeDirtyLoaded {
+        repo_id: RepoId,
+        result: Result<Vec<WorktreeDirtySummary>, Error>,
+    },
+    RefMetadataLoaded {
+        repo_id: RepoId,
+        result: Result<Vec<(String, RefMetadata)>, Error>,
     },
     SubmodulesLoaded {
         repo_id: RepoId,
@@ -1072,6 +1251,12 @@ pub enum InternalMsg {
     CommitDetailsLoaded {
         repo_id: RepoId,
         commit_id: CommitId,
+        result: Result<CommitDetails, Error>,
+    },
+    /// A [`Msg::RevealCommit`] reference resolved (or failed to).
+    CommitRevealResolved {
+        repo_id: RepoId,
+        reference: CommitId,
         result: Result<CommitDetails, Error>,
     },
     RangeFilesLoaded {

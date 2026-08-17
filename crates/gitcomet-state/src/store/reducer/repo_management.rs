@@ -142,6 +142,9 @@ fn append_repo_switch_worktree_refresh_effect(
             repo_id: repo_state.id,
         });
     }
+    if let Some(effect) = super::effects::request_worktree_dirty_effect(repo_state) {
+        effects.push(effect);
+    }
 }
 
 fn clear_loading<T>(loadable: &mut Loadable<T>) -> bool {
@@ -155,6 +158,9 @@ fn clear_loading<T>(loadable: &mut Loadable<T>) -> bool {
 
 fn clear_cancelled_repo_loading(repo_state: &mut RepoState) {
     repo_state.loads_in_flight.clear();
+    // The cancelled walk's reply is dropped by the repo-load guard, so nothing
+    // downstream will ever clear the count it left on screen.
+    repo_state.set_log_scan_progress(None);
     if matches!(repo_state.open, Loadable::Loading) {
         repo_state.set_open(Loadable::NotLoaded);
     }
@@ -557,8 +563,19 @@ pub(super) fn close_repo(
 
     append_cancel_repo_loads_effect_for_repo(state, Some(repo_id), &mut effects);
     let was_active = state.active_repo == Some(repo_id);
+    // Recorded here rather than at the affordance that asked for the close, so
+    // the Recently Closed list is ordered by when repositories were closed no
+    // matter which of them (tab `x`, tab menu, picker row menu, close-others)
+    // the user reached for.
+    let closed_workdir = state.repos[removed_repo_ix].spec.workdir.clone();
     state.repos.remove(removed_repo_ix);
     repos.remove(&repo_id);
+    // The worktree scan's cached handles are pruned only by that repo's own scan,
+    // and a closed repo never scans again. This is the one place that knows the
+    // repo is gone rather than merely idle -- `CancelRepoLoads` also fires on tab
+    // switches and reloads, where the handles are still worth keeping.
+    crate::store::effects::release_worktree_scan_handles(repo_id);
+    effects.push(persist_recent_repo_effect(Some(repo_id), closed_workdir));
     if was_active {
         let next_active_repo = if state.repos.is_empty() {
             None
@@ -605,11 +622,24 @@ pub(super) fn close_repos(
         original_active.and_then(|repo_id| original_order.iter().position(|id| *id == repo_id));
 
     let mut effects =
-        Vec::with_capacity(close_ids.len() + 2 + SET_ACTIVE_REPO_INLINE_EFFECT_CAPACITY);
-    for repo_id in close_ids.iter().copied().collect::<Vec<_>>() {
+        Vec::with_capacity(2 * close_ids.len() + 2 + SET_ACTIVE_REPO_INLINE_EFFECT_CAPACITY);
+    // Tab order, not `close_ids` iteration order: a `HashSet` would leave the
+    // Recently Closed entries for one bulk close in an order that varies run to
+    // run. Walking left to right puts the rightmost tab at the top of the list.
+    for repo_id in original_order.iter().copied() {
+        if !close_ids.contains(&repo_id) {
+            continue;
+        }
         clear_banner_error_for_repo(state, repo_id);
         append_cancel_repo_loads_effect_for_repo(state, Some(repo_id), &mut effects);
+        if let Some(repo) = state.repos.iter().find(|repo| repo.id == repo_id) {
+            effects.push(persist_recent_repo_effect(
+                Some(repo_id),
+                repo.spec.workdir.clone(),
+            ));
+        }
         repos.remove(&repo_id);
+        crate::store::effects::release_worktree_scan_handles(repo_id);
     }
 
     state.repos.retain(|repo| !close_ids.contains(&repo.id));
@@ -679,14 +709,11 @@ fn file_browser_load_for_active_files_mode(
     sidebar_mode: SidebarMode,
     repo_state: &RepoState,
 ) -> Option<Effect> {
-    (sidebar_mode == SidebarMode::Files
-        && matches!(
-            repo_state.file_browser.entries,
-            Loadable::NotLoaded | Loadable::Error(_)
-        ))
-    .then(|| Effect::LoadFileBrowser {
-        repo_id: repo_state.id,
-        source: repo_state.file_browser.source.clone(),
+    (sidebar_mode == SidebarMode::Files && repo_state.file_browser.needs_load()).then(|| {
+        Effect::LoadFileBrowser {
+            repo_id: repo_state.id,
+            source: repo_state.file_browser.source.clone(),
+        }
     })
 }
 
@@ -1159,6 +1186,12 @@ pub(super) fn repo_opened_ok(
         {
             repo_state.set_worktrees(Loadable::Loading);
             effects.push(Effect::LoadWorktrees { repo_id });
+        }
+        // The history rows want this from the moment the repo opens, and the
+        // switch-time trigger fires before the handle exists, so this is the
+        // first point where the scan can actually run.
+        if let Some(effect) = super::effects::request_worktree_dirty_effect(repo_state) {
+            effects.push(effect);
         }
         if should_refresh_worktrees {
             append_ensure_sidebar_data_effects(repo_state, &mut effects);

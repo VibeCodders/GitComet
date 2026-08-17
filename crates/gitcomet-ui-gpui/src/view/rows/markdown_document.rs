@@ -28,6 +28,8 @@ use crate::view::markdown_preview::{
     TOO_MANY_ROWS_TO_RENDER_MESSAGE, markdown_document_blocks,
 };
 use crate::view::perf::{self, ViewPerfRenderLane};
+use std::cell::Cell;
+use std::rc::Rc;
 
 /// Everything the flowing renderer needs that is not in the document.
 pub(in crate::view) struct MarkdownDocumentContext {
@@ -69,16 +71,18 @@ const MARKDOWN_DOCUMENT_CHANGE_BAR_WIDTH_PX: f32 = 3.0;
 /// its blocks is what makes the identity check sound: while the cache keeps
 /// that `Arc` alive, no later document can occupy the same address.
 #[derive(Clone, Default)]
-pub(in crate::view) struct MarkdownDocumentBlockCache(
-    std::rc::Rc<
-        std::cell::RefCell<
-            Option<(
-                Arc<MarkdownPreviewDocument>,
-                std::rc::Rc<Vec<MarkdownBlock>>,
-            )>,
-        >,
+pub(in crate::view) struct MarkdownDocumentBlockCache(MarkdownDocumentBlockCacheSlot);
+
+/// The cached document and its blocks, shared between the clones of a
+/// [`MarkdownDocumentBlockCache`].
+type MarkdownDocumentBlockCacheSlot = std::rc::Rc<
+    std::cell::RefCell<
+        Option<(
+            Arc<MarkdownPreviewDocument>,
+            std::rc::Rc<Vec<MarkdownBlock>>,
+        )>,
     >,
-);
+>;
 
 impl MarkdownDocumentBlockCache {
     fn blocks(&self, document: &Arc<MarkdownPreviewDocument>) -> std::rc::Rc<Vec<MarkdownBlock>> {
@@ -106,7 +110,7 @@ pub(in crate::view) fn render_markdown_document(
         return div()
             .w_full()
             .p(scaled(MARKDOWN_PREVIEW_CONTENT_PAD_X_PX, context))
-            .text_color(context.theme.colors.text_muted)
+            .text_color(context.theme.colors.foreground.secondary)
             .child(TOO_MANY_ROWS_TO_RENDER_MESSAGE)
             .into_any_element();
     }
@@ -127,7 +131,7 @@ pub(in crate::view) fn render_markdown_document(
         .min_w(px(0.0))
         .pl(scaled(MARKDOWN_PREVIEW_CONTENT_PAD_X_PX, context))
         .text_size(scaled(MARKDOWN_PREVIEW_BASE_FONT_PX, context))
-        .text_color(context.theme.colors.text);
+        .text_color(context.theme.colors.foreground.primary);
 
     for (ix, block) in blocks.iter().enumerate() {
         column = column.child(render_block(document, block, ix == 0, context));
@@ -199,7 +203,7 @@ fn render_block(
             .into_any_element(),
         MarkdownBlock::ThematicBreak(_) => wrapper
             .child(div().w_full().h(px(1.0)).bg(with_alpha(
-                context.theme.colors.border,
+                context.theme.colors.stroke.default,
                 if context.theme.is_dark { 0.92 } else { 0.88 },
             )))
             .into_any_element(),
@@ -372,20 +376,35 @@ fn render_inline_image(
     let (Some(view), Some(url)) = (context.view.clone(), inline.link_url.clone()) else {
         return image.into_any_element();
     };
-    image
-        .id(("markdown_preview_inline_image_link", inline.source_byte))
-        .cursor(gpui::CursorStyle::PointingHand)
-        .on_mouse_down(gpui::MouseButton::Left, move |event, window, cx| {
-            // The row underneath would otherwise also treat this as a click on
-            // its text and arm a drag-selection behind the menu.
-            cx.stop_propagation();
-            let url = url.clone();
-            let position = event.position;
-            view.update(cx, |this, cx| {
-                this.open_markdown_preview_link_menu(url, position, window, cx);
-                cx.notify();
-            });
+    // The menu hangs off the picture's box, which only paint knows. Prepaint of
+    // this frame runs before it can dispatch a click, so the handler always
+    // reads a box from the frame it fired on.
+    let painted_bounds = Rc::new(Cell::new(None));
+    let record_bounds = Rc::clone(&painted_bounds);
+    div()
+        // The wrapper stands where the picture stood, so it keeps the picture's
+        // sizing in the line it sits on.
+        .flex_none()
+        .on_children_prepainted(move |children_bounds, _window, _cx| {
+            record_bounds.set(children_bounds.first().copied());
         })
+        .child(
+            image
+                .id(("markdown_preview_inline_image_link", inline.source_byte))
+                .cursor(gpui::CursorStyle::PointingHand)
+                .on_mouse_down(gpui::MouseButton::Left, move |event, window, cx| {
+                    // The row underneath would otherwise also treat this as a
+                    // click on its text and arm a drag-selection behind the menu.
+                    cx.stop_propagation();
+                    let url = url.clone();
+                    let bounds = painted_bounds.get();
+                    let position = event.position;
+                    view.update(cx, |this, cx| {
+                        this.open_markdown_preview_link_menu(url, bounds, position, window, cx);
+                        cx.notify();
+                    });
+                }),
+        )
         .into_any_element()
 }
 
@@ -470,7 +489,7 @@ fn render_heading(
             .pb(scaled(4.0, context))
             .border_b_1()
             .border_color(with_alpha(
-                context.theme.colors.border,
+                context.theme.colors.stroke.default,
                 if context.theme.is_dark { 0.85 } else { 0.92 },
             ));
     }
@@ -493,7 +512,7 @@ fn render_list(rows: RowRun<'_>, context: &MarkdownDocumentContext) -> AnyElemen
                         .flex_none()
                         .min_w(scaled(MARKDOWN_PREVIEW_LIST_MARKER_MIN_WIDTH_PX, context))
                         .mr(scaled(MARKDOWN_PREVIEW_LIST_MARKER_GAP_PX, context))
-                        .text_color(context.theme.colors.text_muted)
+                        .text_color(context.theme.colors.foreground.secondary)
                         .child(marker),
                 )
                 .child(render_row_line(row_ix, row, context)),
@@ -511,7 +530,7 @@ fn render_blockquote(rows: RowRun<'_>, context: &MarkdownDocumentContext) -> Any
         .map(|kind| crate::view::rows::markdown_preview_alert_bar_color(context.theme, kind))
         .unwrap_or_else(|| {
             with_alpha(
-                context.theme.colors.border,
+                context.theme.colors.stroke.default,
                 if context.theme.is_dark { 0.96 } else { 0.86 },
             )
         });
@@ -546,7 +565,7 @@ fn render_blockquote(rows: RowRun<'_>, context: &MarkdownDocumentContext) -> Any
                 .bg(bar_color)
                 .rounded(scaled(2.0, context)),
         )
-        .child(body.text_color(context.theme.colors.text_muted))
+        .child(body.text_color(context.theme.colors.foreground.secondary))
         .into_any_element()
 }
 
@@ -582,12 +601,12 @@ fn render_code(rows: RowRun<'_>, context: &MarkdownDocumentContext) -> AnyElemen
                 .px(scaled(MARKDOWN_PREVIEW_SHELL_PAD_X_PX, context))
                 .py(scaled(CODE_BLOCK_PAD_Y_PX, context))
                 .bg(with_alpha(
-                    context.theme.colors.active_section,
+                    context.theme.colors.interaction.selected_background,
                     if context.theme.is_dark { 0.55 } else { 0.45 },
                 ))
                 .border_1()
                 .border_color(with_alpha(
-                    context.theme.colors.border,
+                    context.theme.colors.stroke.default,
                     if context.theme.is_dark { 0.90 } else { 0.80 },
                 ))
                 .rounded(scaled(4.0, context))
@@ -615,7 +634,7 @@ fn render_table(rows: RowRun<'_>, context: &MarkdownDocumentContext) -> AnyEleme
         // The header band is the stronger of the two so the first row reads as
         // labels rather than data.
         let cell_background = with_alpha(
-            context.theme.colors.surface_bg_elevated,
+            context.theme.colors.surface.raised,
             match (is_header, context.theme.is_dark) {
                 (true, true) => 0.64,
                 (true, false) => 0.86,
@@ -632,7 +651,7 @@ fn render_table(rows: RowRun<'_>, context: &MarkdownDocumentContext) -> AnyEleme
             line = line.font_weight(FontWeight::BOLD);
         }
         table = table.child(line.border_b_1().border_color(with_alpha(
-            context.theme.colors.border,
+            context.theme.colors.stroke.default,
             if context.theme.is_dark { 0.70 } else { 0.60 },
         )));
     }

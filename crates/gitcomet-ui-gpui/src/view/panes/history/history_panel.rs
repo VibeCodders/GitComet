@@ -3,6 +3,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::HistoryView;
+use crate::view::caches::HistoryListRow;
 
 impl Render for HistoryView {
     fn render(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
@@ -29,16 +30,17 @@ impl HistoryView {
         self.ensure_history_cache(cx);
         self.ensure_relative_time_tick(cx);
         self.drive_pending_history_reveal(cx);
-        let (show_working_tree_summary_row, _) = self.ensure_history_worktree_summary_cache();
+        let plan = self.ensure_history_list_plan();
         let repo = self.active_repo();
         let commits_count = self
             .history_cache
             .as_ref()
             .map(|cache| cache.base.visible_indices.len())
             .unwrap_or(0);
-        let count = commits_count + usize::from(show_working_tree_summary_row);
+        let count = plan.list_len(commits_count);
+        let scan_progress = repo.and_then(|r| r.history_state.log_scan_progress);
 
-        let bg = theme.colors.window_bg;
+        let bg = theme.colors.surface.canvas;
 
         let body: AnyElement = if count == 0 {
             match repo.map(|r| &r.log) {
@@ -67,6 +69,9 @@ impl HistoryView {
             .on_scroll_wheel(move |_event, _window, cx| {
                 let _ = root_view_for_scroll.update(cx, |root, cx| {
                     root.close_history_refs_hover(cx);
+                    // Rows move out from under the pointer while scrolling, so
+                    // an open card would end up describing a different commit.
+                    root.dismiss_commit_message_hover(cx);
                 });
             });
             let list = restrict_scroll_to_vertical_axis(list);
@@ -142,6 +147,7 @@ impl HistoryView {
                     && match key {
                         "up" => this.history_select_adjacent_commit(-1, cx),
                         "down" => this.history_select_adjacent_commit(1, cx),
+                        "enter" => this.history_open_selected_worktree(cx),
                         _ => false,
                     };
 
@@ -156,13 +162,37 @@ impl HistoryView {
                     .w_full()
                     .bg(bg)
                     .border_b_1()
-                    .border_color(theme.colors.border_variant)
+                    .border_color(theme.colors.stroke.subtle)
                     .child(
                         div()
                             .pr(scrollbar_gutter)
                             .child(self.history_column_headers(cx)),
                     ),
             )
+            .when_some(scan_progress, |panel, scanned| {
+                // A filtered walk has to scan history until it has a full
+                // page of matches, which on a large repository takes
+                // seconds. Say so, with a count that keeps moving, rather
+                // than leaving the previous rows looking frozen.
+                panel.child(
+                    div()
+                        .w_full()
+                        .px(ui_scale::design_px_from_percent(8.0, self.ui_scale_percent))
+                        .py(ui_scale::design_px_from_percent(2.0, self.ui_scale_percent))
+                        .bg(bg)
+                        .border_b_1()
+                        .border_color(theme.colors.stroke.subtle)
+                        .text_xs()
+                        .text_color(theme.colors.foreground.secondary)
+                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .debug_selector(|| "history_scan_progress".to_string())
+                        .child(format!(
+                            "Scanning history… {} commits",
+                            separated_thousands(scanned)
+                        )),
+                )
+            })
             .child(
                 div()
                     .flex()
@@ -171,6 +201,23 @@ impl HistoryView {
                     .min_h(px(0.0))
                     .child(div().flex_1().min_h(px(0.0)).child(body)),
             )
+    }
+
+    /// Enter on a worktree row opens that worktree, matching what clicking its
+    /// badge does. Returns `false` for every other selection so the key keeps
+    /// falling through to whatever else handles it.
+    pub(in crate::view) fn history_open_selected_worktree(
+        &mut self,
+        _cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        let Some(path) = self
+            .active_repo()
+            .and_then(|repo| repo.history_state.worktree_selection.clone())
+        else {
+            return false;
+        };
+        self.store.dispatch(Msg::OpenRepo(path));
+        true
     }
 
     pub(in crate::view) fn history_select_adjacent_commit(
@@ -182,7 +229,8 @@ impl HistoryView {
             return false;
         };
 
-        let (show_working_tree_summary_row, _) = self.ensure_history_worktree_summary_cache();
+        let plan = self.ensure_history_list_plan();
+        let show_working_tree_summary_row = plan.show_working_tree_summary_row();
         let offset = usize::from(show_working_tree_summary_row);
 
         let (selected_commit, page, log_rev, stashes_rev, history_scope) = match self.active_repo()
@@ -216,7 +264,12 @@ impl HistoryView {
             return false;
         }
 
-        let list_len = total_commits + offset;
+        let list_len = plan.list_len(total_commits);
+
+        // Read before the cache is borrowed mutably below.
+        let selected_worktree = self
+            .active_repo()
+            .and_then(|repo| repo.history_state.worktree_selection.clone());
 
         let current_list_ix = super::resolve_history_selected_list_index(
             &mut self.history_selected_list_index_cache,
@@ -224,11 +277,28 @@ impl HistoryView {
             log_rev,
             stashes_rev,
             history_scope,
-            show_working_tree_summary_row,
-            selected_commit.as_ref(),
+            &plan,
+            super::HistorySelectionRef {
+                commit: selected_commit.as_ref(),
+                worktree_selected: selected_worktree.is_some(),
+            },
             &cache.base.visible_indices,
             &page.commits,
         );
+
+        let current_list_ix = selected_worktree
+            .as_deref()
+            .and_then(|path| super::worktree_row_list_ix(&plan, self.active_repo(), path))
+            .or(current_list_ix);
+
+        // A selected worktree with nothing to anchor to -- it went clean, its
+        // HEAD left the loaded page, or the scan has not answered yet -- leaves
+        // no row to step from. The `None` arms below mean "nothing is selected"
+        // and wrap to the far end of the list, which from a live selection reads
+        // as the log teleporting rather than moving by one.
+        if current_list_ix.is_none() && selected_worktree.is_some() {
+            return false;
+        }
 
         let next_list_ix = match (current_list_ix, direction.is_negative()) {
             (Some(current_list_ix), true) => current_list_ix.saturating_sub(1),
@@ -248,6 +318,25 @@ impl HistoryView {
             return true;
         }
 
+        if let Some(HistoryListRow::WorktreeUncommitted { worktree_ix, .. }) =
+            plan.row_at(next_list_ix)
+        {
+            let path = self
+                .active_repo()
+                .and_then(|repo| match &repo.worktree_dirty {
+                    Loadable::Ready(dirty) => dirty.get(worktree_ix).map(|s| s.path.clone()),
+                    _ => None,
+                });
+            let Some(path) = path else {
+                return false;
+            };
+            self.store
+                .dispatch(Msg::SelectWorktreeUncommitted { repo_id, path });
+            self.dismiss_history_refs_hover(_cx);
+            self.history_scroll
+                .scroll_to_item_strict(next_list_ix, gpui::ScrollStrategy::Center);
+            return true;
+        }
         if show_working_tree_summary_row && next_list_ix == 0 {
             self.store.dispatch(Msg::ClearCommitSelection { repo_id });
             self.store.dispatch(Msg::ClearDiffSelection { repo_id });
@@ -257,7 +346,7 @@ impl HistoryView {
                 log_rev,
                 stashes_rev,
                 history_scope,
-                show_working_tree_summary_row,
+                &plan,
                 None,
                 0,
             );
@@ -267,7 +356,9 @@ impl HistoryView {
             return true;
         }
 
-        let visible_ix = next_list_ix.saturating_sub(offset);
+        let Some(HistoryListRow::Commit { visible_ix }) = plan.row_at(next_list_ix) else {
+            return false;
+        };
         let Some(commit_ix) = cache.base.visible_indices.get(visible_ix) else {
             return false;
         };
@@ -285,7 +376,7 @@ impl HistoryView {
             log_rev,
             stashes_rev,
             history_scope,
-            show_working_tree_summary_row,
+            &plan,
             Some(commit.id.clone()),
             next_list_ix,
         );
@@ -298,7 +389,10 @@ impl HistoryView {
     fn history_column_headers(&mut self, cx: &mut gpui::Context<Self>) -> gpui::Div {
         let theme = self.theme;
         let scaled_px = |value| ui_scale::design_px_from_percent(value, self.ui_scale_percent);
-        let icon_muted = with_alpha(theme.colors.accent, if theme.is_dark { 0.72 } else { 0.82 });
+        let icon_muted = with_alpha(
+            theme.colors.accent.foreground,
+            if theme.is_dark { 0.72 } else { 0.82 },
+        );
         let (show_graph, show_author, show_date, show_sha) = self.history_visible_columns();
         let col_author = self.history_col_author;
         let col_date = self.history_col_date;
@@ -336,6 +430,7 @@ impl HistoryView {
         let author_invoker: SharedString = "history_author_filter_header".into();
         let author_anchor_bounds: Rc<RefCell<Option<Bounds<Pixels>>>> = Rc::new(RefCell::new(None));
         let author_anchor_bounds_for_prepaint = Rc::clone(&author_anchor_bounds);
+        let author_anchor_bounds_for_prepaint_2 = Rc::clone(&author_anchor_bounds);
         let author_anchor_bounds_for_click = Rc::clone(&author_anchor_bounds);
         let author_filter_active = self
             .active_repo()
@@ -343,13 +438,18 @@ impl HistoryView {
         let author_active = self
             .active_context_menu_invoker
             .as_ref()
-            .is_some_and(|id| id.as_ref() == author_invoker.as_ref());
+            .is_some_and(|id| id.as_ref() == author_invoker.as_ref());        // The names on offer come from the commits loaded so far, not from the
+        // whole repository, so say where they are from — otherwise an author who
+        // has not been paged in yet looks like an author who does not exist. Kept
+        // to one line: the tooltip bubble shapes its text as a single run.
         let author_tooltip: SharedString = self
             .active_repo()
             .and_then(|r| r.history_state.history_author_filter.clone())
-            .map(|name| format!("Author filter: {name}"))
-            .unwrap_or_else(|| "Filter history by author".to_string())
-            .into();
+            .map(|name| format!("Author filter: {name} — suggestions from loaded history"))
+            .unwrap_or_else(|| {
+                "Filter history by author — suggestions from loaded history".to_string()
+            })
+             .into();
 
         let ui_scale_percent = self.ui_scale_percent;
         let active_col_resize = self.history_col_resize;
@@ -369,7 +469,7 @@ impl HistoryView {
                     id,
                     components::ResizeGripAxis::Vertical,
                     dragging,
-                    Some(theme.colors.border_variant),
+                    Some(theme.colors.stroke.subtle),
                 ))
                 .on_drag(handle, |_handle, _offset, _window, cx| {
                     cx.new(|_cx| HistoryColResizeDragGhost)
@@ -457,7 +557,7 @@ impl HistoryView {
             .px_2()
             .text_xs()
             .font_weight(FontWeight::SEMIBOLD)
-            .text_color(theme.colors.text_muted)
+            .text_color(theme.colors.foreground.secondary)
             .child(
                 div()
                     .w(self.history_col_branch)
@@ -484,15 +584,22 @@ impl HistoryView {
                                     .h(scaled_px(18.0))
                                     .line_height(scaled_px(18.0))
                                     .rounded(px(theme.radii.row))
-                                    .when(scope_active, |d| d.bg(theme.colors.active))
+                                    .when(scope_active, |d| {
+                                        d.bg(theme.colors.interaction.pressed_background)
+                                    })
                                     .hover(move |s| {
                                         if scope_active {
-                                            s.bg(theme.colors.active)
+                                            s.bg(theme.colors.interaction.pressed_background)
                                         } else {
-                                            s.bg(with_alpha(theme.colors.hover, 0.55))
+                                            s.bg(with_alpha(
+                                                theme.colors.interaction.hover_background,
+                                                0.55,
+                                            ))
                                         }
                                     })
-                                    .active(move |s| s.bg(theme.colors.active))
+                                    .active(move |s| {
+                                        s.bg(theme.colors.interaction.pressed_background)
+                                    })
                                     .cursor(CursorStyle::PointingHand)
                                     .child(
                                         div()
@@ -567,15 +674,22 @@ impl HistoryView {
                                     .h(scaled_px(18.0))
                                     .line_height(scaled_px(18.0))
                                     .rounded(px(theme.radii.row))
-                                    .when(author_active, |d| d.bg(theme.colors.active))
+                                    .when(author_active, |d| {
+                                        d.bg(theme.colors.interaction.pressed_background)
+                                    })
                                     .hover(move |s| {
                                         if author_active {
-                                            s.bg(theme.colors.active)
+                                            s.bg(theme.colors.interaction.pressed_background)
                                         } else {
-                                            s.bg(with_alpha(theme.colors.hover, 0.55))
+                                            s.bg(with_alpha(
+                                                theme.colors.interaction.hover_background,
+                                                0.55,
+                                            ))
                                         }
                                     })
-                                    .active(move |s| s.bg(theme.colors.active))
+                                    .active(move |s| {
+                                        s.bg(theme.colors.interaction.pressed_background)
+                                    })
                                     .cursor(CursorStyle::PointingHand)
                                     .child(
                                         div()
@@ -583,10 +697,10 @@ impl HistoryView {
                                             .line_clamp(1)
                                             .whitespace_nowrap()
                                             .when(author_filter_active, |d| {
-                                                d.text_color(theme.colors.accent)
+                                                d.text_color(theme.colors.accent.foreground)
                                             })
                                             .when(!author_filter_active, |d| {
-                                                d.text_color(theme.colors.text_muted)
+                                                d.text_color(theme.colors.foreground.secondary)
                                             })
                                             .child(author_label.clone()),
                                     )
@@ -632,7 +746,7 @@ impl HistoryView {
                                     .when(scope_repo_id.is_none(), |this| {
                                         this.opacity(0.6).cursor(CursorStyle::Arrow)
                                     })
-                                    .gitcomet_tooltip(theme, author_tooltip),
+                                    .gitcomet_tooltip(theme, author_tooltip.clone()),
                             ),
                     ),
             )
@@ -674,7 +788,99 @@ impl HistoryView {
                         .pr(cell_pad)
                         .whitespace_nowrap()
                         .overflow_hidden()
-                        .child("AUTHOR"),
+                        .child(
+                            div()
+                                .on_children_prepainted(move |children_bounds, _w, _cx| {
+                                    if let Some(bounds) = children_bounds.first() {
+                                        *author_anchor_bounds_for_prepaint_2.borrow_mut() =
+                                            Some(*bounds);
+                                    }
+                                })
+                                .child(
+                                    div()
+                                        .id("history_author_filter_header")
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .px_1()
+                                        .h(scaled_px(18.0))
+                                        .line_height(scaled_px(18.0))
+                                        .rounded(px(theme.radii.row))
+                                        .when(author_active, |d| {
+                                            d.bg(theme.colors.interaction.pressed_background)
+                                        })
+                                        .hover(move |s| {
+                                            if author_active {
+                                                s.bg(theme.colors.interaction.pressed_background)
+                                            } else {
+                                                s.bg(with_alpha(
+                                                    theme.colors.interaction.hover_background,
+                                                    0.55,
+                                                ))
+                                            }
+                                        })
+                                        .active(move |s| {
+                                            s.bg(theme.colors.interaction.pressed_background)
+                                        })
+                                        .cursor(CursorStyle::PointingHand)
+                                        .child(
+                                            div()
+                                                .min_w(px(0.0))
+                                                .line_clamp(1)
+                                                .whitespace_nowrap()
+                                                .when(author_filter_active, |d| {
+                                                    d.text_color(theme.colors.accent.foreground)
+                                                })
+                                                .when(!author_filter_active, |d| {
+                                                    d.text_color(theme.colors.foreground.secondary)
+                                                })
+                                                .child(author_label.clone()),
+                                        )
+                                        .child(svg_icon(
+                                            "icons/chevron_down.svg",
+                                            icon_muted,
+                                            scaled_px(12.0),
+                                        ))
+                                        .when_some(scope_repo_id, |this, repo_id| {
+                                            let author_invoker = author_invoker.clone();
+                                            let author_anchor_bounds_for_click =
+                                                Rc::clone(&author_anchor_bounds_for_click);
+                                            this.on_click(cx.listener(
+                                                move |this, e: &ClickEvent, window, cx| {
+                                                    this.activate_context_menu_invoker(
+                                                        author_invoker.clone(),
+                                                        cx,
+                                                    );
+                                                    if let Some(bounds) =
+                                                        *author_anchor_bounds_for_click.borrow()
+                                                    {
+                                                        this.open_popover_for_bounds(
+                                                            PopoverKind::HistoryAuthorFilter {
+                                                                repo_id,
+                                                            },
+                                                            bounds,
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    } else {
+                                                        this.open_popover_at(
+                                                            PopoverKind::HistoryAuthorFilter {
+                                                                repo_id,
+                                                            },
+                                                            e.position(),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    }
+                                                },
+                                            ))
+                                        })
+                                        .when(scope_repo_id.is_none(), |this| {
+                                            this.opacity(0.6).cursor(CursorStyle::Arrow)
+                                        })
+                                        .gitcomet_tooltip(theme, author_tooltip.clone()),
+                                ),
+                        ),
                 )
             });
 
@@ -754,5 +960,32 @@ impl HistoryView {
         }
 
         header_with_handles
+    }
+}
+
+/// `1778198` → `1 778 198`. Groups with a narrow no-break space, which reads as
+/// a separator in every locale rather than as a decimal point in some.
+fn separated_thousands(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (ix, ch) in digits.chars().enumerate() {
+        if ix > 0 && (digits.len() - ix).is_multiple_of(3) {
+            out.push('\u{202f}');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+#[cfg(test)]
+mod scan_progress_tests {
+    use super::separated_thousands;
+
+    #[test]
+    fn groups_digits_in_threes() {
+        assert_eq!(separated_thousands(0), "0");
+        assert_eq!(separated_thousands(999), "999");
+        assert_eq!(separated_thousands(1_000), "1\u{202f}000");
+        assert_eq!(separated_thousands(1_778_198), "1\u{202f}778\u{202f}198");
     }
 }

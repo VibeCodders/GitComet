@@ -1,10 +1,11 @@
-use crate::theme::AppTheme;
+use crate::theme::{AppTheme, composite_over};
 use crate::ui_scale::UiScale;
 use gpui::prelude::*;
 use gpui::{
     AnyElement, Bounds, ClickEvent, CursorStyle, Div, FocusHandle, IntoElement, Pixels,
     SharedString, Stateful, Window, div, px,
 };
+use palette::IntoColor;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -35,6 +36,9 @@ pub struct Button {
     disabled: bool,
     selected: bool,
     selected_bg: Option<gpui::Rgba>,
+    bg: Option<gpui::Rgba>,
+    hover_bg: Option<gpui::Rgba>,
+    text_color: Option<gpui::Rgba>,
     rounding: ButtonRounding,
     borderless: bool,
     suppress_hover_border: bool,
@@ -54,6 +58,9 @@ impl Button {
             disabled: false,
             selected: false,
             selected_bg: None,
+            bg: None,
+            hover_bg: None,
+            text_color: None,
             rounding: ButtonRounding::All,
             borderless: false,
             suppress_hover_border: false,
@@ -72,6 +79,26 @@ impl Button {
 
     pub fn selected_bg(mut self, bg: gpui::Rgba) -> Self {
         self.selected_bg = Some(bg);
+        self
+    }
+
+    /// Resting background, for a button that carries its own tint instead of
+    /// the style's neutral fill.
+    pub fn bg(mut self, bg: gpui::Rgba) -> Self {
+        self.bg = Some(bg);
+        self
+    }
+
+    /// Hover *and* pressed background. A tinted resting background needs this
+    /// too: the style's neutral overlay would otherwise read as a step *down*
+    /// from the tint under the cursor.
+    pub fn hover_bg(mut self, bg: gpui::Rgba) -> Self {
+        self.hover_bg = Some(bg);
+        self
+    }
+
+    pub fn text_color(mut self, color: gpui::Rgba) -> Self {
+        self.text_color = Some(color);
         self
     }
 
@@ -187,6 +214,9 @@ impl Button {
             disabled,
             selected,
             selected_bg,
+            bg: bg_override,
+            hover_bg: hover_bg_override,
+            text_color: text_color_override,
             rounding,
             borderless,
             suppress_hover_border,
@@ -199,10 +229,11 @@ impl Button {
         let ui_scale = ui_scale.into();
 
         let transparent = gpui::rgba(0x00000000);
-        let outlined_border = with_alpha(
-            theme.colors.text_muted,
-            if theme.is_dark { 0.38 } else { 0.28 },
-        );
+        let outlined_border = if theme.is_dark {
+            with_alpha(theme.colors.foreground.secondary, 0.38)
+        } else {
+            theme.colors.stroke.control
+        };
         let hover_overlay = theme.hover_overlay();
         let active_overlay = theme.active_overlay();
         let (bg, hover_bg, active_bg, border, hover_border, active_border, text) = match style {
@@ -210,55 +241,60 @@ impl Button {
                 transparent,
                 hover_overlay,
                 active_overlay,
-                with_alpha(theme.colors.accent, 0.90),
-                with_alpha(theme.colors.accent, 1.00),
-                with_alpha(theme.colors.accent, 1.00),
-                theme.colors.accent,
+                with_alpha(theme.colors.accent.foreground, 0.90),
+                with_alpha(theme.colors.accent.foreground, 1.00),
+                with_alpha(theme.colors.accent.foreground, 1.00),
+                theme.colors.accent.foreground,
             ),
             ButtonStyle::Outlined => (
                 transparent,
                 hover_overlay,
                 active_overlay,
                 outlined_border,
-                with_alpha(
-                    theme.colors.text_muted,
-                    if theme.is_dark { 0.55 } else { 0.40 },
-                ),
-                with_alpha(
-                    theme.colors.text_muted,
-                    if theme.is_dark { 0.62 } else { 0.46 },
-                ),
-                theme.colors.text,
+                if theme.is_dark {
+                    with_alpha(theme.colors.foreground.secondary, 0.55)
+                } else {
+                    theme.colors.interaction.selected_indicator
+                },
+                if theme.is_dark {
+                    with_alpha(theme.colors.foreground.secondary, 0.62)
+                } else {
+                    theme.colors.interaction.selected_indicator
+                },
+                theme.colors.foreground.primary,
             ),
             ButtonStyle::Solid => {
-                let bg = theme.colors.surface_bg_elevated;
-                let hover_bg = mix(
-                    bg,
-                    theme.colors.text,
-                    if theme.is_dark { 0.06 } else { 0.03 },
-                );
-                let active_bg = mix(
-                    bg,
-                    theme.colors.text,
-                    if theme.is_dark { 0.10 } else { 0.05 },
-                );
+                let bg = theme.colors.surface.raised;
+                let hover_bg = if theme.is_dark {
+                    mix(bg, theme.colors.foreground.primary, 0.06)
+                } else {
+                    composite_over(bg, hover_overlay)
+                };
+                let active_bg = if theme.is_dark {
+                    mix(bg, theme.colors.foreground.primary, 0.10)
+                } else {
+                    composite_over(bg, active_overlay)
+                };
                 (
                     bg,
                     hover_bg,
                     active_bg,
-                    with_alpha(
-                        theme.colors.text_muted,
-                        if theme.is_dark { 0.34 } else { 0.26 },
-                    ),
-                    with_alpha(
-                        theme.colors.text_muted,
-                        if theme.is_dark { 0.55 } else { 0.40 },
-                    ),
-                    with_alpha(
-                        theme.colors.text_muted,
-                        if theme.is_dark { 0.62 } else { 0.46 },
-                    ),
-                    theme.colors.text,
+                    if theme.is_dark {
+                        with_alpha(theme.colors.foreground.secondary, 0.34)
+                    } else {
+                        theme.colors.stroke.control
+                    },
+                    if theme.is_dark {
+                        with_alpha(theme.colors.foreground.secondary, 0.55)
+                    } else {
+                        theme.colors.interaction.selected_indicator
+                    },
+                    if theme.is_dark {
+                        with_alpha(theme.colors.foreground.secondary, 0.62)
+                    } else {
+                        theme.colors.interaction.selected_indicator
+                    },
+                    theme.colors.foreground.primary,
                 )
             }
             ButtonStyle::Subtle => (
@@ -267,14 +303,14 @@ impl Button {
                 active_overlay,
                 transparent,
                 with_alpha(
-                    theme.colors.text_muted,
+                    theme.colors.foreground.secondary,
                     if theme.is_dark { 0.45 } else { 0.32 },
                 ),
                 with_alpha(
-                    theme.colors.text_muted,
+                    theme.colors.foreground.secondary,
                     if theme.is_dark { 0.52 } else { 0.38 },
                 ),
-                theme.colors.text,
+                theme.colors.foreground.primary,
             ),
             ButtonStyle::Transparent => (
                 transparent,
@@ -282,28 +318,48 @@ impl Button {
                 active_overlay,
                 transparent,
                 with_alpha(
-                    theme.colors.text_muted,
+                    theme.colors.foreground.secondary,
                     if theme.is_dark { 0.40 } else { 0.30 },
                 ),
                 with_alpha(
-                    theme.colors.text_muted,
+                    theme.colors.foreground.secondary,
                     if theme.is_dark { 0.46 } else { 0.34 },
                 ),
-                theme.colors.text_muted,
+                theme.colors.foreground.secondary,
             ),
-            ButtonStyle::Danger => (
-                with_alpha(theme.colors.danger, if theme.is_dark { 0.18 } else { 0.14 }),
-                with_alpha(theme.colors.danger, if theme.is_dark { 0.26 } else { 0.20 }),
-                with_alpha(theme.colors.danger, if theme.is_dark { 0.32 } else { 0.26 }),
-                with_alpha(theme.colors.danger, if theme.is_dark { 0.42 } else { 0.32 }),
-                with_alpha(theme.colors.danger, if theme.is_dark { 0.46 } else { 0.36 }),
-                with_alpha(theme.colors.danger, if theme.is_dark { 0.52 } else { 0.42 }),
-                theme.colors.text,
-            ),
+            ButtonStyle::Danger => {
+                let danger = theme.colors.status.danger;
+                if theme.is_dark {
+                    (
+                        with_alpha(danger.foreground, 0.18),
+                        with_alpha(danger.foreground, 0.26),
+                        with_alpha(danger.foreground, 0.32),
+                        with_alpha(danger.foreground, 0.42),
+                        with_alpha(danger.foreground, 0.46),
+                        with_alpha(danger.foreground, 0.52),
+                        theme.colors.foreground.primary,
+                    )
+                } else {
+                    (
+                        danger.background,
+                        composite_over(danger.background, hover_overlay),
+                        composite_over(danger.background, active_overlay),
+                        danger.border,
+                        danger.foreground,
+                        danger.foreground,
+                        danger.foreground,
+                    )
+                }
+            }
         };
 
+        let bg = bg_override.unwrap_or(bg);
+        let hover_bg = hover_bg_override.unwrap_or(hover_bg);
+        let active_bg = hover_bg_override.unwrap_or(active_bg);
+        let text = text_color_override.unwrap_or(text);
+
         let separator_color = with_alpha(
-            theme.colors.text_muted,
+            theme.colors.foreground.secondary,
             if theme.is_dark { 0.34 } else { 0.26 },
         );
         let label = label.to_string();
@@ -385,21 +441,31 @@ impl Button {
         }
         base = base.focus(move |s| {
             if borderless {
-                s.bg(theme.colors.focus_ring_bg)
+                s.bg(theme.colors.interaction.focus_background)
             } else {
-                s.border_color(theme.colors.focus_ring)
-                    .bg(theme.colors.focus_ring_bg)
+                s.border_color(theme.colors.interaction.focus_ring)
+                    .bg(theme.colors.interaction.focus_background)
             }
         });
 
         if disabled {
             base = base.opacity(0.5).cursor(CursorStyle::Arrow);
         } else if selected {
-            let selected_bg = selected_bg_override.unwrap_or(theme.colors.active);
+            let selected_bg =
+                selected_bg_override.unwrap_or(theme.colors.interaction.pressed_background);
             base = base
                 .bg(selected_bg)
                 .hover(move |s| s.bg(selected_bg))
                 .active(move |s| s.bg(selected_bg));
+            if !theme.is_dark {
+                base = base.shadow(vec![gpui::BoxShadow {
+                    color: theme.colors.interaction.selected_indicator.into_color(),
+                    offset: gpui::point(px(0.0), px(0.0)),
+                    blur_radius: px(0.0),
+                    spread_radius: px(1.0),
+                    inset: true,
+                }]);
+            }
         } else if suppress_hover_border {
             base = base
                 .hover(move |s| s.bg(hover_bg))
@@ -421,16 +487,16 @@ fn looks_like_icon_button(label: &str) -> bool {
 }
 
 fn with_alpha(mut color: gpui::Rgba, alpha: f32) -> gpui::Rgba {
-    color.a = alpha;
+    color.alpha = alpha;
     color
 }
 
 fn mix(a: gpui::Rgba, b: gpui::Rgba, t: f32) -> gpui::Rgba {
     let t = t.clamp(0.0, 1.0);
-    gpui::Rgba {
-        r: a.r + (b.r - a.r) * t,
-        g: a.g + (b.g - a.g) * t,
-        b: a.b + (b.b - a.b) * t,
-        a: a.a + (b.a - a.a) * t,
-    }
+    gpui::Rgba::new(
+        a.red + (b.red - a.red) * t,
+        a.green + (b.green - a.green) * t,
+        a.blue + (b.blue - a.blue) * t,
+        a.alpha + (b.alpha - a.alpha) * t,
+    )
 }

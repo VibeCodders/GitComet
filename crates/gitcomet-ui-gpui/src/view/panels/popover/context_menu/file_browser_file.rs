@@ -8,6 +8,7 @@ pub(super) fn model(
     this: &PopoverHost,
     repo_id: RepoId,
     path: &std::path::Path,
+    cx: &gpui::Context<PopoverHost>,
 ) -> ContextMenuModel {
     let source = this
         .state
@@ -16,11 +17,6 @@ pub(super) fn model(
         .find(|repo| repo.id == repo_id)
         .map(|repo| repo.file_browser.source.clone())
         .unwrap_or_default();
-
-    let copy_path_text = this
-        .resolve_workdir_path(repo_id, path)
-        .map(|p| path_text_for_copy(&p))
-        .unwrap_or_else(|_| path_text_for_copy(path));
 
     let mut items = vec![ContextMenuItem::Header(
         path.file_name()
@@ -52,6 +48,42 @@ pub(super) fn model(
             shortcut: None,
             disabled: false,
             action: Box::new(ContextMenuAction::SelectDiff { repo_id, target }),
+        });
+    }
+
+    items.push(ContextMenuItem::Entry {
+        label: "Edit file".into(),
+        icon: Some("icons/pencil.svg".into()),
+        shortcut: None,
+        // The editor always opens the workspace copy, so browsing a commit is
+        // no obstacle — but a branch listing has no path on disk at all, and a
+        // picture has no text to edit.
+        disabled: matches!(source, FileSource::Branch(_))
+            || crate::view::should_bypass_text_file_preview_for_path(path),
+        action: Box::new(ContextMenuAction::EditFile {
+            repo_id,
+            path: path.to_path_buf(),
+        }),
+    });
+
+    // Only offered for a file the editor is actually holding unsaved text for —
+    // an always-present "Discard changes" would read as "revert the file", which
+    // is what the status list's discard does and is a different, far more
+    // destructive thing.
+    if this
+        .main_pane
+        .read(cx)
+        .file_edits_are_unsaved_for(repo_id, path)
+    {
+        items.push(ContextMenuItem::Entry {
+            label: "Discard unsaved edits".into(),
+            icon: Some("icons/undo.svg".into()),
+            shortcut: None,
+            disabled: false,
+            action: Box::new(ContextMenuAction::DiscardFileEdits {
+                repo_id,
+                path: path.to_path_buf(),
+            }),
         });
     }
 
@@ -105,21 +137,31 @@ pub(super) fn model(
             // The browsed source decides the permalink reference: the commit
             // or branch being browsed, or the current branch for the working
             // directory.
-            let reference = match &source {
-                FileSource::Commit(commit_id) => commit_id.as_ref().to_string(),
-                FileSource::Branch(name) => name.clone(),
+            let (reference, is_branch) = match &source {
+                FileSource::Commit(commit_id) => (commit_id.as_ref().to_string(), false),
+                FileSource::Branch(name) => (name.clone(), true),
                 FileSource::WorkingDirectory => match &repo.head_branch {
                     Loadable::Ready(head) if !head.is_empty() && head != "HEAD" => {
-                        head.clone()
+                        (head.clone(), true)
                     }
                     _ => return None,
                 },
             };
-            crate::view::permalink::file_permalink(
-                remotes,
-                &reference,
-                &path.display().to_string(),
-            )
+            // A branch permalink is a `blob/<branch>` link that only resolves
+            // while the branch exists on the permalink's remote. For a
+            // local-only branch (never pushed) it would point at a nonexistent
+            // source, so don't offer the action in that case.
+            if is_branch
+                && let Loadable::Ready(remote_branches) = &repo.remote_branches
+                && !crate::view::permalink::branch_exists_on_permalink_remote(
+                    remotes,
+                    remote_branches,
+                    &reference,
+                )
+            {
+                return None;
+            }
+            crate::view::permalink::file_permalink(remotes, &reference, &path.display().to_string())
         });
     if let Some(permalink) = file_permalink {
         items.push(ContextMenuItem::Entry {
@@ -132,15 +174,7 @@ pub(super) fn model(
     }
 
     items.push(ContextMenuItem::Separator);
-    items.push(ContextMenuItem::Entry {
-        label: "Copy path".into(),
-        icon: Some("icons/copy.svg".into()),
-        shortcut: None,
-        disabled: false,
-        action: Box::new(ContextMenuAction::CopyText {
-            text: copy_path_text,
-        }),
-    });
+    push_copy_path_entries(&mut items, this, repo_id, path, None);
 
     ContextMenuModel::new(items)
 }

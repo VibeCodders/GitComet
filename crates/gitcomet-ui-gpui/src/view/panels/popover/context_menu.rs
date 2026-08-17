@@ -1,12 +1,14 @@
 use super::*;
 
 mod branch;
+mod branch_group;
 mod branch_section;
 mod browse_history;
 mod change_tracking_settings;
 mod commit;
 mod commit_file;
 mod commit_options;
+mod commit_sha_link;
 mod conflict_resolver_chunk;
 mod conflict_resolver_input_row;
 mod conflict_resolver_output;
@@ -14,15 +16,15 @@ mod diff_actions;
 mod diff_content_mode_settings;
 mod diff_editor;
 mod diff_hunk;
-mod file_browser_file;
-mod history_author_filter;
+mod file_browser_file;mod file_browser_folder;
 mod history_branch_filter;
-mod markdown_link;
 mod mergetool_settings;
+mod pinned_section;
 mod previous_commit_messages;
 mod pull;
 mod push;
 mod remote;
+mod repo_picker_row;
 mod repo_tab;
 mod stash;
 mod status_file;
@@ -32,6 +34,7 @@ mod submodule_section;
 mod tag;
 mod terminal;
 mod ui_scale_picker;
+mod web_link;
 mod worktree;
 mod worktree_section;
 
@@ -51,10 +54,61 @@ fn normalize_platform_path(path: std::path::PathBuf) -> std::path::PathBuf {
     }
 }
 
+/// One line of the "Add to .gitignore" field as a submittable pattern, or
+/// `None` when the line is blank.
+///
+/// Trailing spaces go through git's own rule rather than `str::trim`, which
+/// would unescape a deliberate `foo\ ` back into a dangling backslash. Leading
+/// whitespace is dropped: it is significant to git, but a leading space in a
+/// hand-typed line is copy-paste noise far more often than intent, and the
+/// resulting pattern would silently match nothing.
+fn gitignore_pattern_line(line: &str) -> Option<&str> {
+    let line = gitcomet_core::gitignore::trim_trailing_spaces(line.trim_start());
+    (!line.is_empty()).then_some(line)
+}
+
 pub(super) fn path_text_for_copy(path: &std::path::Path) -> String {
     normalize_platform_path(path.to_path_buf())
         .display()
         .to_string()
+}
+
+/// The `Copy absolute path` / `Copy relative path` pair every file-ish menu
+/// ends with, for a repo-relative `path`.
+///
+/// Built in one place so the labels, icons and mnemonic cannot drift apart
+/// between menus: the mnemonic is matched on the key alone, so `c` has to mean
+/// the same thing in whichever menu is open.
+pub(super) fn push_copy_path_entries(
+    items: &mut Vec<ContextMenuItem>,
+    host: &PopoverHost,
+    repo_id: RepoId,
+    path: &std::path::Path,
+    relative_shortcut: Option<SharedString>,
+) {
+    // Offered only when the workdir join actually resolves. Falling back to the
+    // repo-relative text would put identical content behind two entries whose
+    // labels promise different things.
+    if let Ok(absolute) = host.resolve_workdir_path(repo_id, path) {
+        items.push(ContextMenuItem::Entry {
+            label: "Copy absolute path".into(),
+            icon: Some("icons/copy.svg".into()),
+            shortcut: None,
+            disabled: false,
+            action: Box::new(ContextMenuAction::CopyText {
+                text: path_text_for_copy(&absolute),
+            }),
+        });
+    }
+    items.push(ContextMenuItem::Entry {
+        label: "Copy relative path".into(),
+        icon: Some("icons/copy.svg".into()),
+        shortcut: relative_shortcut,
+        disabled: false,
+        action: Box::new(ContextMenuAction::CopyText {
+            text: path_text_for_copy(path),
+        }),
+    });
 }
 
 fn active_branch_tracking_upstream_name(host: &PopoverHost) -> Option<String> {
@@ -161,7 +215,7 @@ pub(in super::super) fn context_menu_shortcut_entry_ix(
 }
 
 impl PopoverHost {
-    fn workdir_for_repo(&self, repo_id: RepoId) -> Option<std::path::PathBuf> {
+    pub(super) fn workdir_for_repo(&self, repo_id: RepoId) -> Option<std::path::PathBuf> {
         self.state
             .repos
             .iter()
@@ -234,6 +288,22 @@ impl PopoverHost {
     /// The paths a context-menu action on `clicked_path` covers, plus whether
     /// they came out of the row selection. Reads only — see
     /// [`Self::clear_status_multi_selection`] for the other half.
+    /// The screen point a follow-up popover should open at, derived from the
+    /// anchor of the menu that is currently open.
+    ///
+    /// Every context-menu action that opens a dialog needs this, and the six
+    /// copies it replaced all carried the same duplicated fallback constant.
+    fn popover_anchor_point(&self) -> gpui::Point<Pixels> {
+        self.popover_anchor
+            .as_ref()
+            .map(|anchor| match anchor {
+                PopoverAnchor::Point(point) => *point,
+                PopoverAnchor::Bounds(bounds) => bounds.bottom_right(),
+                PopoverAnchor::Centered => point(px(64.0), px(64.0)),
+            })
+            .unwrap_or_else(|| point(px(64.0), px(64.0)))
+    }
+
     fn status_paths_for_action(
         &self,
         repo_id: RepoId,
@@ -272,6 +342,33 @@ impl PopoverHost {
             self.clear_status_multi_selection(repo_id, cx);
         }
         (paths, used_selection)
+    }
+
+    fn repo_is_open(&self, repo_id: RepoId) -> bool {
+        self.state.repos.iter().any(|repo| repo.id == repo_id)
+    }
+
+    /// A toast rather than an error banner: nothing failed, the row just went
+    /// stale, and the banner belongs to whichever repository is active now — not
+    /// to the one that left.
+    fn warn_repository_gone(&mut self, cx: &mut gpui::Context<Self>) {
+        self.push_toast(
+            components::ToastKind::Warning,
+            "That repository is no longer open.".to_owned(),
+            cx,
+        );
+    }
+
+    /// The menu a repository row in the picker offers. Not reachable through
+    /// [`Self::context_menu_model`] because it has no popover kind of its own:
+    /// it is only ever floated over the picker by
+    /// [`super::picker_row_menu`](crate::view::panels::popover), never opened as
+    /// a popover in its own right.
+    pub(super) fn repo_picker_row_menu_model(
+        &self,
+        entry: &repo_picker::RepoPickerEntry,
+    ) -> ContextMenuModel {
+        repo_picker_row::model(self, entry)
     }
 
     pub(in super::super) fn context_menu_model(
@@ -319,7 +416,12 @@ impl PopoverHost {
                 repo_id,
                 kind: RepoPopoverKind::Remote(RemotePopoverKind::Menu { name }),
             } => Some(remote::model(self, *repo_id, name)),
-            PopoverKind::MarkdownLinkMenu { url } => Some(markdown_link::model(url)),
+            PopoverKind::WebLinkMenu { url } => Some(web_link::model(url)),
+            PopoverKind::CommitShaLinkMenu {
+                repo_id,
+                commit_id,
+                allow_navigate,
+            } => Some(commit_sha_link::model(*repo_id, commit_id, *allow_navigate)),
             PopoverKind::StashMenu {
                 repo_id,
                 index,
@@ -347,7 +449,25 @@ impl PopoverHost {
                 path,
             } => Some(commit_file::model(self, *repo_id, commit_id, path)),
             PopoverKind::FileBrowserFileMenu { repo_id, path } => {
-                Some(file_browser_file::model(self, *repo_id, path))
+                Some(file_browser_file::model(self, *repo_id, path, cx))
+            }
+            PopoverKind::FileBrowserFolderMenu { repo_id, path } => {
+                Some(file_browser_folder::model(self, *repo_id, path))
+            }
+            PopoverKind::BranchGroupMenu {
+                repo_id,
+                section,
+                remote,
+                path,
+            } => Some(branch_group::model(
+                self,
+                *repo_id,
+                *section,
+                remote.as_deref(),
+                path,
+            )),
+            PopoverKind::PinnedSectionMenu { repo_id, section } => {
+                Some(pinned_section::model(self, *repo_id, *section))
             }
             PopoverKind::BrowseHistoryMenu { repo_id } => {
                 Some(browse_history::model(self, *repo_id))
@@ -407,6 +527,9 @@ impl PopoverHost {
                 split_selection_rows,
                 join_previous_region,
                 join_next_region,
+                alignment_marked_columns,
+                has_manual_alignments,
+                output_is_protected,
             } => Some(conflict_resolver_chunk::model(
                 *conflict_ix,
                 *has_base,
@@ -416,6 +539,9 @@ impl PopoverHost {
                 *split_selection_rows,
                 join_previous_region.clone(),
                 join_next_region.clone(),
+                *alignment_marked_columns,
+                *has_manual_alignments,
+                *output_is_protected,
             )),
             PopoverKind::ConflictResolverOutputMenu {
                 cursor_line,
@@ -434,9 +560,6 @@ impl PopoverHost {
             )),
             PopoverKind::HistoryBranchFilter { repo_id } => {
                 Some(history_branch_filter::model(self, *repo_id))
-            }
-            PopoverKind::HistoryAuthorFilter { repo_id } => {
-                Some(history_author_filter::model(self, *repo_id))
             }
             PopoverKind::DiffActionMenu => Some(diff_actions::model(self)),
             PopoverKind::MergetoolSettingsMenu => Some(mergetool_settings::model(self, cx)),
@@ -499,12 +622,111 @@ impl PopoverHost {
                     path,
                 });
             }
+            ContextMenuAction::EditFile { repo_id, path } => {
+                self.store.dispatch(Msg::OpenFileEditor { repo_id, path });
+            }
+            ContextMenuAction::DiscardFileEdits { repo_id, path } => {
+                self.main_pane.update(cx, |pane, cx| {
+                    pane.discard_file_edits_for(repo_id, &path, cx);
+                });
+            }
             ContextMenuAction::BrowseRepositoryAtCommit { repo_id, commit_id } => {
                 self.store
                     .dispatch(Msg::BrowseRepositoryAtCommit { repo_id, commit_id });
             }
+            ContextMenuAction::RevealHistoryCommit { repo_id, commit_id } => {
+                self.main_pane.update(cx, |main, cx| {
+                    main.reveal_history_commit(
+                        repo_id,
+                        commit_id,
+                        Some(gitcomet_core::domain::LogScope::AllBranches),
+                        cx,
+                    );
+                });
+            }
             ContextMenuAction::ResetBrowseToLive { repo_id } => {
                 self.store.dispatch(Msg::ResetBrowseToLive { repo_id });
+            }
+            ContextMenuAction::ToggleFileBrowserDir { repo_id, path } => {
+                self.store
+                    .dispatch(Msg::ToggleFileBrowserDir { repo_id, path });
+            }
+            // The branch tree's collapse state is view-owned rather than a
+            // store message, so these four go through the sidebar pane.
+            ContextMenuAction::ToggleSidebarCollapseKey { collapse_key } => {
+                self.sidebar_pane.update(cx, |pane, cx| {
+                    pane.toggle_active_repo_collapse_key(collapse_key, cx);
+                });
+            }
+            ContextMenuAction::SetSidebarCollapseKey {
+                collapse_key,
+                collapsed,
+            } => {
+                self.sidebar_pane.update(cx, |pane, cx| {
+                    pane.set_active_repo_collapse_key(collapse_key, collapsed, cx);
+                });
+            }
+            ContextMenuAction::SetBranchGroupCollapsedRecursive {
+                section,
+                remote,
+                path,
+                collapsed,
+            } => {
+                self.sidebar_pane.update(cx, |pane, cx| {
+                    pane.set_branch_group_collapsed_recursive(section, remote, path, collapsed, cx);
+                });
+            }
+            ContextMenuAction::UnpinAllBranches { repo_id, section } => {
+                self.sidebar_pane.update(cx, |pane, cx| {
+                    pane.unpin_all_branches(repo_id, section, cx);
+                });
+            }
+            ContextMenuAction::ConfirmDeleteBranchGroup {
+                repo_id,
+                section,
+                remote,
+                path,
+                group_label,
+            } => {
+                let names = branch_group::deletable_branches(
+                    self,
+                    repo_id,
+                    section,
+                    remote.as_deref(),
+                    &path,
+                );
+                // The entry is disabled at zero, so this only fires if the group
+                // emptied between the last repaint and the click.
+                if names.is_empty() {
+                    self.close_popover(cx);
+                    return;
+                }
+                let anchor = self.popover_anchor_point();
+                self.open_popover_at(
+                    PopoverKind::DeleteBranchesConfirm {
+                        repo_id,
+                        section,
+                        remote,
+                        group_label,
+                        names,
+                    },
+                    anchor,
+                    window,
+                    cx,
+                );
+                return;
+            }
+            ContextMenuAction::SetFileBrowserDirExpandedRecursive {
+                repo_id,
+                path,
+                expanded,
+            } => {
+                self.store
+                    .dispatch(Msg::SetFileBrowserDirExpandedRecursive {
+                        repo_id,
+                        path,
+                        expanded,
+                    });
             }
             ContextMenuAction::SelectConflictDiff { repo_id, path } => {
                 self.store
@@ -583,10 +805,51 @@ impl PopoverHost {
                 self.store.dispatch(Msg::OpenRepo(path));
             }
             ContextMenuAction::ActivateRepo { repo_id } => {
+                if !self.repo_is_open(repo_id) {
+                    self.warn_repository_gone(cx);
+                    return;
+                }
                 self.store.dispatch(Msg::SetActiveRepo { repo_id });
             }
+            ContextMenuAction::CloseRepo { repo_id } if !self.repo_is_open(repo_id) => {
+                // The row this came from went stale — a concurrent close from a
+                // repo tab, say. Dispatching would be a no-op the user cannot
+                // see, and the menu is already down by now.
+                self.warn_repository_gone(cx);
+                return;
+            }
             ContextMenuAction::CloseRepo { repo_id } => {
+                // The reducer records the close as a recent; this keeps the
+                // repository picker's own snapshot of that list in step, cap
+                // included, for the frames before it next reads the session.
+                if let Some(workdir) = self.workdir_for_repo(repo_id) {
+                    session::promote_recent_repo(&mut self.cached_recent_repos, &workdir);
+                }
                 self.store.dispatch(Msg::CloseRepo { repo_id });
+            }
+            ContextMenuAction::PinRepository { path } => {
+                let _ = session::persist_pinned_repo(&path);
+                if !self.cached_pinned_repos.contains(&path) {
+                    self.cached_pinned_repos.push(path);
+                }
+                // Pinning is bookkeeping, not navigation: the menu that offered
+                // it goes, but the list it was over stays.
+                close_after_action = false;
+            }
+            ContextMenuAction::UnpinRepository { path } => {
+                let _ = session::remove_pinned_repo(&path);
+                self.cached_pinned_repos.retain(|pin| pin != &path);
+                close_after_action = false;
+            }
+            ContextMenuAction::ForgetRecentRepository { path } => {
+                // Open and pinned repositories have no entry for this, and the
+                // guard keeps it that way: a pin is what keeps a closed
+                // repository listed, so forgetting one would strand it.
+                if !self.cached_pinned_repos.contains(&path) {
+                    let _ = session::remove_recent_repo(&path);
+                    self.cached_recent_repos.retain(|recent| recent != &path);
+                }
+                close_after_action = false;
             }
             ContextMenuAction::CloseRepos {
                 repo_ids,
@@ -679,15 +942,7 @@ impl PopoverHost {
                 self.store.dispatch(Msg::ClearComparisonMark { repo_id });
             }
             ContextMenuAction::CherryPickCommit { repo_id, commit_id } => {
-                let anchor = self
-                    .popover_anchor
-                    .as_ref()
-                    .map(|anchor| match anchor {
-                        PopoverAnchor::Point(point) => *point,
-                        PopoverAnchor::Bounds(bounds) => bounds.bottom_right(),
-                        PopoverAnchor::Centered => point(px(64.0), px(64.0)),
-                    })
-                    .unwrap_or_else(|| point(px(64.0), px(64.0)));
+                let anchor = self.popover_anchor_point();
                 self.open_popover_at(
                     PopoverKind::CherryPickCommitConfirm { repo_id, commit_id },
                     anchor,
@@ -712,15 +967,7 @@ impl PopoverHost {
                 // Kick off the combined-message preview, then swap the menu
                 // for the confirmation prompt.
                 self.store.dispatch(Msg::PrepareSquash { repo_id });
-                let anchor = self
-                    .popover_anchor
-                    .as_ref()
-                    .map(|anchor| match anchor {
-                        PopoverAnchor::Point(point) => *point,
-                        PopoverAnchor::Bounds(bounds) => bounds.bottom_right(),
-                        PopoverAnchor::Centered => point(px(64.0), px(64.0)),
-                    })
-                    .unwrap_or_else(|| point(px(64.0), px(64.0)));
+                let anchor = self.popover_anchor_point();
                 self.open_popover_at(PopoverKind::SquashPrompt { repo_id }, anchor, window, cx);
                 return;
             }
@@ -904,20 +1151,33 @@ impl PopoverHost {
                 area,
                 path,
             } => {
-                let anchor = self
-                    .popover_anchor
-                    .as_ref()
-                    .map(|anchor| match anchor {
-                        PopoverAnchor::Point(point) => *point,
-                        PopoverAnchor::Bounds(bounds) => bounds.bottom_right(),
-                        PopoverAnchor::Centered => point(px(64.0), px(64.0)),
-                    })
-                    .unwrap_or_else(|| point(px(64.0), px(64.0)));
+                let anchor = self.popover_anchor_point();
                 self.open_popover_at(
                     PopoverKind::DiscardChangesConfirm {
                         repo_id,
                         area,
                         path: Some(path),
+                    },
+                    anchor,
+                    window,
+                    cx,
+                );
+                return;
+            }
+            ContextMenuAction::AddToGitignoreSelectionOrPath {
+                repo_id,
+                area,
+                path,
+            } => {
+                let anchor = self.popover_anchor_point();
+                // Deliberately does not consume the row selection: the dialog
+                // can still be cancelled, and `submit_add_to_gitignore` is what
+                // clears it once the action is committed.
+                self.open_popover_at(
+                    PopoverKind::AddToGitignorePrompt {
+                        repo_id,
+                        area,
+                        path,
                     },
                     anchor,
                     window,
@@ -997,15 +1257,7 @@ impl PopoverHost {
                 index,
                 message,
             } => {
-                let anchor = self
-                    .popover_anchor
-                    .as_ref()
-                    .map(|anchor| match anchor {
-                        PopoverAnchor::Point(point) => *point,
-                        PopoverAnchor::Bounds(bounds) => bounds.bottom_right(),
-                        PopoverAnchor::Centered => point(px(64.0), px(64.0)),
-                    })
-                    .unwrap_or_else(|| point(px(64.0), px(64.0)));
+                let anchor = self.popover_anchor_point();
                 self.open_popover_at(
                     PopoverKind::StashDropConfirm {
                         repo_id,
@@ -1107,15 +1359,7 @@ impl PopoverHost {
                 }
             }
             ContextMenuAction::OpenPopover { kind } => {
-                let anchor = self
-                    .popover_anchor
-                    .as_ref()
-                    .map(|anchor| match anchor {
-                        PopoverAnchor::Point(point) => *point,
-                        PopoverAnchor::Bounds(bounds) => bounds.bottom_right(),
-                        PopoverAnchor::Centered => point(px(64.0), px(64.0)),
-                    })
-                    .unwrap_or_else(|| point(px(64.0), px(64.0)));
+                let anchor = self.popover_anchor_point();
                 self.open_popover_at(kind, anchor, window, cx);
                 return;
             }
@@ -1133,6 +1377,16 @@ impl PopoverHost {
             ContextMenuAction::ConflictResolverSplitSelection => {
                 self.main_pane.update(cx, |pane, cx| {
                     pane.conflict_resolver_split_selection(cx);
+                });
+            }
+            ContextMenuAction::ConflictResolverAlignManually => {
+                self.main_pane.update(cx, |pane, cx| {
+                    pane.conflict_resolver_align_manually(cx);
+                });
+            }
+            ContextMenuAction::ConflictResolverClearManualAlignments => {
+                self.main_pane.update(cx, |pane, cx| {
+                    pane.conflict_resolver_clear_manual_alignments(cx);
                 });
             }
             ContextMenuAction::ConflictResolverJoinRegions { target } => {
@@ -1341,7 +1595,10 @@ impl PopoverHost {
                 });
             }
         }
-        if close_after_action {
+        // A menu floating over a picker is not the popover: it closed itself on
+        // the way in, and whether the picker underneath survives is the picker's
+        // call, not the action's.
+        if close_after_action && !self.suppress_popover_close_after_action {
             self.close_popover_and_restore_focus(window, cx);
         } else {
             if restore_diff_panel_focus_after_action {
@@ -1362,6 +1619,189 @@ impl PopoverHost {
         if let Some(action) = context_menu_entry_action_at(model, ix) {
             self.context_menu_activate_action(action, window, cx);
         }
+    }
+
+    /// What an "Add to .gitignore" action on `path` would cover, or `None` when
+    /// the action does not apply.
+    ///
+    /// The single source of truth for eligibility: the menu uses it to decide
+    /// whether to show the entry and the dialog uses it to seed itself. Two
+    /// copies of this rule would let the menu offer an action the dialog then
+    /// refuses (or the reverse), and nothing would catch the drift.
+    ///
+    /// The selection is read but *not* consumed — the dialog is cancellable, and
+    /// losing a selection to a dialog the user backed out of is exactly the
+    /// failure the read/take split documented above exists to prevent.
+    pub(super) fn add_to_gitignore_target(
+        &self,
+        repo_id: RepoId,
+        area: DiffArea,
+        path: &std::path::PathBuf,
+        cx: &gpui::App,
+    ) -> Option<(
+        Vec<std::path::PathBuf>,
+        gitcomet_core::gitignore::GitignoreSuggestions,
+    )> {
+        use gitcomet_core::domain::FileStatusKind;
+
+        // `.gitignore` has no effect on anything already in the index, so a
+        // pattern for a tracked path is a line that changes nothing and leaves
+        // the row exactly where it was.
+        if area != DiffArea::Unstaged {
+            return None;
+        }
+        let repo = self.state.repos.iter().find(|r| r.id == repo_id)?;
+        let (paths, used_selection) = self.status_paths_for_action(repo_id, area, path, cx);
+
+        // Every targeted path must be untracked, not just the clicked one: the
+        // untracked and unstaged buckets are separate, and a tracked path that
+        // snuck into the selection is a silent no-op the user would debug.
+        // Indexed when there is a selection to check, because one
+        // `status_entry_for_path` per path is a linear scan of the whole status
+        // list each time and this runs on every right-click.
+        let all_untracked = if used_selection {
+            let untracked: std::collections::HashSet<&std::path::Path> = repo
+                .status_entries_for_area(area)
+                .unwrap_or(&[])
+                .iter()
+                .filter(|entry| entry.kind == FileStatusKind::Untracked)
+                .map(|entry| entry.path.as_path())
+                .collect();
+            paths.iter().all(|p| untracked.contains(p.as_path()))
+        } else {
+            paths.first().is_some_and(|p| {
+                matches!(
+                    repo.status_entry_for_path(area, p).map(|s| s.kind),
+                    Some(FileStatusKind::Untracked)
+                )
+            })
+        };
+        if !all_untracked {
+            return None;
+        }
+
+        // Rules out anything with no expressible pattern at all: a non-UTF-8
+        // path, or a name containing a line break.
+        let suggestions = gitcomet_core::gitignore::suggestions_for_paths(&paths)?;
+        Some((paths, suggestions))
+    }
+
+    /// Seed the "Add to .gitignore" dialog when it opens.
+    pub(super) fn prepare_add_to_gitignore(
+        &mut self,
+        repo_id: RepoId,
+        area: DiffArea,
+        path: &std::path::PathBuf,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let target = self.add_to_gitignore_target(repo_id, area, path, cx);
+        let scope = gitcomet_core::gitignore::GitignoreScope::File;
+        let text = target
+            .as_ref()
+            .map(|(_, suggestions)| suggestions.lines_for(scope).join("\n"))
+            .unwrap_or_default();
+        let (paths, suggestions) = match target {
+            Some((paths, suggestions)) => (paths, Some(suggestions)),
+            None => (vec![path.clone()], None),
+        };
+
+        self.gitignore_paths = paths;
+        self.gitignore_suggestions = suggestions;
+        self.gitignore_scope = scope;
+
+        let theme = self.theme;
+        self.gitignore_patterns_input.update(cx, |input, cx| {
+            input.clear_transient_key_presses();
+            input.set_theme(theme, cx);
+            input.set_text(&text, cx);
+            cx.notify();
+        });
+        // `set_text` resets only the horizontal offset, so a dialog reopened
+        // after scrolling a long selection would show blank space where the
+        // patterns are.
+        self.gitignore_patterns_scroll
+            .set_offset(gpui::point(px(0.0), px(0.0)));
+        let focus = self
+            .gitignore_patterns_input
+            .read_with(cx, |i, _| i.focus_handle());
+        window.focus(&focus, cx);
+    }
+
+    /// Re-seed the pattern field after the user picks a different scope.
+    ///
+    /// This overwrites whatever is in the field. That is the point: the user
+    /// just asked for a different pattern, and merging the old text into the
+    /// new scope would leave a field matching neither.
+    pub(super) fn set_add_to_gitignore_scope(
+        &mut self,
+        scope: gitcomet_core::gitignore::GitignoreScope,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(text) = self
+            .gitignore_suggestions
+            .as_ref()
+            .map(|s| s.lines_for(scope).join("\n"))
+        else {
+            return;
+        };
+        self.gitignore_scope = scope;
+        self.gitignore_patterns_input.update(cx, |input, cx| {
+            input.set_text(&text, cx);
+            cx.notify();
+        });
+        // As in `prepare_add_to_gitignore`: the new text is usually shorter than
+        // what it replaced, so a stale vertical offset would scroll it off.
+        self.gitignore_patterns_scroll
+            .set_offset(gpui::point(px(0.0), px(0.0)));
+        cx.notify();
+    }
+
+    /// The non-blank lines currently in the pattern field.
+    pub(super) fn add_to_gitignore_patterns(&self, cx: &gpui::App) -> Vec<String> {
+        self.gitignore_patterns_input.read_with(cx, |input, _| {
+            input
+                .text()
+                .lines()
+                .filter_map(gitignore_pattern_line)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+    }
+
+    /// Whether the pattern field holds anything submittable.
+    ///
+    /// Separate from [`Self::add_to_gitignore_patterns`] because this runs every
+    /// frame the dialog is on screen, and building the whole `Vec<String>` just
+    /// to ask whether it is empty allocates one `String` per selected file per
+    /// frame.
+    pub(super) fn can_submit_add_to_gitignore(&self, cx: &gpui::App) -> bool {
+        self.gitignore_patterns_input.read_with(cx, |input, _| {
+            input
+                .text()
+                .lines()
+                .any(|line| gitignore_pattern_line(line).is_some())
+        })
+    }
+
+    pub(super) fn submit_add_to_gitignore(
+        &mut self,
+        repo_id: RepoId,
+        area: DiffArea,
+        path: std::path::PathBuf,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let patterns = self.add_to_gitignore_patterns(cx);
+        if patterns.is_empty() {
+            return;
+        }
+        // Now that the action is going ahead, the row selection has served its
+        // purpose and is cleared. The returned paths are unused — the patterns
+        // come from the field, which the user may have edited.
+        let _ = self.take_status_paths_for_action(repo_id, area, &path, cx);
+        self.store
+            .dispatch(Msg::AppendGitignorePatterns { repo_id, patterns });
+        self.close_popover(cx);
     }
 
     pub(super) fn discard_worktree_changes_confirmed(
@@ -1508,7 +1948,7 @@ impl PopoverHost {
             .flex()
             .flex_col()
             .items_stretch()
-            .text_color(theme.colors.text)
+            .text_color(theme.colors.foreground.primary)
             .min_w(width.min_px(ui_scale))
             .max_w(width.max_px(ui_scale))
             .track_focus(&focus)
@@ -1621,6 +2061,63 @@ impl PopoverHost {
                     )
                     .id(("context_menu_label", ix))
                     .into_any_element(),
+                    ContextMenuItem::Segmented { label, segments } => {
+                        // Same construction as the toolbar's Inline/Split style
+                        // toggles: one bordered pill, dividers between segments,
+                        // the active one filled.
+                        let mut control = div()
+                            .id(("context_menu_segmented", ix))
+                            .flex()
+                            .items_center()
+                            .h(components::control_height(ui_scale))
+                            .rounded(px(theme.radii.row))
+                            .border_1()
+                            .border_color(theme.colors.stroke.default)
+                            .overflow_hidden()
+                            .p(px(1.0));
+                        for (seg_ix, segment) in segments.into_iter().enumerate() {
+                            if seg_ix > 0 {
+                                control = control.child(
+                                    div().h_full().w(px(1.0)).bg(theme.colors.stroke.default),
+                                );
+                            }
+                            let ContextMenuSegment {
+                                id,
+                                label,
+                                tooltip,
+                                selected,
+                                action,
+                            } = segment;
+                            let debug_selector = id.clone();
+                            let mut button = components::Button::new(id, label)
+                                .borderless()
+                                .style(components::ButtonStyle::Subtle)
+                                .selected(selected)
+                                .selected_bg(theme.colors.interaction.pressed_background)
+                                .on_click(theme, cx, move |this, _e, window, cx| {
+                                    this.context_menu_activate_action(action.clone(), window, cx);
+                                })
+                                .debug_selector(move || debug_selector.to_string());
+                            if let Some(tooltip) = tooltip {
+                                button = button.gitcomet_tooltip(theme, tooltip);
+                            }
+                            control = control.child(button);
+                        }
+                        components::context_menu_label(
+                            theme,
+                            ui_scale,
+                            label,
+                            Some(tooltip_host.clone()),
+                            cx,
+                        )
+                        .id(("context_menu_segmented_row", ix))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(control)
+                        .into_any_element()
+                    }
                     ContextMenuItem::Entry {
                         label,
                         icon,

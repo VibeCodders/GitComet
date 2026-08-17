@@ -35,6 +35,44 @@ pub(crate) const PERF_BUDGETS: &[PerfBudgetSpec] = &[
         // budget as repo_switch work is heavier than pure scroll.
         threshold_ns: 10.0 * NANOS_PER_MILLISECOND,
     },
+    // --- picker_prompt --- the action-bar badge pickers, whose frames a hover
+    // moving from row to row pays for (the popover host is an uncached view, so a
+    // hover transition re-renders the whole picker).
+    PerfBudgetSpec {
+        label: "picker_prompt/branch_hover_frame/1200",
+        estimate_path: "picker_prompt/branch_hover_frame/1200/new/estimates.json",
+        // Measured around 1.96 ms for one drawn frame over 1200 refs. Windowing
+        // is what keeps this flat: the same frame rendering every matched row
+        // (`branch_full_list_frame/1200`) measures around 171 ms.
+        threshold_ns: 8.0 * NANOS_PER_MILLISECOND,
+    },
+    PerfBudgetSpec {
+        label: "picker_prompt/branch_hover_frame/200",
+        estimate_path: "picker_prompt/branch_hover_frame/200/new/estimates.json",
+        // Measured around 1.20 ms; the full-list frame at this scale is ~36 ms.
+        threshold_ns: 6.0 * NANOS_PER_MILLISECOND,
+    },
+    PerfBudgetSpec {
+        label: "picker_prompt/branch_query_frame/1200",
+        estimate_path: "picker_prompt/branch_query_frame/1200/new/estimates.json",
+        // Measured around 2.03 ms: a filtered list of the same 1200 refs.
+        threshold_ns: 8.0 * NANOS_PER_MILLISECOND,
+    },
+    PerfBudgetSpec {
+        label: "picker_prompt/branch_rows_build/1200",
+        estimate_path: "picker_prompt/branch_rows_build/1200/new/estimates.json",
+        // Measured around 0.90 ms to build and filter 1200 rows. This runs once
+        // per change to the repository's refs, not once per frame — the rows
+        // cache is what makes that true.
+        threshold_ns: 4.0 * NANOS_PER_MILLISECOND,
+    },
+    PerfBudgetSpec {
+        label: "picker_prompt/workspace_hover_frame/8",
+        estimate_path: "picker_prompt/workspace_hover_frame/8/new/estimates.json",
+        // Measured around 0.85 ms, which is the picker's fixed cost (query row,
+        // scrollbar, window draw) rather than its rows.
+        threshold_ns: 4.0 * NANOS_PER_MILLISECOND,
+    },
     // --- keyboard --- sustained arrow-key repeat bursts with frame timing stats
     PerfBudgetSpec {
         label: "keyboard/arrow_scroll_history_sustained_repeat",
@@ -144,6 +182,16 @@ pub(crate) const PERF_BUDGETS: &[PerfBudgetSpec] = &[
         // Initial-history page on a very deep repo: the request depth stays at
         // 200 commits even though total history is 100k commits.
         threshold_ns: 100.0 * NANOS_PER_MILLISECOND,
+    },
+    PerfBudgetSpec {
+        label: "git_ops/log_walk_author_filter_100k_commits",
+        estimate_path: "git_ops/log_walk_author_filter_100k_commits/new/estimates.json",
+        // A 200-commit page for an author who owns 1 commit in 2000 has to walk
+        // the whole 100k history. Measured around 470 ms with decoding spread
+        // across threads. The fixture has no commit-graph (fast-import does not
+        // write one), so this is the slower of the two shapes: on a real
+        // repository with a graph the traversal stops decoding commits twice.
+        threshold_ns: 900.0 * NANOS_PER_MILLISECOND,
     },
     PerfBudgetSpec {
         label: "git_ops/status_clean_10k_files",

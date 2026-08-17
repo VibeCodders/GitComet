@@ -10,6 +10,7 @@ use gpui::{
     GlobalElementId, HighlightStyle, InspectorElementId, IntoElement, LayoutId, Pixels, Rgba,
     SharedString, TextAlign, WeakEntity, Window, div, point, px, rems, size,
 };
+use palette::IntoColor;
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -31,6 +32,25 @@ pub enum TruncatedTextTooltipMode {
     FullTextIfTruncated,
 }
 
+/// How the clipping box [`TruncatedText::render`] wraps its element in behaves as
+/// a flex item.
+///
+/// Callers laying several of these out on one line would otherwise have to nest
+/// their own flex box around each one, doubling the element count of a line for
+/// nothing.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TruncatedTextFlex {
+    /// Leave the box's flex properties alone.
+    #[default]
+    Inherit,
+    /// Takes the leftover space on the line (`flex_1`).
+    Grow,
+    /// Sized by its text, but gives way when the line is too narrow.
+    Shrink,
+    /// Sized by its text and never squeezed (`flex_shrink_0`).
+    Fixed,
+}
+
 pub struct TruncatedText {
     text: SharedString,
     profile: TextTruncationProfile,
@@ -43,6 +63,7 @@ pub struct TruncatedText {
     text_color: Option<Rgba>,
     text_size: Option<AbsoluteLength>,
     font_weight: Option<FontWeight>,
+    flex: TruncatedTextFlex,
 }
 
 impl TruncatedText {
@@ -59,6 +80,7 @@ impl TruncatedText {
             text_color: None,
             text_size: None,
             font_weight: None,
+            flex: TruncatedTextFlex::default(),
         }
     }
 
@@ -115,6 +137,12 @@ impl TruncatedText {
         self
     }
 
+    /// How this text behaves as a flex item on the line that holds it.
+    pub fn flex(mut self, flex: TruncatedTextFlex) -> Self {
+        self.flex = flex;
+        self
+    }
+
     pub(crate) fn path_alignment_group(
         mut self,
         path_alignment_group: PathTruncationAlignmentGroup,
@@ -159,11 +187,14 @@ impl TruncatedText {
             font_weight: self.font_weight,
         };
 
-        let root = div()
-            .min_w(px(0.0))
-            .overflow_hidden()
-            .whitespace_nowrap()
-            .child(element);
+        let mut root = div().min_w(px(0.0)).overflow_hidden().whitespace_nowrap();
+        match self.flex {
+            TruncatedTextFlex::Inherit => {}
+            TruncatedTextFlex::Grow => root = root.flex_1(),
+            TruncatedTextFlex::Shrink => root.style().flex_shrink = Some(1.0),
+            TruncatedTextFlex::Fixed => root = root.flex_shrink_0(),
+        }
+        let root = root.child(element);
 
         match (root_id, tooltip_host, truncated) {
             (Some(root_id), Some(tooltip_host), Some(truncated)) => root
@@ -261,7 +292,7 @@ impl Element for TruncatedTextElement {
                 });
                 let mut base_style = window.text_style();
                 if let Some(text_color) = text_color {
-                    base_style.color = text_color.into();
+                    base_style.color = text_color.into_color();
                 }
                 if let Some(text_size) = text_size {
                     base_style.font_size = text_size;

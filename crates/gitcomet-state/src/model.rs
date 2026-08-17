@@ -11,7 +11,7 @@ use gitcomet_core::services::{
     SubmoduleTrustTarget,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -79,7 +79,21 @@ pub struct RepoLoadsInFlight {
     in_flight: u32,
     pending: u32,
     pending_log: Option<PendingLogLoad>,
+    /// The log walk that is actually running, so replies from one a newer
+    /// request superseded can be told apart from the current one.
+    active_log: Option<(LogLoadSeq, PendingLogLoad)>,
+    last_log_seq: LogLoadSeq,
 }
+
+/// Identifies one dispatched log walk. Handed out by
+/// [`RepoLoadsInFlight::request_log`] and carried by the effect and its replies,
+/// so a reply is matched to the request that started it and nothing else.
+///
+/// A walk cannot be identified by what it asks for: switching the filter away
+/// and back leaves the second request looking exactly like the first, and the
+/// first walk's reply would then be taken for the second's — clearing the
+/// bookkeeping while the walk it belongs to is still running.
+pub type LogLoadSeq = u64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingLogLoad {
@@ -106,6 +120,11 @@ impl RepoLoadsInFlight {
     pub const REMOTE_TAGS: u32 = 1 << 13;
     pub const WORKTREES: u32 = 1 << 14;
     pub const SUBMODULES: u32 = 1 << 15;
+    pub const REF_METADATA: u32 = 1 << 16;
+    pub const WORKTREE_DIRTY: u32 = 1 << 17;
+    /// Deliberately outside `PRIMARY_REFRESH_FLAGS`: the live listing is a
+    /// worktree walk, far costlier than the other loads.
+    pub const FILE_BROWSER: u32 = 1 << 18;
     const PRIMARY_REFRESH_FLAGS: u32 = Self::HEAD_BRANCH
         | Self::UPSTREAM_DIVERGENCE
         | Self::REBASE_STATE
@@ -126,17 +145,30 @@ impl RepoLoadsInFlight {
         self.in_flight = 0;
         self.pending = 0;
         self.pending_log = None;
+        self.active_log = None;
     }
 
     /// Starts the common primary-refresh batch immediately when no work is already queued or
-    /// running. Callers fall back to per-load request coalescing when this returns `false`.
-    pub fn request_primary_refresh_batch(&mut self) -> bool {
+    /// running. Callers fall back to per-load request coalescing when this returns `None`.
+    ///
+    /// The batch includes a log load, so it takes that request and returns its
+    /// sequence number: replies are matched against it by
+    /// [`Self::is_active_log_reply`], and a batch that failed to declare one
+    /// would have its log page silently discarded.
+    pub fn request_primary_refresh_batch(&mut self, log: PendingLogLoad) -> Option<LogLoadSeq> {
         if self.in_flight == 0 && self.pending == 0 && self.pending_log.is_none() {
             self.in_flight |= Self::PRIMARY_REFRESH_FLAGS;
-            true
+            Some(self.start_log(log))
         } else {
-            false
+            None
         }
+    }
+
+    /// Marks `load` as the walk now in flight and hands out its sequence number.
+    fn start_log(&mut self, load: PendingLogLoad) -> LogLoadSeq {
+        self.last_log_seq = self.last_log_seq.wrapping_add(1);
+        self.active_log = Some((self.last_log_seq, load));
+        self.last_log_seq
     }
 
     /// For non-log loads: starts immediately if not in flight, otherwise coalesces by remembering
@@ -164,51 +196,83 @@ impl RepoLoadsInFlight {
     }
 
     /// For log loads: coalesce by keeping only the latest requested
-    /// `(scope, author, cursor)` while a log load is already in flight.
-    pub fn request_log(
-        &mut self,
-        scope: LogScope,
-        author: Option<String>,
-        limit: usize,
-        cursor: Option<LogCursor>,
-    ) -> bool {
-        if self.is_in_flight(Self::LOG) {
-            let next = PendingLogLoad {
-                scope,
-                author,
-                limit,
-                cursor,
-            };
-            match &self.pending_log {
-                // Scope or author changes invalidate older pending requests
-                // (including pagination).
-                Some(existing)
-                    if existing.scope != next.scope || existing.author != next.author =>
-                {
-                    self.pending_log = Some(next);
-                }
-                // Don't let a refresh request (cursor=None) clobber a pending pagination request
-                // for the same scope and author.
-                Some(existing) if existing.cursor.is_some() && next.cursor.is_none() => {}
-                _ => {
-                    self.pending_log = Some(next);
-                }
-            }
-            false
-        } else {
+    /// `(scope, author, cursor)` while a log load is already in flight. Returns
+    /// the new walk's sequence number when it starts now, `None` when it was
+    /// queued behind the walk in flight.
+    ///
+    /// A request that changes the scope or the author filter is dispatched
+    /// straight away instead of being queued: on a large repository a walk runs
+    /// for tens of seconds, and the repo-load pool has one or two threads, so
+    /// waiting the old one out would stall the new filter for that whole time.
+    /// The effects layer cancels the superseded walk, and its reply is dropped
+    /// by [`Self::is_active_log_reply`].
+    pub fn request_log(&mut self, next: PendingLogLoad) -> Option<LogLoadSeq> {
+        if !self.is_in_flight(Self::LOG) {
             self.in_flight |= Self::LOG;
-            true
+            return Some(self.start_log(next));
+        }
+
+        let supersedes_active = self
+            .active_log
+            .as_ref()
+            .is_none_or(|(_, active)| active.scope != next.scope || active.author != next.author);
+        if supersedes_active {
+            self.pending_log = None;
+            return Some(self.start_log(next));
+        }
+        match &self.pending_log {
+            // Scope or author changes invalidate older pending requests
+            // (including pagination).
+            Some(existing) if existing.scope != next.scope || existing.author != next.author => {
+                self.pending_log = Some(next);
+            }
+            // Don't let a refresh request (cursor=None) clobber a pending pagination request
+            // for the same scope and author.
+            Some(existing) if existing.cursor.is_some() && next.cursor.is_none() => {}
+            _ => {
+                self.pending_log = Some(next);
+            }
+        }
+        None
+    }
+
+    /// Whether a log reply belongs to the walk that is currently in flight,
+    /// rather than one that a newer request superseded (and that the effects
+    /// layer cancelled). Superseded replies must be dropped without touching
+    /// the in-flight bookkeeping — the walk that replaced them is still going.
+    pub fn is_active_log_reply(&self, seq: LogLoadSeq) -> bool {
+        match &self.active_log {
+            Some((active, _)) => *active == seq,
+            // Nothing is being tracked, so no walk's bookkeeping can be cleared
+            // out from under it — `active_log` is set for exactly as long as the
+            // `LOG` flag is, so applying this reply finishes a load that is not
+            // running and promotes a queue that is empty.
+            None => true,
         }
     }
 
-    pub fn finish_log(&mut self) -> Option<PendingLogLoad> {
+    /// The sequence number of the walk in flight, if any. Tests that answer a
+    /// dispatched load by hand need it to send a reply the reducer will accept.
+    pub fn active_log_seq(&self) -> Option<LogLoadSeq> {
+        self.active_log.as_ref().map(|(seq, _)| *seq)
+    }
+
+    /// Whether the walk in flight is paginating rather than rebuilding the page.
+    pub fn active_log_is_load_more(&self) -> bool {
+        self.active_log
+            .as_ref()
+            .is_some_and(|(_, active)| active.cursor.is_some())
+    }
+
+    /// Finishes the walk in flight and starts whichever request queued behind
+    /// it, returning that request and its sequence number.
+    pub fn finish_log(&mut self) -> Option<(LogLoadSeq, PendingLogLoad)> {
         self.in_flight &= !Self::LOG;
-        if let Some(next) = self.pending_log.take() {
-            self.in_flight |= Self::LOG;
-            Some(next)
-        } else {
-            None
-        }
+        self.active_log = None;
+        let next = self.pending_log.take()?;
+        self.in_flight |= Self::LOG;
+        let seq = self.start_log(next.clone());
+        Some((seq, next))
     }
 }
 
@@ -308,6 +372,10 @@ pub struct FileBrowserState {
     pub expanded_dirs: HashSet<Arc<PathBuf>>,
     pub search_query: String,
     pub file_browser_rev: u64,
+    /// The worktree moved under a listing nobody is looking at. Deferring the
+    /// re-walk keeps the rendered rows on screen instead of flashing back to
+    /// "Loading files...".
+    pub stale: bool,
 }
 
 impl Default for FileBrowserState {
@@ -318,6 +386,7 @@ impl Default for FileBrowserState {
             expanded_dirs: HashSet::new(),
             search_query: String::new(),
             file_browser_rev: 0,
+            stale: false,
         }
     }
 }
@@ -325,6 +394,10 @@ impl Default for FileBrowserState {
 impl FileBrowserState {
     pub fn bump_rev(&mut self) {
         self.file_browser_rev = self.file_browser_rev.wrapping_add(1);
+    }
+
+    pub fn needs_load(&self) -> bool {
+        self.stale || matches!(self.entries, Loadable::NotLoaded | Loadable::Error(_))
     }
 }
 
@@ -357,6 +430,12 @@ pub struct ViewHistoryEntry {
 pub struct MainViewSnapshot {
     pub diff_target: Option<DiffTarget>,
     pub content_preview: bool,
+    /// Whether the file was open in the editor rather than the read-only
+    /// content view. Recorded so back/forward can step *into* and *out of* edit
+    /// mode: without it, opening the editor on the file already on screen
+    /// produced a snapshot identical to the read-only one and deduped away, so
+    /// neither direction could cross that boundary.
+    pub edit_mode: bool,
     pub selected_commit: Option<CommitId>,
     /// The comparison the details pane is showing, if any. Without this a
     /// back/forward step could neither reproduce a comparison nor leave one:
@@ -364,6 +443,12 @@ pub struct MainViewSnapshot {
     /// snapshot that omitted it would restore a target and selection that the
     /// pane never gets around to showing.
     pub range_selection: Option<RangeSelection>,
+    /// The linked-worktree row whose uncommitted changes the details pane is
+    /// showing, if any. A third kind of history selection alongside a commit and
+    /// a comparison, and mutually exclusive with both -- each setter clears the
+    /// others. Without it, selecting a worktree row reads as "selection cleared"
+    /// and back/forward can neither leave the row nor return to it.
+    pub worktree_selection: Option<PathBuf>,
 }
 
 /// Browser-style back/forward stack. `cursor` indexes the currently shown entry
@@ -686,6 +771,11 @@ pub struct HistoryState {
     pub log: Loadable<Shared<LogPage>>,
     pub retained_log_while_loading: Option<Shared<LogPage>>,
     pub log_loading_more: bool,
+    /// Commits visited so far by a walk that is still running, when it reports
+    /// progress. `None` once the page is complete. An author filter has to walk
+    /// history until it finds a full page, which on a large repository takes
+    /// seconds; this is what tells the user it is working.
+    pub log_scan_progress: Option<u64>,
     pub log_rev: u64,
     pub file_history_path: Option<PathBuf>,
     pub file_history: Loadable<Shared<LogPage>>,
@@ -697,6 +787,12 @@ pub struct HistoryState {
     pub retained_blame_while_loading: Option<Shared<Vec<BlameLine>>>,
     pub selected_commit: Option<CommitId>,
     pub selected_commit_rev: u64,
+    /// The commit a "reveal in history" is currently walking toward.
+    ///
+    /// It is selected the moment the reveal starts, before the log has paged far
+    /// enough to contain its row, so page reconciliation has to be told not to
+    /// mistake "not loaded yet" for "no longer exists".
+    pub reveal_target: Option<CommitId>,
     pub commit_details: Loadable<Shared<CommitDetails>>,
     pub commit_details_rev: u64,
     pub multi_selection: CommitMultiSelection,
@@ -706,6 +802,11 @@ pub struct HistoryState {
     /// active. The per-file and whole-range diffs render through the normal
     /// `DiffState` pipeline via a `DiffTarget::CommitRange`.
     pub range_selection: Option<RangeSelection>,
+    /// Path of the linked worktree whose uncommitted changes the history row
+    /// selection is on, if any. A third kind of selection alongside a commit and
+    /// a range; the details pane branches on it.
+    pub worktree_selection: Option<PathBuf>,
+    pub worktree_selection_rev: u64,
     pub range_files: Loadable<Shared<Vec<CommitFileChange>>>,
     pub range_files_rev: u64,
     /// Monotonic id of the newest issued range-file load. A reply carrying an
@@ -738,6 +839,7 @@ impl Default for HistoryState {
             log: Loadable::NotLoaded,
             retained_log_while_loading: None,
             log_loading_more: false,
+            log_scan_progress: None,
             log_rev: 0,
             file_history_path: None,
             file_history: Loadable::NotLoaded,
@@ -747,10 +849,13 @@ impl Default for HistoryState {
             retained_blame_while_loading: None,
             selected_commit: None,
             selected_commit_rev: 0,
+            reveal_target: None,
             commit_details: Loadable::NotLoaded,
             commit_details_rev: 0,
             multi_selection: CommitMultiSelection::default(),
             range_selection: None,
+            worktree_selection: None,
+            worktree_selection_rev: 0,
             range_files: Loadable::NotLoaded,
             range_files_rev: 0,
             range_files_request: 0,
@@ -817,6 +922,16 @@ pub struct DiffState {
     /// preview (the same renderer used for added/removed files — syntax
     /// highlighted, no green/red) rather than a diff. Set by `OpenFileContent`.
     pub content_preview: bool,
+    /// When true, the file-content view is the editable buffer rather than the
+    /// read-only preview. Only ever set together with `content_preview`, and
+    /// only for a `WorkingTree` target — editing is always of the file on disk.
+    /// Set by `OpenFileEditor`, cleared by `ExitDiffEditMode`.
+    pub edit_mode: bool,
+    /// The view that opened the editor. Editing always retargets the working
+    /// tree, so both the original target and whether it was a diff or a
+    /// full-content preview have to be retained explicitly for Save/Discard to
+    /// return to the right place.
+    pub edit_return_view: Option<FileEditReturnView>,
     pub diff_target_rev: u64,
     pub diff_state_rev: u64,
     /// A reload of the *same* target is in flight and the content still on
@@ -846,6 +961,8 @@ impl Default for DiffState {
         Self {
             diff_target: None,
             content_preview: false,
+            edit_mode: false,
+            edit_return_view: None,
             diff_target_rev: 0,
             diff_state_rev: 0,
             diff_reload_in_flight: false,
@@ -864,6 +981,13 @@ impl Default for DiffState {
     }
 }
 
+/// Main-pane destination restored when an editable working-tree buffer closes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileEditReturnView {
+    pub target: DiffTarget,
+    pub content_preview: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InlineSubmoduleDiffSection {
     Range(SubmoduleDiffRangeKind),
@@ -879,8 +1003,52 @@ pub struct InlineSubmoduleDiffEntry {
     pub section: InlineSubmoduleDiffSection,
 }
 
+/// The inline-diff entries for a linked worktree's changed files, in the order
+/// the rows are rendered: staged first, then unstaged, the same order the
+/// working-tree pane uses.
+///
+/// One builder rather than two, because the indices have to agree. The rows are
+/// rebuilt from every scan while the open diff carries the list it was opened
+/// with, so the reducer re-resolves that list against each new scan
+/// (`refresh_worktree_inline_diff_entries`) -- and a second, separately written
+/// ordering in the view would silently desynchronize the two.
+pub fn worktree_inline_diff_entries(
+    summary: &WorktreeDirtySummary,
+) -> Vec<InlineSubmoduleDiffEntry> {
+    let staged = summary.staged.iter().map(|f| (f, DiffArea::Staged));
+    let unstaged = summary.unstaged.iter().map(|f| (f, DiffArea::Unstaged));
+    staged
+        .chain(unstaged)
+        .map(|(file, area)| InlineSubmoduleDiffEntry {
+            path: file.path.clone(),
+            kind: file.kind,
+            target: DiffTarget::WorkingTree {
+                path: file.path.clone(),
+                area,
+            },
+            section: match area {
+                DiffArea::Staged => InlineSubmoduleDiffSection::LiveStaged,
+                _ => InlineSubmoduleDiffSection::LiveUnstaged,
+            },
+        })
+        .collect()
+}
+
+/// Which foreign repository the inline diff is showing, and therefore how the
+/// UI labels it. The machinery is the same either way: a throwaway handle opened
+/// at `submodule_repo_path`, with its files and diffs parked on the active repo.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ForeignDiffOrigin {
+    Submodule,
+    Worktree {
+        branch: Option<String>,
+        detached: bool,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub struct InlineSubmoduleDiffState {
+    pub origin: ForeignDiffOrigin,
     pub submodule_repo_path: PathBuf,
     pub parent_submodule_path: PathBuf,
     pub entries: Vec<InlineSubmoduleDiffEntry>,
@@ -1030,11 +1198,25 @@ pub struct RepoState {
     pub rebase_in_progress: Loadable<bool>,
     pub sequencer_state: Loadable<SequencerState>,
     pub merge_commit_message: Loadable<Option<String>>,
+    /// Commit whose full message the history hover card is showing, and the
+    /// message once it arrives. A single slot: only one card is ever open, and
+    /// the view keeps its own small cache of recently fetched messages.
+    pub hover_commit_message: Option<(CommitId, Loadable<Arc<str>>)>,
     pub interactive_rebase_setup: Option<InteractiveRebaseSetup>,
     pub interactive_cherry_pick_setup: Option<InteractiveCherryPickSetup>,
     pub merge_message_rev: u64,
     pub worktrees: Loadable<Arc<Vec<Worktree>>>,
     pub worktrees_rev: u64,
+    /// Uncommitted-change counts for the *other* linked worktrees, so the
+    /// history pane can show work left behind in a worktree that is not the one
+    /// being viewed. Only worktrees with changes are kept.
+    pub worktree_dirty: Loadable<Arc<Vec<WorktreeDirtySummary>>>,
+    pub worktree_dirty_rev: u64,
+    /// Tip-commit author/date/summary per short refname, loaded on demand by
+    /// pickers that display it. Invalidated whenever the branch or
+    /// remote-branch lists change, so it never outlives the refs it describes.
+    pub ref_metadata: Loadable<Arc<HashMap<String, RefMetadata>>>,
+    pub ref_metadata_rev: u64,
     pub submodules: Loadable<Arc<Vec<Submodule>>>,
     pub submodules_rev: u64,
     pub submodule_add_in_flight: Option<SubmoduleAddProgressState>,
@@ -1137,12 +1319,17 @@ impl RepoState {
             rebase_in_progress: Loadable::NotLoaded,
             sequencer_state: Loadable::NotLoaded,
             merge_commit_message: Loadable::NotLoaded,
+            hover_commit_message: None,
             interactive_rebase_setup: None,
             interactive_cherry_pick_setup: None,
             cherry_pick_range_preview: None,
             merge_message_rev: 0,
             worktrees: Loadable::NotLoaded,
             worktrees_rev: 0,
+            worktree_dirty: Loadable::NotLoaded,
+            worktree_dirty_rev: 0,
+            ref_metadata: Loadable::NotLoaded,
+            ref_metadata_rev: 0,
             submodules: Loadable::NotLoaded,
             submodules_rev: 0,
             submodule_add_in_flight: None,
@@ -1200,6 +1387,7 @@ impl RepoState {
         }
         self.branches = branches;
         self.branches_rev = self.branches_rev.wrapping_add(1);
+        self.invalidate_ref_metadata();
         self.bump_branch_sidebar_rev();
     }
 
@@ -1238,6 +1426,7 @@ impl RepoState {
         }
         self.remote_branches = remote_branches;
         self.remote_branches_rev = self.remote_branches_rev.wrapping_add(1);
+        self.invalidate_ref_metadata();
         self.bump_branch_sidebar_rev();
     }
 
@@ -1276,6 +1465,52 @@ impl RepoState {
         self.worktrees = worktrees;
         self.worktrees_rev = self.worktrees_rev.wrapping_add(1);
         self.bump_branch_sidebar_rev();
+    }
+
+    pub(crate) fn set_worktree_dirty(
+        &mut self,
+        worktree_dirty: Loadable<Vec<WorktreeDirtySummary>>,
+    ) {
+        let worktree_dirty = loadable_into_arc(worktree_dirty);
+        if self.worktree_dirty == worktree_dirty {
+            return;
+        }
+        self.worktree_dirty = worktree_dirty;
+        self.worktree_dirty_rev = self.worktree_dirty_rev.wrapping_add(1);
+    }
+
+    pub(crate) fn set_ref_metadata(
+        &mut self,
+        ref_metadata: Loadable<HashMap<String, RefMetadata>>,
+    ) {
+        let ref_metadata = loadable_into_arc(ref_metadata);
+        if self.ref_metadata == ref_metadata {
+            return;
+        }
+        self.ref_metadata = ref_metadata;
+        self.ref_metadata_rev = self.ref_metadata_rev.wrapping_add(1);
+    }
+
+    /// Drops cached ref metadata so the next picker open re-fetches it. Called
+    /// from the branch setters, which already early-return when unchanged, so
+    /// background refreshes that find no ref changes will not thrash this.
+    fn invalidate_ref_metadata(&mut self) {
+        // A load that read the *old* refs may already be in flight. Mark it
+        // pending so its result schedules a refetch; otherwise that stale map
+        // lands as `Ready` and, since callers only refetch on
+        // `NotLoaded | Error`, it would never be corrected.
+        if self
+            .loads_in_flight
+            .is_in_flight(RepoLoadsInFlight::REF_METADATA)
+        {
+            self.loads_in_flight
+                .request(RepoLoadsInFlight::REF_METADATA);
+        }
+        if matches!(self.ref_metadata, Loadable::NotLoaded) {
+            return;
+        }
+        self.ref_metadata = Loadable::NotLoaded;
+        self.ref_metadata_rev = self.ref_metadata_rev.wrapping_add(1);
     }
 
     pub(crate) fn set_submodules(&mut self, submodules: Loadable<Vec<Submodule>>) {
@@ -1431,6 +1666,22 @@ impl RepoState {
         }
     }
 
+    /// The repo-relative path of the file the main pane is showing, whatever
+    /// form it is showing it in — a diff, the read-only content view, or the
+    /// editor.
+    ///
+    /// Used by the file explorer to mark the open file and by the locate action
+    /// to decide what to reveal. Deliberately not gated on `content_preview`:
+    /// a diff of a file still means that file is the one open.
+    pub fn open_file_path(&self) -> Option<&std::path::Path> {
+        match self.diff_state.diff_target.as_ref()? {
+            DiffTarget::WorkingTree { path, .. } => Some(path.as_path()),
+            DiffTarget::Commit { path, .. } | DiffTarget::CommitRange { path, .. } => {
+                path.as_deref()
+            }
+        }
+    }
+
     pub fn status_entry_for_path(
         &self,
         area: DiffArea,
@@ -1507,6 +1758,23 @@ impl RepoState {
         }
     }
 
+    /// Shows a partially built page while the walk building it keeps running,
+    /// in place of whatever [`Self::retain_log_while_loading`] was holding —
+    /// which, when a filter has just changed, is the rows the user is trying to
+    /// get away from.
+    ///
+    /// Deliberately not `set_log(Ready)`: the page is not finished, and a
+    /// `Ready` page whose `next_cursor` is `None` is indistinguishable from a
+    /// complete history with nothing more to load. Only meaningful while the log
+    /// is `Loading`; `set_log` drops the retained page once the walk finishes.
+    pub(crate) fn set_partial_log_while_loading(&mut self, page: Shared<LogPage>) {
+        if !matches!(self.log, Loadable::Loading) {
+            return;
+        }
+        self.history_state.retained_log_while_loading = Some(page);
+        self.bump_log_revs();
+    }
+
     /// Hold on to the currently loaded annotations so the blame column keeps
     /// painting them while the same target reloads, instead of blanking out.
     /// Only valid while `blame_path`/`blame_source` still describe them —
@@ -1534,6 +1802,13 @@ impl RepoState {
         self.bump_log_revs();
     }
 
+    /// Records how far a running walk has scanned, or clears it when the page
+    /// is complete. Deliberately does not bump `log_rev`: the log itself has not
+    /// changed, and the rows must not be rebuilt just to move a counter.
+    pub(crate) fn set_log_scan_progress(&mut self, scanned: Option<u64>) {
+        self.history_state.log_scan_progress = scanned;
+    }
+
     pub(crate) fn set_log_scope(&mut self, scope: LogScope) {
         if self.history_state.history_scope == scope {
             return;
@@ -1550,7 +1825,40 @@ impl RepoState {
         self.bump_log_revs();
     }
 
+    pub(crate) fn set_reveal_target(&mut self, v: Option<CommitId>) {
+        self.history_state.reveal_target = v;
+    }
+
+    /// Selecting a worktree row takes the details pane over, so the commit
+    /// selection lets go first. Passing `None` simply clears it, which is what
+    /// selecting a commit or the working-tree row ends up doing.
+    pub(crate) fn set_worktree_selection(&mut self, path: Option<PathBuf>) {
+        if self.history_state.worktree_selection == path {
+            return;
+        }
+        if path.is_some() {
+            // Clears `worktree_selection` as a side effect, hence the assignment
+            // afterwards rather than before.
+            self.set_selected_commit(None);
+        }
+        self.history_state.worktree_selection = path;
+        self.history_state.worktree_selection_rev =
+            self.history_state.worktree_selection_rev.wrapping_add(1);
+    }
+
     pub(crate) fn set_selected_commit(&mut self, v: Option<CommitId>) {
+        // Moving the commit selection at all -- including clearing it for the
+        // working-tree row -- means the worktree row is no longer what is shown.
+        if self.history_state.worktree_selection.take().is_some() {
+            self.history_state.worktree_selection_rev =
+                self.history_state.worktree_selection_rev.wrapping_add(1);
+        }
+        // Selecting anything other than the commit a reveal is walking toward
+        // means the user moved on, and the reveal's exemption from page
+        // reconciliation retires with it.
+        if self.history_state.reveal_target != v {
+            self.history_state.reveal_target = None;
+        }
         if v.is_none() {
             // Clearing the selection always dissolves any multi-selection too;
             // every clear site (scope change, repo switch, diff selection)
@@ -1660,6 +1968,14 @@ impl RepoState {
             self.history_state.commit_details_rev.wrapping_add(1);
     }
 
+    pub(crate) fn set_hover_commit_message(
+        &mut self,
+        commit_id: CommitId,
+        message: Loadable<Arc<str>>,
+    ) {
+        self.hover_commit_message = Some((commit_id, message));
+    }
+
     pub(crate) fn set_merge_commit_message(&mut self, v: Loadable<Option<String>>) {
         self.merge_commit_message = v;
         self.merge_message_rev = self.merge_message_rev.wrapping_add(1);
@@ -1726,8 +2042,10 @@ impl RepoState {
         MainViewSnapshot {
             diff_target: self.diff_state.diff_target.clone(),
             content_preview: self.diff_state.content_preview,
+            edit_mode: self.diff_state.edit_mode,
             selected_commit: self.history_state.selected_commit.clone(),
             range_selection: self.history_state.range_selection.clone(),
+            worktree_selection: self.history_state.worktree_selection.clone(),
         }
     }
 
@@ -1737,8 +2055,10 @@ impl RepoState {
     pub(crate) fn main_view_snapshot_matches(&self, other: &MainViewSnapshot) -> bool {
         self.diff_state.diff_target == other.diff_target
             && self.diff_state.content_preview == other.content_preview
+            && self.diff_state.edit_mode == other.edit_mode
             && self.history_state.selected_commit == other.selected_commit
             && self.history_state.range_selection == other.range_selection
+            && self.history_state.worktree_selection == other.worktree_selection
     }
 
     pub(crate) fn set_diff_target(&mut self, target: Option<DiffTarget>) {
@@ -1763,7 +2083,7 @@ impl RepoState {
     }
 }
 
-fn loadable_into_arc<T>(loadable: Loadable<Vec<T>>) -> Loadable<Arc<Vec<T>>> {
+fn loadable_into_arc<T>(loadable: Loadable<T>) -> Loadable<Arc<T>> {
     match loadable {
         Loadable::Ready(v) => Loadable::Ready(Arc::new(v)),
         Loadable::Loading => Loadable::Loading,
@@ -1846,23 +2166,29 @@ mod tests {
         let history_view = MainViewSnapshot {
             diff_target: None,
             content_preview: false,
+            edit_mode: false,
             selected_commit: None,
             range_selection: None,
+            worktree_selection: None,
         };
         let commit_view = MainViewSnapshot {
             diff_target: None,
             content_preview: false,
+            edit_mode: false,
             selected_commit: Some(CommitId("aaa".into())),
             range_selection: None,
+            worktree_selection: None,
         };
         let file_view = MainViewSnapshot {
             diff_target: Some(DiffTarget::Commit {
                 commit_id: CommitId("aaa".into()),
                 path: Some(PathBuf::from("src/lib.rs")),
             }),
+            edit_mode: false,
             content_preview: false,
             selected_commit: Some(CommitId("aaa".into())),
             range_selection: None,
+            worktree_selection: None,
         };
 
         let mut h: NavStack<MainViewSnapshot> = NavStack::default();
@@ -1889,6 +2215,7 @@ mod tests {
         // adding a step or dropping forward history.
         let reloaded_file_view = MainViewSnapshot {
             content_preview: true,
+            edit_mode: false,
             ..file_view.clone()
         };
         h.reconcile(reloaded_file_view.clone(), false);
@@ -2040,23 +2367,29 @@ mod tests {
         let history_log = MainViewSnapshot {
             diff_target: None,
             content_preview: false,
+            edit_mode: false,
             selected_commit: None,
             range_selection: None,
+            worktree_selection: None,
         };
         let commit_view = MainViewSnapshot {
             diff_target: None,
             content_preview: false,
+            edit_mode: false,
             selected_commit: Some(CommitId("aaa".into())),
             range_selection: None,
+            worktree_selection: None,
         };
         let file_diff = MainViewSnapshot {
             diff_target: Some(DiffTarget::Commit {
                 commit_id: CommitId("aaa".into()),
                 path: Some(PathBuf::from("src/lib.rs")),
             }),
+            edit_mode: false,
             content_preview: false,
             selected_commit: Some(CommitId("aaa".into())),
             range_selection: None,
+            worktree_selection: None,
         };
 
         let mut h: NavStack<MainViewSnapshot> = NavStack::default();
@@ -2086,26 +2419,32 @@ mod tests {
                 path: PathBuf::from("a.txt"),
                 area: DiffArea::Unstaged,
             }),
+            edit_mode: false,
             content_preview: false,
             selected_commit: None,
             range_selection: None,
+            worktree_selection: None,
         };
         let view_b = MainViewSnapshot {
             diff_target: Some(DiffTarget::WorkingTree {
                 path: PathBuf::from("b.txt"),
                 area: DiffArea::Unstaged,
             }),
+            edit_mode: false,
             content_preview: false,
             selected_commit: None,
             range_selection: None,
+            worktree_selection: None,
         };
 
         let mut h: NavStack<MainViewSnapshot> = NavStack::default();
         let empty = MainViewSnapshot {
             diff_target: None,
             content_preview: false,
+            edit_mode: false,
             selected_commit: None,
             range_selection: None,
+            worktree_selection: None,
         };
         h.reconcile(empty.clone(), false);
         h.reconcile(view_a.clone(), true);
@@ -2116,6 +2455,7 @@ mod tests {
         // collapse — it overwrites in place.
         let changed = MainViewSnapshot {
             content_preview: true,
+            edit_mode: false,
             ..view_b.clone()
         };
         h.reconcile(changed.clone(), false);
@@ -2247,11 +2587,40 @@ mod tests {
         }
     }
 
+    fn log_request(
+        scope: LogScope,
+        author: Option<&str>,
+        cursor: Option<LogCursor>,
+    ) -> PendingLogLoad {
+        PendingLogLoad {
+            scope,
+            author: author.map(str::to_owned),
+            limit: 20,
+            cursor,
+        }
+    }
+
+    fn test_log_request() -> PendingLogLoad {
+        log_request(LogScope::FullReachable, None, None)
+    }
+
+    fn test_cursor(id: &str) -> LogCursor {
+        LogCursor {
+            last_seen: CommitId(id.into()),
+            resume_from: None,
+            resume_token: None,
+        }
+    }
+
     #[test]
     fn request_primary_refresh_batch_marks_all_primary_loads_when_idle() {
         let mut loads = RepoLoadsInFlight::default();
 
-        assert!(loads.request_primary_refresh_batch());
+        assert!(
+            loads
+                .request_primary_refresh_batch(test_log_request())
+                .is_some()
+        );
         assert!(loads.is_in_flight(RepoLoadsInFlight::HEAD_BRANCH));
         assert!(loads.is_in_flight(RepoLoadsInFlight::UPSTREAM_DIVERGENCE));
         assert!(loads.is_in_flight(RepoLoadsInFlight::REBASE_STATE));
@@ -2266,117 +2635,136 @@ mod tests {
         let mut loads = RepoLoadsInFlight::default();
         assert!(loads.request(RepoLoadsInFlight::WORKTREE_STATUS));
 
-        assert!(!loads.request_primary_refresh_batch());
+        assert!(
+            loads
+                .request_primary_refresh_batch(test_log_request())
+                .is_none()
+        );
         assert!(!loads.is_in_flight(RepoLoadsInFlight::HEAD_BRANCH));
         assert!(loads.is_in_flight(RepoLoadsInFlight::WORKTREE_STATUS));
         assert!(!loads.is_in_flight(RepoLoadsInFlight::LOG));
     }
 
+    /// A scope change supersedes the walk in flight rather than queueing behind
+    /// it: on a large repository that walk runs for tens of seconds, and the
+    /// effects layer cancels it as the replacement is dispatched.
     #[test]
-    fn request_log_scope_change_replaces_pending_log_request() {
+    fn request_log_scope_change_starts_immediately() {
         let mut loads = RepoLoadsInFlight::default();
-        assert!(loads.request_log(LogScope::FullReachable, None, 20, None));
+        let first = loads
+            .request_log(log_request(LogScope::FullReachable, None, None))
+            .expect("first request starts");
 
-        assert!(!loads.request_log(
-            LogScope::AllBranches,
-            None,
-            20,
-            Some(LogCursor {
-                last_seen: CommitId("older".into()),
-                resume_from: None,
-                resume_token: None,
-            }),
-        ));        assert!(!loads.request_log(LogScope::NoMerges, None, 20, None));
-
-        assert_eq!(
-            loads.finish_log(),
-            Some(PendingLogLoad {
-                scope: LogScope::NoMerges,
-                author: None,
-                limit: 20,
-                cursor: None,
-            })
+        assert!(
+            loads
+                .request_log(log_request(
+                    LogScope::AllBranches,
+                    None,
+                    Some(test_cursor("older")),
+                ))
+                .is_some()
         );
+        let latest = loads
+            .request_log(log_request(LogScope::NoMerges, None, None))
+            .expect("a scope change starts at once");
+
+        // The superseded walks' replies are no longer the active one.
+        assert!(!loads.is_active_log_reply(first));
+        assert!(loads.is_active_log_reply(latest));
+        // Nothing is left queued: the newest request is the one running.
+        assert_eq!(loads.finish_log(), None);
     }
 
     #[test]
     fn request_log_same_scope_refresh_does_not_clobber_pending_pagination() {
         let mut loads = RepoLoadsInFlight::default();
-        let cursor = LogCursor {
-            last_seen: CommitId("page-1".into()),
-            resume_from: None,
-            resume_token: None,
-        };
+        let cursor = test_cursor("page-1");
 
-        assert!(loads.request_log(LogScope::MergesOnly, None, 20, None));
-        assert!(!loads.request_log(
-            LogScope::MergesOnly,
-            None,
-            20,
-            Some(cursor.clone())
-        ));
-        assert!(!loads.request_log(LogScope::MergesOnly, None, 20, None));
+        assert!(
+            loads
+                .request_log(log_request(LogScope::MergesOnly, None, None))
+                .is_some()
+        );
+        assert!(
+            loads
+                .request_log(log_request(
+                    LogScope::MergesOnly,
+                    None,
+                    Some(cursor.clone())
+                ))
+                .is_none()
+        );
+        assert!(
+            loads
+                .request_log(log_request(LogScope::MergesOnly, None, None))
+                .is_none()
+        );
 
         assert_eq!(
-            loads.finish_log(),
-            Some(PendingLogLoad {
-                scope: LogScope::MergesOnly,
-                author: None,
-                limit: 20,
-                cursor: Some(cursor),
-            })
+            loads.finish_log().map(|(_, next)| next),
+            Some(log_request(
+                LogScope::MergesOnly,
+                None,
+                Some(cursor.clone())
+            ))
         );
     }
 
     #[test]
-    fn request_log_author_change_replaces_pending_pagination() {
+    fn request_log_author_change_starts_immediately_and_drops_pending_pagination() {
         let mut loads = RepoLoadsInFlight::default();
-        let cursor = LogCursor {
-            last_seen: CommitId("page-1".into()),
-            resume_from: None,
-            resume_token: None,
-        };
 
-        assert!(loads.request_log(LogScope::MergesOnly, None, 20, None));
+        assert!(
+            loads
+                .request_log(log_request(LogScope::MergesOnly, None, None))
+                .is_some()
+        );
         // A pagination request for the same scope+author is kept pending.
-        assert!(!loads.request_log(
-            LogScope::MergesOnly,
-            None,
-            20,
-            Some(cursor.clone())
-        ));
-        // Switching the author invalidates the pending pagination entirely.
-        assert!(!loads.request_log(LogScope::MergesOnly, Some("alice".into()), 20, None));
-
-        assert_eq!(
-            loads.finish_log(),
-            Some(PendingLogLoad {
-                scope: LogScope::MergesOnly,
-                author: Some("alice".into()),
-                limit: 20,
-                cursor: None,
-            })
+        assert!(
+            loads
+                .request_log(log_request(
+                    LogScope::MergesOnly,
+                    None,
+                    Some(test_cursor("page-1"))
+                ))
+                .is_none()
         );
+        // Switching the author starts at once and drops that pagination, which
+        // belonged to the previous filter.
+        let latest = loads
+            .request_log(log_request(LogScope::MergesOnly, Some("alice"), None))
+            .expect("an author change starts at once");
+
+        assert!(loads.is_active_log_reply(latest));
+        assert_eq!(loads.finish_log(), None);
     }
 
+    /// Replies are matched against the walk that is actually running, and by
+    /// identity rather than by what it asked for: switching a filter away and
+    /// back leaves the second request looking exactly like the first.
     #[test]
-    fn request_log_author_change_does_not_clobber_pending_pagination_of_other_author() {
+    fn superseded_reply_is_not_the_active_one_even_when_it_asked_for_the_same_thing() {
         let mut loads = RepoLoadsInFlight::default();
 
-        assert!(loads.request_log(LogScope::NoMerges, Some("alice".into()), 20, None));
-        assert!(!loads.request_log(LogScope::NoMerges, Some("alice".into()), 20, None));
-        // A different author replaces the pending request (pagination reset).
-        assert!(!loads.request_log(LogScope::NoMerges, Some("bob".into()), 20, None));
+        let first = loads
+            .request_log(log_request(LogScope::NoMerges, None, None))
+            .expect("first request starts");
+        assert!(loads.is_active_log_reply(first));
 
-        assert_eq!(
-            loads.finish_log(),
-            Some(PendingLogLoad {
-                scope: LogScope::NoMerges,
-                author: Some("bob".into()),
-                limit: 20,
-                cursor: None,
-            })
-        );
+        let alice = loads
+            .request_log(log_request(LogScope::NoMerges, Some("alice"), None))
+            .expect("an author change starts at once");
+        assert!(!loads.is_active_log_reply(first));
+
+        // Back to no filter: same scope, same author, same cursor as `first`.
+        let again = loads
+            .request_log(log_request(LogScope::NoMerges, None, None))
+            .expect("clearing the filter starts at once");
+
+        assert_ne!(first, again);
+        assert!(!loads.is_active_log_reply(first));
+        assert!(!loads.is_active_log_reply(alice));
+        assert!(loads.is_active_log_reply(again));
     }
 
     #[test]
@@ -2833,6 +3221,68 @@ mod tests {
         let rev = repo.stashes_rev;
         repo.set_stashes(Loadable::Loading);
         assert_eq!(repo.stashes_rev, rev);
+    }
+
+    #[test]
+    fn set_ref_metadata_bumps_rev_when_changed_and_not_otherwise() {
+        let mut repo = new_repo();
+        let before = repo.ref_metadata_rev;
+        repo.set_ref_metadata(Loadable::Loading);
+        assert_eq!(repo.ref_metadata_rev, before + 1);
+        repo.set_ref_metadata(Loadable::Loading);
+        assert_eq!(
+            repo.ref_metadata_rev,
+            before + 1,
+            "rev should not bump for an unchanged value"
+        );
+        repo.set_ref_metadata(Loadable::Ready(HashMap::new()));
+        assert_eq!(repo.ref_metadata_rev, before + 2);
+    }
+
+    #[test]
+    fn set_branches_invalidates_cached_ref_metadata() {
+        let mut repo = new_repo();
+        repo.set_ref_metadata(Loadable::Ready(HashMap::from([(
+            "main".to_string(),
+            RefMetadata {
+                author: "Ada".to_string(),
+                committed_at: 1,
+                summary: "first".to_string(),
+            },
+        )])));
+        assert!(matches!(repo.ref_metadata, Loadable::Ready(_)));
+
+        repo.set_branches(Loadable::Ready(vec![]));
+
+        assert!(
+            matches!(repo.ref_metadata, Loadable::NotLoaded),
+            "metadata must not outlive the ref list it describes"
+        );
+    }
+
+    #[test]
+    fn set_remote_branches_invalidates_cached_ref_metadata() {
+        let mut repo = new_repo();
+        repo.set_ref_metadata(Loadable::Ready(HashMap::new()));
+
+        repo.set_remote_branches(Loadable::Ready(vec![]));
+
+        assert!(matches!(repo.ref_metadata, Loadable::NotLoaded));
+    }
+
+    #[test]
+    fn unchanged_branches_do_not_invalidate_ref_metadata() {
+        // The branch setters early-return when nothing changed, so a background
+        // refresh that finds the same refs must leave the cache alone.
+        let mut repo = new_repo();
+        repo.set_branches(Loadable::Ready(vec![]));
+        repo.set_ref_metadata(Loadable::Ready(HashMap::new()));
+        let rev = repo.ref_metadata_rev;
+
+        repo.set_branches(Loadable::Ready(vec![]));
+
+        assert!(matches!(repo.ref_metadata, Loadable::Ready(_)));
+        assert_eq!(repo.ref_metadata_rev, rev);
     }
 
     #[test]

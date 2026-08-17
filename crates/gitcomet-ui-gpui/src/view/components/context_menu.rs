@@ -2,7 +2,7 @@ use crate::theme::AppTheme;
 use crate::ui_scale::UiScale;
 use crate::view::tooltip_host::TooltipHost;
 use gpui::prelude::*;
-use gpui::{CursorStyle, Div, ElementId, Rgba, SharedString, Stateful, WeakEntity, div, px};
+use gpui::{CursorStyle, Div, ElementId, Rgba, SharedString, Stateful, WeakEntity, div, px, rems};
 
 use super::control_height_md;
 use super::{TextTruncationProfile, TruncatedText, TruncatedTextTooltipMode, shortcut_keys};
@@ -96,10 +96,23 @@ pub fn context_menu(theme: AppTheme, content: impl IntoElement) -> Div {
         .flex()
         .flex_col()
         .items_stretch()
-        .text_color(theme.colors.text)
+        .text_color(theme.colors.foreground.primary)
         .child(content)
 }
 
+/// Type scale of a menu's heading block, mirroring a worktree-picker row: the
+/// primary line names the object at the same size as the entries below it, and
+/// the secondary line under it is smaller and muted.
+///
+/// Both sizes have to be handed to [`TruncatedText`] explicitly. A `.text_xs()`
+/// on the wrapping div never reaches it — it measures and shapes its line from
+/// `window.text_style()` inside a deferred measure closure, after the ancestor
+/// text style has been unwound — so a single-line heading takes the window
+/// default instead. That is what made the two lines render at the same size.
+const MENU_PRIMARY_REMS: f32 = 0.875;
+const MENU_SECONDARY_REMS: f32 = 0.75;
+
+/// The menu's primary heading: what the menu is about.
 pub fn context_menu_header<V: 'static>(
     theme: AppTheme,
     ui_scale: impl Into<UiScale>,
@@ -114,10 +127,10 @@ pub fn context_menu_header<V: 'static>(
     div()
         .px(scaled_px(8.0))
         .py(scaled_px(4.0))
-        .text_xs()
-        .line_height(scaled_px(14.0))
+        .text_size(rems(MENU_PRIMARY_REMS))
+        .line_height(scaled_px(18.0))
         .font_weight(gpui::FontWeight::MEDIUM)
-        .text_color(theme.colors.text)
+        .text_color(theme.colors.foreground.primary)
         .when(max_lines == 1, |s| s.whitespace_nowrap().overflow_hidden())
         .when(max_lines > 1, |s| s.line_clamp(max_lines))
         .child(context_menu_text_content(
@@ -125,7 +138,9 @@ pub fn context_menu_header<V: 'static>(
             tooltip_host,
             cx,
             max_lines,
-            theme.colors.text,
+            theme.colors.foreground.primary,
+            rems(MENU_PRIMARY_REMS),
+            Some(gpui::FontWeight::MEDIUM),
         ))
 }
 
@@ -145,9 +160,9 @@ pub fn context_menu_description<V: 'static>(
     div()
         .px(scaled_px(8.0))
         .pb(scaled_px(4.0))
-        .text_xs()
+        .text_size(rems(MENU_SECONDARY_REMS))
         .line_height(scaled_px(14.0))
-        .text_color(theme.colors.text_muted)
+        .text_color(theme.colors.foreground.secondary)
         .when(max_lines == 1, |s| s.whitespace_nowrap().overflow_hidden())
         .when(max_lines > 1, |s| s.line_clamp(max_lines))
         .child(context_menu_text_content(
@@ -155,10 +170,17 @@ pub fn context_menu_description<V: 'static>(
             tooltip_host,
             cx,
             max_lines,
-            theme.colors.text_muted,
+            theme.colors.foreground.secondary,
+            rems(MENU_SECONDARY_REMS),
+            None,
         ))
 }
 
+/// The menu's secondary heading — the line under the header that says *which*
+/// object the menu acts on (a file's full path, a worktree's location, a link's
+/// URL), plus the empty/loading lines that stand in for a missing list. Smaller
+/// and muted against the primary heading, the way a picker row's detail line
+/// reads against its title.
 pub fn context_menu_label<V: 'static>(
     theme: AppTheme,
     ui_scale: impl Into<UiScale>,
@@ -173,9 +195,9 @@ pub fn context_menu_label<V: 'static>(
     div()
         .px(scaled_px(8.0))
         .pb(scaled_px(4.0))
-        .text_sm()
-        .line_height(scaled_px(18.0))
-        .text_color(theme.colors.text)
+        .text_size(rems(MENU_SECONDARY_REMS))
+        .line_height(scaled_px(14.0))
+        .text_color(theme.colors.foreground.secondary)
         .when(max_lines == 1, |s| s.whitespace_nowrap().overflow_hidden())
         .when(max_lines > 1, |s| s.line_clamp(max_lines))
         .child(context_menu_text_content(
@@ -183,7 +205,9 @@ pub fn context_menu_label<V: 'static>(
             tooltip_host,
             cx,
             max_lines,
-            theme.colors.text,
+            theme.colors.foreground.secondary,
+            rems(MENU_SECONDARY_REMS),
+            None,
         ))
 }
 
@@ -193,7 +217,7 @@ pub fn context_menu_separator(theme: AppTheme, ui_scale: impl Into<UiScale>) -> 
     div()
         .my(scaled_px(2.0))
         .border_t_1()
-        .border_color(theme.colors.border_variant)
+        .border_color(theme.colors.stroke.subtle)
 }
 
 pub struct ContextMenuEntry {
@@ -336,7 +360,7 @@ fn context_menu_entry<V: 'static>(
                     div()
                         .flex_1()
                         .min_w(px(0.0))
-                        .text_sm()
+                        .text_size(rems(MENU_PRIMARY_REMS))
                         .line_height(scaled_px(18.0))
                         .text_color(text_color)
                         .when(max_lines == 1, |s| s.whitespace_nowrap().overflow_hidden())
@@ -347,6 +371,8 @@ fn context_menu_entry<V: 'static>(
                             cx,
                             max_lines,
                             text_color,
+                            rems(MENU_PRIMARY_REMS),
+                            None,
                         )),
                 ),
         );
@@ -358,7 +384,7 @@ fn context_menu_entry<V: 'static>(
         .font_family(crate::font_preferences::EDITOR_MONOSPACE_FONT_FAMILY)
         .text_xs()
         .line_height(scaled_px(14.0))
-        .text_color(theme.colors.text_muted);
+        .text_color(theme.colors.foreground.secondary);
 
     if let Some(shortcut) = shortcut {
         end = if shortcut_keycaps {
@@ -371,7 +397,7 @@ fn context_menu_entry<V: 'static>(
 
     if disabled {
         row = row
-            .text_color(theme.colors.text_muted)
+            .text_color(theme.colors.foreground.secondary)
             .cursor(CursorStyle::Arrow);
     }
 
@@ -384,12 +410,12 @@ fn context_menu_entry_text_color(
     icon_color: gpui::Rgba,
 ) -> gpui::Rgba {
     if disabled {
-        theme.colors.text_muted
-    } else if icon_color == theme.colors.danger {
+        theme.colors.foreground.secondary
+    } else if icon_color == theme.colors.status.danger.foreground {
         // Destructive entries carry the danger tint on both icon and label.
-        theme.colors.danger
+        theme.colors.status.danger.foreground
     } else {
-        theme.colors.text
+        theme.colors.foreground.primary
     }
 }
 
@@ -400,11 +426,11 @@ fn context_menu_icon_color(
     icon_path: Option<&'static str>,
 ) -> gpui::Rgba {
     if disabled {
-        return theme.colors.text_muted;
+        return theme.colors.foreground.secondary;
     }
 
     if label == "Close" && icon_path == Some("icons/repo_tab_close.svg") {
-        return theme.colors.accent;
+        return theme.colors.accent.foreground;
     }
 
     // Semantic-ish mapping for common actions.
@@ -415,28 +441,28 @@ fn context_menu_icon_color(
         || label.contains("Drop")
         || label.contains("Remove")
     {
-        return theme.colors.danger;
+        return theme.colors.status.danger.foreground;
     }
     if matches!(icon_path, Some("icons/warning.svg"))
         || label.contains("Force")
         || label.contains("Discard")
     {
-        return theme.colors.warning;
+        return theme.colors.status.warning.foreground;
     }
     if matches!(icon_path, Some("icons/arrow_up.svg")) || label.starts_with("Push") {
-        return theme.colors.success;
+        return theme.colors.status.success.foreground;
     }
     if matches!(icon_path, Some("icons/arrow_down.svg")) || label.starts_with("Pull") {
-        return theme.colors.warning;
+        return theme.colors.status.warning.foreground;
     }
     if matches!(icon_path, Some("icons/plus.svg")) || label.starts_with("Stage") {
-        return theme.colors.success;
+        return theme.colors.status.success.foreground;
     }
     if matches!(icon_path, Some("icons/minus.svg")) || label.starts_with("Unstage") {
-        return theme.colors.warning;
+        return theme.colors.status.warning.foreground;
     }
 
-    theme.colors.accent
+    theme.colors.accent.foreground
 }
 
 fn context_menu_icon_path(icon: &str, label: &str) -> Option<&'static str> {
@@ -453,6 +479,10 @@ fn context_menu_icon_path(icon: &str, label: &str) -> Option<&'static str> {
         "icons/git_branch.svg" => Some("icons/git_branch.svg"),
         "icons/arrow_down.svg" => Some("icons/arrow_down.svg"),
         "icons/arrow_up.svg" => Some("icons/arrow_up.svg"),
+        "icons/arrow_down_to_line.svg" => Some("icons/arrow_down_to_line.svg"),
+        "icons/arrow_up_to_line.svg" => Some("icons/arrow_up_to_line.svg"),
+        "icons/chevron_down.svg" => Some("icons/chevron_down.svg"),
+        "icons/chevron_right.svg" => Some("icons/chevron_right.svg"),
         "icons/broom.svg" => Some("icons/broom.svg"),
         "icons/stash.svg" => Some("icons/stash.svg"),
         "icons/tag.svg" => Some("icons/tag.svg"),
@@ -533,11 +563,20 @@ fn context_menu_text_content<V: 'static>(
     cx: &gpui::Context<V>,
     max_lines: usize,
     text_color: Rgba,
+    text_size: gpui::Rems,
+    font_weight: Option<gpui::FontWeight>,
 ) -> impl IntoElement {
     if max_lines == 1 {
+        // `text_size`/`font_weight` are set on the element itself: it shapes its
+        // line from `window.text_style()` in a deferred measure closure, so the
+        // caller's text styling on the wrapping div does not reach it.
         let mut truncated = TruncatedText::new(text.text.clone())
             .profile(text.profile)
-            .text_color(text_color);
+            .text_color(text_color)
+            .text_size(text_size);
+        if let Some(font_weight) = font_weight {
+            truncated = truncated.font_weight(font_weight);
+        }
         if let (Some(tooltip_host), TruncatedTextTooltipMode::FullTextIfTruncated) =
             (tooltip_host, text.tooltip_mode)
         {
@@ -546,6 +585,7 @@ fn context_menu_text_content<V: 'static>(
         return truncated.render(cx).into_any_element();
     }
 
+    // The wrapped branch is an ordinary text child, which does inherit.
     div()
         .text_color(text_color)
         .child(text.text)
@@ -555,6 +595,82 @@ fn context_menu_text_content<V: 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct HeadingBlock {
+        theme: AppTheme,
+    }
+
+    impl gpui::Render for HeadingBlock {
+        fn render(
+            &mut self,
+            _window: &mut gpui::Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl IntoElement {
+            div()
+                .flex()
+                .flex_col()
+                .child(
+                    context_menu_header(self.theme, 100u32, "primary.rs", None, cx)
+                        .debug_selector(|| "heading_primary".to_string()),
+                )
+                .child(
+                    context_menu_label(
+                        self.theme,
+                        100u32,
+                        ContextMenuText::path_single_line("/tmp/some/where/primary.rs"),
+                        None,
+                        cx,
+                    )
+                    .debug_selector(|| "heading_secondary".to_string()),
+                )
+        }
+    }
+
+    /// A menu naming an object renders two headings, and the second one has to
+    /// read as subordinate. Both lines go through `TruncatedText`, which takes
+    /// its size from the element rather than the wrapping div's text class — so
+    /// dropping the explicit size silently returns both lines to the window
+    /// default and they render identically, which is the bug this guards.
+    ///
+    /// Glyph metrics are useless here (the test text system measures every glyph
+    /// the same), but the line box each heading reserves still follows its font
+    /// size, so height is the observable that separates them.
+    #[gpui::test]
+    fn secondary_heading_renders_smaller_than_the_primary(cx: &mut gpui::TestAppContext) {
+        let _guard = crate::test_support::lock_visual_test();
+        let theme = crate::theme::AppTheme::gitcomet_dark();
+        let (_view, cx) = cx.add_window_view(|_window, _cx| HeadingBlock { theme });
+        crate::view::test_support::redraw(cx);
+
+        let primary = cx
+            .debug_bounds("heading_primary")
+            .expect("expected the primary heading");
+        let secondary = cx
+            .debug_bounds("heading_secondary")
+            .expect("expected the secondary heading");
+
+        // Both carry 4px of bottom padding; the primary adds 4px on top.
+        let primary_line = primary.size.height - px(8.0);
+        let secondary_line = secondary.size.height - px(4.0);
+        assert!(
+            secondary_line < primary_line,
+            "secondary heading must render smaller than the primary, got \
+             {secondary_line:?} vs {primary_line:?}"
+        );
+    }
+
+    #[test]
+    fn secondary_heading_is_muted_against_the_primary() {
+        for theme in [
+            crate::theme::AppTheme::gitcomet_dark(),
+            crate::theme::AppTheme::gitcomet_light(),
+        ] {
+            assert_ne!(
+                theme.colors.foreground.secondary, theme.colors.foreground.primary,
+                "the two headings must not share a color"
+            );
+        }
+    }
 
     #[test]
     fn context_menu_icon_path_accepts_direct_svg_paths() {
@@ -569,6 +685,10 @@ mod tests {
             "icons/git_branch.svg",
             "icons/arrow_down.svg",
             "icons/arrow_up.svg",
+            "icons/arrow_down_to_line.svg",
+            "icons/arrow_up_to_line.svg",
+            "icons/chevron_down.svg",
+            "icons/chevron_right.svg",
             "icons/broom.svg",
             "icons/stash.svg",
             "icons/tag.svg",
@@ -631,15 +751,15 @@ mod tests {
         let theme = AppTheme::gitcomet_dark();
         assert_eq!(
             context_menu_icon_color(theme, false, "Delete branch", Some("icons/trash.svg")),
-            theme.colors.danger
+            theme.colors.status.danger.foreground
         );
         assert_eq!(
             context_menu_icon_color(theme, false, "Close", Some("icons/repo_tab_close.svg")),
-            theme.colors.accent
+            theme.colors.accent.foreground
         );
         assert_eq!(
             context_menu_icon_color(theme, false, "Force push", Some("icons/warning.svg")),
-            theme.colors.warning
+            theme.colors.status.warning.foreground
         );
     }
 
@@ -649,14 +769,14 @@ mod tests {
         let close_icon =
             context_menu_icon_color(theme, false, "Close", Some("icons/repo_tab_close.svg"));
 
-        assert_eq!(close_icon, theme.colors.accent);
+        assert_eq!(close_icon, theme.colors.accent.foreground);
         assert_eq!(
             context_menu_entry_text_color(theme, false, close_icon),
-            theme.colors.text
+            theme.colors.foreground.primary
         );
         assert_eq!(
-            context_menu_entry_text_color(theme, false, theme.colors.danger),
-            theme.colors.danger,
+            context_menu_entry_text_color(theme, false, theme.colors.status.danger.foreground),
+            theme.colors.status.danger.foreground,
             "other destructive entries should retain their danger text"
         );
     }
@@ -669,6 +789,10 @@ mod tests {
             "icons/git_branch.svg",
             "icons/arrow_down.svg",
             "icons/arrow_up.svg",
+            "icons/arrow_down_to_line.svg",
+            "icons/arrow_up_to_line.svg",
+            "icons/chevron_down.svg",
+            "icons/chevron_right.svg",
             "icons/broom.svg",
             "icons/stash.svg",
             "icons/tag.svg",

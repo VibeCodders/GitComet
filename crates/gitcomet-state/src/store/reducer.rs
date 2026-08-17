@@ -104,14 +104,17 @@ pub(crate) fn msg_requires_available_git(msg: &Msg) -> bool {
             | Msg::CompareWithWorkingTree { .. }
             | Msg::SelectDiff { .. }
             | Msg::SelectConflictDiff { .. }
+            | Msg::SelectWorktreeUncommitted { .. }
             | Msg::LoadStashes { .. }
             | Msg::LoadConflictFile { .. }
             | Msg::LoadReflog { .. }
-            | Msg::LoadRecentCommitMessages { .. }
-            | Msg::LoadCherryPickRangePreview { .. }
-            | Msg::LoadFileHistory { .. }
+            | Msg::LoadRecentCommitMessages { .. }            | Msg::LoadCherryPickRangePreview { .. }
+            | Msg::LoadHoverCommitMessage { .. }
+              | Msg::LoadFileHistory { .. }
             | Msg::LoadBlame { .. }
             | Msg::LoadWorktrees { .. }
+            | Msg::LoadWorktreeDirty { .. }
+            | Msg::LoadRefMetadata { .. }
             | Msg::LoadSubmodules { .. }
             | Msg::LoadSubmodule { .. }
             | Msg::LoadTags { .. }
@@ -119,9 +122,11 @@ pub(crate) fn msg_requires_available_git(msg: &Msg) -> bool {
             | Msg::RefreshBranches { .. }
             | Msg::LoadFileBrowser { .. }
             | Msg::OpenFileContent { .. }
+            | Msg::OpenFileEditor { .. }
             | Msg::OpenFileAtCommitParent { .. }
             | Msg::OpenFileAtCommit { .. }
             | Msg::BrowseRepositoryAtCommit { .. }
+            | Msg::RevealCommit { .. }
             | Msg::ResetBrowseToLive { .. }
             | Msg::ViewerNavBack { .. }
             | Msg::ViewerNavForward { .. }
@@ -140,6 +145,7 @@ pub(crate) fn msg_requires_available_git(msg: &Msg) -> bool {
             | Msg::RenameBranch { .. }
             | Msg::DeleteBranch { .. }
             | Msg::ForceDeleteBranch { .. }
+            | Msg::DeleteBranches { .. }
             | Msg::CloneRepo { .. }
             | Msg::ExportPatch { .. }
             | Msg::ApplyPatch { .. }
@@ -157,6 +163,7 @@ pub(crate) fn msg_requires_available_git(msg: &Msg) -> bool {
             | Msg::DiscardWorktreeChangesPath { .. }
             | Msg::DiscardWorktreeChangesPaths { .. }
             | Msg::SaveWorktreeFile { .. }
+            | Msg::AppendGitignorePatterns { .. }
             | Msg::Commit { .. }
             | Msg::CommitAmend { .. }
             | Msg::SafePushAfterCommit { .. }
@@ -175,6 +182,7 @@ pub(crate) fn msg_requires_available_git(msg: &Msg) -> bool {
             | Msg::SetUpstreamBranch { .. }
             | Msg::UnsetUpstreamBranch { .. }
             | Msg::DeleteRemoteBranch { .. }
+            | Msg::DeleteRemoteBranches { .. }
             | Msg::Reset { .. }
             | Msg::PrepareSquash { .. }
             | Msg::SquashCommits { .. }
@@ -380,6 +388,11 @@ fn retry_msg_for_repo_command(repo_id: RepoId, command: RepoCommandKind) -> Opti
             remote,
             branch,
         },
+        RepoCommandKind::DeleteRemoteBranches { remote, branches } => Msg::DeleteRemoteBranches {
+            repo_id,
+            remote,
+            branches,
+        },
         RepoCommandKind::Reset { mode, target } => Msg::Reset {
             repo_id,
             target,
@@ -524,6 +537,11 @@ fn retry_msg_for_repo_command(repo_id: RepoId, command: RepoCommandKind) -> Opti
         // persisted reword messages) on disk; continue it with the staged
         // auth like the cherry-pick commands above.
         RepoCommandKind::InteractiveRebase { .. } => Msg::RebaseContinue { repo_id },
+        // Writes `.gitignore` on the local filesystem, so it never fails for
+        // want of credentials — and this replay path exists only to re-run a
+        // command after an auth prompt. Retaining `patterns` would make a replay
+        // possible; there is just nothing here that an auth prompt could fix.
+        RepoCommandKind::AppendGitignorePatterns { .. } => return None,
         // Not replayable because command metadata does not retain original content.
         RepoCommandKind::SaveWorktreeFile { .. }
         | RepoCommandKind::StageHunk
@@ -554,6 +572,7 @@ fn attach_git_auth_to_effects(mut effects: Vec<Effect>, auth: StagedGitAuth) -> 
         | Effect::ForcePushWithLease { auth: slot, .. }
         | Effect::PushSetUpstream { auth: slot, .. }
         | Effect::DeleteRemoteBranch { auth: slot, .. }
+        | Effect::DeleteRemoteBranches { auth: slot, .. }
         | Effect::PushTag { auth: slot, .. }
         | Effect::DeleteRemoteTag { auth: slot, .. }
         | Effect::RebaseContinue { auth: slot, .. } => {
@@ -594,7 +613,12 @@ pub(crate) fn fill_select_diff_inline(
     content_preview: bool,
     effects: &mut SelectDiffEffects,
 ) {
-    diff_selection::fill_select_diff_inline(state, repo_id, target, content_preview, effects)
+    let mode = if content_preview {
+        diff_selection::ContentViewMode::Preview
+    } else {
+        diff_selection::ContentViewMode::Diff
+    };
+    diff_selection::fill_select_diff_inline(state, repo_id, target, mode, effects)
 }
 
 #[inline]
@@ -721,6 +745,10 @@ pub(super) fn reduce(
 
     let effects = reduce_inner(repos, id_alloc, state, msg);
 
+    // Enforced here rather than at each of the four places a worktree selection
+    // can end; see the helper.
+    effects::retire_orphaned_worktree_diffs(state);
+
     if reconcile {
         reconcile_active_nav_history(state, push);
     }
@@ -738,12 +766,22 @@ fn is_view_navigation(msg: &Msg) -> bool {
         Msg::SelectDiff { .. }
             | Msg::SelectConflictDiff { .. }
             | Msg::SelectCommit { .. }
+            // Selecting a linked-worktree row is a destination like any other
+            // history selection; it just is not a commit.
+            | Msg::SelectWorktreeUncommitted { .. }
             | Msg::CompareCommitRange { .. }
             | Msg::CompareWithMarked { .. }
             | Msg::CompareWithWorkingTree { .. }
             | Msg::OpenFileContent { .. }
+            | Msg::OpenFileEditor { .. }
+            // Leaving the editor is a destination of its own, so Back returns to
+            // the editor rather than skipping past it to whatever preceded it.
+            | Msg::ExitDiffEditMode { .. }
             | Msg::OpenFileAtCommit { .. }
             | Msg::BrowseRepositoryAtCommit { .. }
+            // A reveal moves the main view when its reference resolves, not
+            // when it is asked for.
+            | Msg::Internal(crate::msg::InternalMsg::CommitRevealResolved { .. })
             | Msg::ResetBrowseToLive { .. }
             | Msg::OpenInlineSubmoduleDiff { .. }
             | Msg::SelectInlineSubmoduleDiff { .. }
@@ -950,6 +988,7 @@ fn reduce_inner(
         Msg::SelectDiff { repo_id, target } => diff_selection::select_diff(state, repo_id, target),
         Msg::OpenInlineSubmoduleDiff {
             repo_id,
+            origin,
             submodule_repo_path,
             parent_submodule_path,
             entries,
@@ -957,6 +996,7 @@ fn reduce_inner(
         } => diff_selection::open_inline_submodule_diff(
             state,
             repo_id,
+            origin,
             submodule_repo_path,
             parent_submodule_path,
             entries,
@@ -982,8 +1022,7 @@ fn reduce_inner(
             path,
             mode,
         } => effects::load_conflict_file(state, repo_id, path, mode),
-        Msg::LoadReflog { repo_id } => effects::load_reflog(state, repo_id),
-        Msg::CreateVirtualBranch { repo_id, name } => {
+        Msg::LoadReflog { repo_id } => effects::load_reflog(state, repo_id),        Msg::CreateVirtualBranch { repo_id, name } => {
             virtual_branches::create_virtual_branch(state, repo_id, name)
         }
         Msg::RenameVirtualBranch {
@@ -1020,7 +1059,10 @@ fn reduce_inner(
             repo_id,
             branch_ids,
         } => virtual_branches::prune_virtual_branches(state, repo_id, branch_ids),
-        Msg::LoadRecentCommitMessages { repo_id, limit } => {
+        Msg::LoadHoverCommitMessage { repo_id, commit_id } => {
+            effects::load_hover_commit_message(state, repo_id, commit_id)
+        }
+          Msg::LoadRecentCommitMessages { repo_id, limit } => {
             effects::load_recent_commit_messages(state, repo_id, limit)
         }
         Msg::LoadCherryPickRangePreview {
@@ -1039,6 +1081,11 @@ fn reduce_inner(
             source,
         } => effects::load_blame(state, repo_id, path, source),
         Msg::LoadWorktrees { repo_id } => effects::load_worktrees(state, repo_id),
+        Msg::LoadWorktreeDirty { repo_id } => effects::load_worktree_dirty(state, repo_id),
+        Msg::SelectWorktreeUncommitted { repo_id, path } => {
+            effects::select_worktree_uncommitted(state, repo_id, path)
+        }
+        Msg::LoadRefMetadata { repo_id } => effects::load_ref_metadata(state, repo_id),
         Msg::LoadSubmodules { repo_id } => effects::load_submodules(state, repo_id),
         Msg::LoadTags { repo_id } => effects::load_tags(state, repo_id),
         Msg::LoadRemoteTags { repo_id } => effects::load_remote_tags(state, repo_id),
@@ -1049,8 +1096,16 @@ fn reduce_inner(
         Msg::ToggleFileBrowserDir { repo_id, path } => {
             effects::toggle_file_browser_dir(state, repo_id, path)
         }
+        Msg::SetFileBrowserDirExpandedRecursive {
+            repo_id,
+            path,
+            expanded,
+        } => effects::set_file_browser_dir_expanded_recursive(state, repo_id, path, expanded),
         Msg::SetFileBrowserSearch { repo_id, query } => {
             effects::set_file_browser_search(state, repo_id, query)
+        }
+        Msg::RevealFileBrowserPath { repo_id, path } => {
+            effects::reveal_file_browser_path(state, repo_id, path)
         }
         Msg::SetFileBrowserSource { repo_id, source } => {
             effects::set_file_browser_source(state, repo_id, source)
@@ -1060,6 +1115,10 @@ fn reduce_inner(
             source,
             path,
         } => diff_selection::open_file_content(state, repo_id, source, path),
+        Msg::OpenFileEditor { repo_id, path } => {
+            diff_selection::open_file_editor(state, repo_id, path)
+        }
+        Msg::ExitDiffEditMode { repo_id } => diff_selection::exit_diff_edit_mode(state, repo_id),
         Msg::OpenFileAtCommitParent {
             repo_id,
             commit_id,
@@ -1081,6 +1140,10 @@ fn reduce_inner(
         Msg::BrowseRepositoryAtCommit { repo_id, commit_id } => {
             effects::browse_repository_at_commit(state, repo_id, commit_id)
         }
+        Msg::RevealCommit { repo_id, reference } => {
+            effects::reveal_commit(state, repo_id, reference)
+        }
+        Msg::FinishCommitReveal { repo_id } => effects::finish_commit_reveal(state, repo_id),
         Msg::ResetBrowseToLive { repo_id } => effects::reset_browse_to_live(state, repo_id),
         Msg::ViewerNavBack { repo_id } => {
             diff_selection::viewer_nav(state, repo_id, crate::model::ViewNavDir::Back)
@@ -1200,6 +1263,17 @@ fn reduce_inner(
         Msg::ForceDeleteBranch { repo_id, name } => {
             begin_local_action(state, repo_id);
             actions_emit_effects::force_delete_branch(repo_id, name)
+        }
+        Msg::DeleteBranches {
+            repo_id,
+            names,
+            force,
+        } => {
+            if names.is_empty() {
+                return Vec::new();
+            }
+            begin_local_action(state, repo_id);
+            actions_emit_effects::delete_branches(repo_id, names, force)
         }
         Msg::CloneRepo { url, dest } => repo_management::clone_repo(state, url, dest),
         Msg::AbortCloneRepo { dest } => repo_management::abort_clone_repo(state, dest),
@@ -1419,6 +1493,10 @@ fn reduce_inner(
             begin_local_action(state, repo_id);
             actions_emit_effects::save_worktree_file(repo_id, path, contents, stage)
         }
+        Msg::AppendGitignorePatterns { repo_id, patterns } => {
+            begin_local_action(state, repo_id);
+            actions_emit_effects::append_gitignore_patterns(repo_id, patterns)
+        }
         Msg::Commit {
             repo_id,
             message,
@@ -1505,6 +1583,16 @@ fn reduce_inner(
             remote,
             branch,
         } => actions_emit_effects::delete_remote_branch(repos, state, repo_id, remote, branch),
+        Msg::DeleteRemoteBranches {
+            repo_id,
+            remote,
+            branches,
+        } => {
+            if branches.is_empty() {
+                return Vec::new();
+            }
+            actions_emit_effects::delete_remote_branches(repos, state, repo_id, remote, branches)
+        }
         Msg::Reset {
             repo_id,
             target,
@@ -1678,13 +1766,50 @@ fn reduce_inner(
             repo_id,
             path,
             choice,
-        } => conflict_interactions::apply_bulk_choice(state, repo_id, path, choice),
+            scope,
+        } => conflict_interactions::apply_bulk_choice(state, repo_id, path, choice, scope),
         Msg::ConflictSetRegionChoice {
             repo_id,
             path,
             region_index,
             choice,
         } => conflict_interactions::set_region_choice(state, repo_id, path, region_index, choice),
+        Msg::ConflictToggleRegionSource {
+            repo_id,
+            path,
+            region_index,
+            source,
+        } => {
+            conflict_interactions::toggle_region_source(state, repo_id, path, region_index, source)
+        }
+        Msg::ConflictReplaceRegionSelection {
+            repo_id,
+            path,
+            region_index,
+            selection,
+        } => conflict_interactions::replace_region_selection(
+            state,
+            repo_id,
+            path,
+            region_index,
+            selection,
+        ),
+        Msg::ConflictTogglePlanBlockSource {
+            repo_id,
+            path,
+            block_id,
+            source,
+        } => {
+            conflict_interactions::toggle_plan_block_source(state, repo_id, path, block_id, source)
+        }
+        Msg::ConflictReplacePlanBlockSelection {
+            repo_id,
+            path,
+            block_id,
+            selection,
+        } => conflict_interactions::replace_plan_block_selection(
+            state, repo_id, path, block_id, selection,
+        ),
         Msg::ConflictSyncRegionResolutions {
             repo_id,
             path,
@@ -1721,6 +1846,28 @@ fn reduce_inner(
             }
             effects
         }
+        Msg::ConflictAddManualAlignment {
+            repo_id,
+            path,
+            alignment,
+            expected_conflict_rev,
+        } => conflict_interactions::add_manual_alignment(
+            state,
+            repo_id,
+            path,
+            alignment,
+            expected_conflict_rev,
+        ),
+        Msg::ConflictClearManualAlignments {
+            repo_id,
+            path,
+            expected_conflict_rev,
+        } => conflict_interactions::clear_manual_alignments(
+            state,
+            repo_id,
+            path,
+            expected_conflict_rev,
+        ),
         Msg::ConflictJoinRegions {
             repo_id,
             path,
@@ -1824,11 +1971,18 @@ fn reduce_inner(
         }
         Msg::Internal(crate::msg::InternalMsg::LogLoaded {
             repo_id,
+            seq,
             scope,
-            author,
+            author: _,
             cursor,
             result,
-        }) => external_and_history::log_loaded(state, repo_id, scope, author, cursor, result),
+        }) => external_and_history::log_loaded(state, repo_id, seq, scope, cursor, result),
+        Msg::Internal(crate::msg::InternalMsg::LogChunkLoaded {
+            repo_id,
+            seq,
+            commits,
+            scanned,
+        }) => external_and_history::log_chunk_loaded(state, repo_id, seq, commits, scanned),
         Msg::Internal(crate::msg::InternalMsg::TagsLoaded { repo_id, result }) => {
             effects::tags_loaded(state, repo_id, result)
         }
@@ -1878,6 +2032,11 @@ fn reduce_inner(
         Msg::Internal(crate::msg::InternalMsg::MergeCommitMessageLoaded { repo_id, result }) => {
             external_and_history::merge_commit_message_loaded(state, repo_id, result)
         }
+        Msg::Internal(crate::msg::InternalMsg::HoverCommitMessageLoaded {
+            repo_id,
+            commit_id,
+            result,
+        }) => effects::hover_commit_message_loaded(state, repo_id, commit_id, result),
         Msg::Internal(crate::msg::InternalMsg::FileHistoryLoaded {
             repo_id,
             path,
@@ -1897,6 +2056,12 @@ fn reduce_inner(
         }) => effects::conflict_file_loaded(state, repo_id, path, *result, conflict_session),
         Msg::Internal(crate::msg::InternalMsg::WorktreesLoaded { repo_id, result }) => {
             effects::worktrees_loaded(state, repo_id, result)
+        }
+        Msg::Internal(crate::msg::InternalMsg::WorktreeDirtyLoaded { repo_id, result }) => {
+            effects::worktree_dirty_loaded(state, repo_id, result)
+        }
+        Msg::Internal(crate::msg::InternalMsg::RefMetadataLoaded { repo_id, result }) => {
+            effects::ref_metadata_loaded(state, repo_id, result)
         }
         Msg::Internal(crate::msg::InternalMsg::SubmodulesLoaded { repo_id, result }) => {
             effects::submodules_loaded(state, repo_id, result)
@@ -2010,6 +2175,11 @@ fn reduce_inner(
             commit_id,
             result,
         }) => effects::commit_details_loaded(state, repo_id, commit_id, result),
+        Msg::Internal(crate::msg::InternalMsg::CommitRevealResolved {
+            repo_id,
+            reference,
+            result,
+        }) => effects::commit_reveal_resolved(state, repo_id, reference, result),
         Msg::Internal(crate::msg::InternalMsg::RangeFilesLoaded {
             repo_id,
             from,
@@ -2323,6 +2493,58 @@ mod nav_history_tests {
         );
     }
 
+    /// A linked-worktree row is a third kind of history selection, and selecting
+    /// one clears the commit selection. Left out of the navigation machinery it
+    /// read as "the view went back to the log": the entry for the commit the user
+    /// came from was overwritten in place, so Back skipped it, and no snapshot
+    /// could reproduce the worktree row on the way forward.
+    #[test]
+    fn selecting_a_worktree_row_is_a_navigation_step_of_its_own() {
+        let repo_id = RepoId(1);
+        let mut state = available_state_with_repo(repo_id);
+        let commit = CommitId("abc".into());
+        let worktree = std::path::PathBuf::from("/tmp/wt/a");
+
+        dispatch(
+            &mut state,
+            Msg::SelectCommit {
+                repo_id,
+                commit_id: commit.clone(),
+            },
+        );
+        dispatch(
+            &mut state,
+            Msg::SelectWorktreeUncommitted {
+                repo_id,
+                path: worktree.clone(),
+            },
+        );
+        assert_eq!(
+            repo(&state, repo_id).history_state.selected_commit,
+            None,
+            "the worktree row displaces the commit selection"
+        );
+
+        dispatch(&mut state, Msg::GlobalNavBack { repo_id });
+        assert_eq!(
+            repo(&state, repo_id).history_state.selected_commit.as_ref(),
+            Some(&commit),
+            "back must return to the commit the worktree row was selected from"
+        );
+        assert_eq!(repo(&state, repo_id).history_state.worktree_selection, None);
+
+        dispatch(&mut state, Msg::GlobalNavForward { repo_id });
+        assert_eq!(
+            repo(&state, repo_id)
+                .history_state
+                .worktree_selection
+                .as_ref(),
+            Some(&worktree),
+            "forward must reproduce the worktree row, not just clear the commit"
+        );
+        assert_eq!(repo(&state, repo_id).history_state.selected_commit, None);
+    }
+
     #[test]
     fn opening_a_file_diff_is_recorded_and_back_restores_the_log() {
         let repo_id = RepoId(1);
@@ -2465,6 +2687,7 @@ mod nav_history_tests {
             repo_id: RepoId(1),
         }));
         assert!(is_view_navigation(&Msg::OpenInlineSubmoduleDiff {
+            origin: crate::model::ForeignDiffOrigin::Submodule,
             repo_id: RepoId(1),
             submodule_repo_path: std::path::PathBuf::from("/tmp/sub"),
             parent_submodule_path: std::path::PathBuf::from("sub"),
@@ -2500,6 +2723,7 @@ mod nav_history_tests {
         dispatch(
             &mut state,
             Msg::OpenInlineSubmoduleDiff {
+                origin: crate::model::ForeignDiffOrigin::Submodule,
                 repo_id,
                 submodule_repo_path: std::path::PathBuf::from("/tmp/repo/vendor/first"),
                 parent_submodule_path: std::path::PathBuf::from("vendor/first"),

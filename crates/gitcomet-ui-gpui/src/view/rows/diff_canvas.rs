@@ -12,9 +12,10 @@ use crate::view::panes::main::DiffHorizontalScrollColumn;
 use crate::view::panes::main::diff_search::{DiffSearchMatcher, DiffSearchOptions};
 use gitcomet_core::domain::{DiffArea, DiffLineKind};
 use gpui::{
-    App, Bounds, CursorStyle, DispatchPhase, HighlightStyle, Hitbox, HitboxBehavior, Hsla, Pixels,
+    App, Bounds, CursorStyle, DispatchPhase, HighlightStyle, Hitbox, HitboxBehavior, Pixels,
     Styled, TextRun, TextStyle, TransformationMatrix, TruncateFrom, Window, fill, point, px, size,
 };
+use palette::IntoColor;
 use rustc_hash::{FxHashMap, FxHasher};
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -255,7 +256,7 @@ fn paint_truncated_text(
         return;
     }
     let mut style = diff_text_style(window);
-    style.color = color.into();
+    style.color = color.into_color();
     let runs = vec![style.to_run(text.len())];
     let mut wrapper = window
         .text_system()
@@ -329,7 +330,7 @@ fn paint_blame_annotation(
     );
     window.paint_layer(layout.message, |window| {
         let message_color = if hovered == Some(AnnotArea::Message) {
-            theme.colors.accent
+            theme.colors.accent.foreground
         } else {
             text_color
         };
@@ -350,7 +351,7 @@ fn paint_blame_annotation(
                     point(layout.message.left(), underline_y),
                     size(layout.message.size.width, px(1.0)),
                 ),
-                theme.colors.accent,
+                theme.colors.accent.foreground,
             ));
         }
     });
@@ -360,7 +361,7 @@ fn paint_blame_annotation(
     // revision (the committed state before the local change).
     if prior_enabled {
         let icon_color = if hovered == Some(AnnotArea::PriorIcon) {
-            theme.colors.accent
+            theme.colors.accent.foreground
         } else {
             crate::theme::with_alpha(text_color, 0.6)
         };
@@ -379,13 +380,13 @@ fn paint_blame_annotation(
         // the "view file at this commit" icon, which would be a no-op here.
         paint_blame_dot(
             layout.browse_icon,
-            crate::theme::with_alpha(theme.colors.accent, 0.7),
+            crate::theme::with_alpha(theme.colors.accent.foreground, 0.7),
             ui_scale_percent,
             window,
         );
     } else if browse_enabled {
         let icon_color = if hovered == Some(AnnotArea::BrowseIcon) {
-            theme.colors.accent
+            theme.colors.accent.foreground
         } else {
             crate::theme::with_alpha(text_color, 0.6)
         };
@@ -421,7 +422,7 @@ fn paint_blame_icon(
 
 /// Paint `path` as a square icon of `glyph` size, centered in `cell` and clamped
 /// so it never spills out of it.
-fn paint_centered_svg_icon(
+pub(super) fn paint_centered_svg_icon(
     path: &'static str,
     cell: Bounds<Pixels>,
     glyph: Pixels,
@@ -438,7 +439,7 @@ fn paint_centered_svg_icon(
         path.into(),
         None,
         TransformationMatrix::unit(),
-        Hsla::from(color),
+        color.into_color(),
         cx,
     );
 }
@@ -518,8 +519,8 @@ impl StageGutterSpec {
 
     fn color(self, theme: AppTheme) -> gpui::Rgba {
         match self.area {
-            DiffArea::Unstaged => theme.colors.diff_add_text,
-            DiffArea::Staged => theme.colors.diff_remove_text,
+            DiffArea::Unstaged => theme.colors.diff.added.foreground,
+            DiffArea::Staged => theme.colors.diff.removed.foreground,
         }
     }
 
@@ -861,7 +862,7 @@ fn render_blame_column(
         blame,
         &layout,
         y,
-        theme.colors.text_muted,
+        theme.colors.foreground.secondary,
         theme,
         metrics,
         when_metrics,
@@ -1007,7 +1008,7 @@ pub(super) struct StreamedDiffTextPaintSpec {
     pub(super) query_options: DiffSearchOptions,
     pub(super) query_matcher: Option<Arc<DiffSearchMatcher>>,
     pub(super) word_ranges: Arc<[Range<usize>]>,
-    pub(super) word_color: Option<gpui::Rgba>,
+    pub(super) word_kind: Option<crate::theme::DiffColorKind>,
     pub(super) syntax: StreamedDiffTextSyntaxSource,
 }
 
@@ -1166,7 +1167,7 @@ fn patch_split_row_canvas_revision_key(
 }
 
 fn semantic_diff_row_bg(theme: AppTheme, bg: gpui::Rgba) -> Option<gpui::Rgba> {
-    (bg != theme.colors.window_bg).then_some(bg)
+    (bg != theme.colors.surface.canvas).then_some(bg)
 }
 
 fn focused_row_outline_color(theme: AppTheme, bg: gpui::Rgba) -> gpui::Rgba {
@@ -1505,9 +1506,7 @@ fn streamed_diff_text_highlights_hash(spec: &StreamedDiffTextPaintSpec) -> u64 {
     for range in spec.word_ranges.iter() {
         hash_range(&mut hasher, range);
     }
-    if let Some(color) = spec.word_color {
-        hash_rgba(&mut hasher, color);
-    }
+    spec.word_kind.hash(&mut hasher);
     match &spec.syntax {
         StreamedDiffTextSyntaxSource::None => {
             0u8.hash(&mut hasher);
@@ -1540,10 +1539,14 @@ fn hash_overlay_ranges(
     base_highlights_hash: u64,
     ranges: &[Range<usize>],
     background_color: gpui::Hsla,
+    foreground_color: Option<gpui::Hsla>,
 ) -> u64 {
     let mut hasher = FxHasher::default();
     base_highlights_hash.hash(&mut hasher);
-    hash_rgba(&mut hasher, background_color.into());
+    hash_rgba(&mut hasher, background_color.into_color());
+    if let Some(foreground_color) = foreground_color {
+        hash_rgba(&mut hasher, foreground_color.into_color());
+    }
     for range in ranges {
         range.start.hash(&mut hasher);
         range.end.hash(&mut hasher);
@@ -1551,10 +1554,18 @@ fn hash_overlay_ranges(
     hasher.finish()
 }
 
+/// Lays a semantic overlay -- the word-diff wash -- over already-styled text.
+///
+/// `foreground_color` is the text colour the wash pins under itself, and it is
+/// applied only where nothing has coloured the run already: light themes carry
+/// the wash opaque, which would drown a syntax colour, so the diff foreground
+/// takes over there and syntax keeps its own everywhere else. That is the rule
+/// the non-streamed builder follows, and both paths render the same hunk.
 fn overlay_background_ranges_on_styled_text(
     base: &CachedDiffStyledText,
     ranges: &[Range<usize>],
     background_color: gpui::Hsla,
+    foreground_color: Option<gpui::Hsla>,
 ) -> CachedDiffStyledText {
     if ranges.is_empty() || base.text.is_empty() {
         return base.clone();
@@ -1568,6 +1579,7 @@ fn overlay_background_ranges_on_styled_text(
                 &mut merged,
                 range,
                 HighlightStyle {
+                    color: foreground_color,
                     background_color: Some(background_color),
                     ..HighlightStyle::default()
                 },
@@ -1576,7 +1588,12 @@ fn overlay_background_ranges_on_styled_text(
         return CachedDiffStyledText {
             text: base.text.clone(),
             highlights: Arc::from(merged),
-            highlights_hash: hash_overlay_ranges(base.highlights_hash, ranges, background_color),
+            highlights_hash: hash_overlay_ranges(
+                base.highlights_hash,
+                ranges,
+                background_color,
+                foreground_color,
+            ),
             text_hash: base.text_hash,
         };
     }
@@ -1622,6 +1639,9 @@ fn overlay_background_ranges_on_styled_text(
         let mut style = active_base.map(|(_, style)| *style).unwrap_or_default();
         if active_range.is_some() {
             style.background_color = Some(background_color);
+            if style.color.is_none() {
+                style.color = foreground_color;
+            }
         }
 
         if style != default_style {
@@ -1634,7 +1654,12 @@ fn overlay_background_ranges_on_styled_text(
     CachedDiffStyledText {
         text: base.text.clone(),
         highlights: Arc::from(merged),
-        highlights_hash: hash_overlay_ranges(base.highlights_hash, ranges, background_color),
+        highlights_hash: hash_overlay_ranges(
+            base.highlights_hash,
+            ranges,
+            background_color,
+            foreground_color,
+        ),
         text_hash: base.text_hash,
     }
 }
@@ -1813,13 +1838,22 @@ fn build_streamed_diff_slice_styled_text(
     };
 
     if !spec.word_ranges.is_empty()
-        && let Some(mut color) = spec.word_color
+        && let Some(word_kind) = spec.word_kind
     {
         let clipped = clip_ranges_to_slice(spec.word_ranges.as_ref(), &resolved_slice_range);
         if !clipped.is_empty() {
-            color.a = if theme.is_dark { 0.22 } else { 0.16 };
-            base =
-                overlay_background_ranges_on_styled_text(&base, clipped.as_slice(), color.into());
+            // The same resolver the non-streamed builder uses, and both halves of
+            // what it returns. Deriving the wash here instead gave a line past
+            // `STREAMED_DIFF_TEXT_MIN_BYTES` a different word-diff colour from
+            // its neighbours in the same diff; dropping the foreground did the
+            // same to the text on light themes, which pin it under the wash.
+            let (background, foreground) = diff_text::word_highlight_colors(theme, word_kind);
+            base = overlay_background_ranges_on_styled_text(
+                &base,
+                clipped.as_slice(),
+                background.into_color(),
+                foreground.map(IntoColor::into_color),
+            );
         }
     }
 
@@ -2054,7 +2088,7 @@ pub(super) fn inline_diff_line_row_canvas(
                 prepaint.bounds,
                 prepaint.annot_w,
                 bg,
-                theme.colors.surface_bg,
+                theme.colors.surface.panel,
             );
 
             if let Some(blame) = &blame {
@@ -2327,13 +2361,13 @@ pub(super) fn split_diff_line_row_canvas(
                     window,
                     prepaint.bounds,
                     prepaint.annot_w,
-                    theme.colors.surface_bg,
+                    theme.colors.surface.panel,
                 );
             }
             window.paint_quad(fill(row_bg_fill_bounds(prepaint.left_col), left_bg));
             window.paint_quad(fill(
                 row_bg_fill_bounds(prepaint.sep_bounds),
-                theme.colors.border,
+                theme.colors.stroke.default,
             ));
             window.paint_quad(fill(row_bg_fill_bounds(prepaint.right_col), right_bg));
 
@@ -2605,7 +2639,7 @@ pub(super) fn patch_split_column_row_canvas(
                 prepaint.bounds,
                 prepaint.annot_w,
                 bg,
-                theme.colors.surface_bg,
+                theme.colors.surface.panel,
             );
 
             if let Some(blame) = &blame {
@@ -2713,6 +2747,76 @@ pub(super) fn patch_split_column_row_canvas(
     .into_any_element()
 }
 
+/// The blame column for one row of the file editor's gutter.
+///
+/// The editor's gutter is otherwise plain divs, but blame is not a label — it
+/// has a hover highlight, a tooltip carrying the commit body, and three click
+/// targets (the message opens commit details, the two icons walk to the file at
+/// that commit and at its parent). All of that lives in [`render_blame_column`],
+/// so the gutter hands it a canvas sized to exactly the annotation column and
+/// gets the same behaviour the diff and preview have.
+///
+/// A row whose `blame.show_text` is false paints only its recency bar and
+/// installs no handlers — which is how the editor represents blame it cannot
+/// stand behind, on the interior lines of a same-commit run and over a buffer
+/// with unsaved edits.
+pub(in crate::view) fn blame_gutter_row_canvas(
+    theme: AppTheme,
+    view: Entity<MainPaneView>,
+    ui_scale_percent: u32,
+    visual_ix: usize,
+    row_height: Pixels,
+    annotation_width: Pixels,
+    annot_hover: Option<(usize, AnnotArea)>,
+    blame: Option<RowBlamePaint>,
+) -> AnyElement {
+    // Same revision key the diff rows build, for the same reason: GPUI keys
+    // element state by id, so a canvas identified by its row index alone keeps
+    // last frame's hitboxes and hover after the blame under it changes.
+    let row_hover = annot_hover.and_then(|(ix, area)| (ix == visual_ix).then_some(area));
+    let revision = mix_blame_revision(0, annotation_width, row_hover, blame.as_ref());
+    keyed_canvas(
+        (
+            gpui::ElementId::from(("file_editor_blame_row_canvas", visual_ix)),
+            format!("{revision:016x}"),
+        ),
+        move |bounds, window, _cx| {
+            build_annot_hitboxes(window, bounds, annotation_width, ui_scale_percent)
+        },
+        move |bounds, annot_hitboxes, window, cx| {
+            let line_metrics = line_metrics(window);
+            let y = center_text_y(bounds, line_metrics.line_height);
+
+            // The whole canvas *is* the annotation column, so it takes the
+            // sidebar colour the diff and preview rows give theirs — not the
+            // editor canvas, which left the strip with no edge at all.
+            window.paint_quad(fill(bounds, theme.colors.surface.panel));
+
+            if let Some(blame) = &blame {
+                let when_metrics = line_metrics_annot_when(window);
+                render_blame_column(
+                    blame,
+                    bounds,
+                    annotation_width,
+                    y,
+                    theme,
+                    line_metrics,
+                    when_metrics,
+                    ui_scale_percent,
+                    visual_ix,
+                    annot_hitboxes.as_ref(),
+                    &view,
+                    window,
+                    cx,
+                );
+            }
+        },
+    )
+    .w(annotation_width)
+    .h(row_height)
+    .into_any_element()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn worktree_preview_row_canvas(
     theme: AppTheme,
@@ -2789,8 +2893,8 @@ pub(super) fn worktree_preview_row_canvas(
                 window,
                 bounds,
                 prepaint.annot_w,
-                theme.colors.window_bg,
-                theme.colors.surface_bg,
+                theme.colors.surface.canvas,
+                theme.colors.surface.panel,
             );
             if let Some(color) = bar_color
                 && prepaint.bar_w > px(0.0)
@@ -2830,7 +2934,7 @@ pub(super) fn worktree_preview_row_canvas(
                 prepaint.inner.left() + gutter_cell_total_width(prepaint.pad, ui_scale_percent)
                     - prepaint.pad,
                 y,
-                theme.colors.text_muted,
+                theme.colors.foreground.secondary,
                 line_metrics,
                 window,
                 cx,
@@ -2851,7 +2955,7 @@ pub(super) fn worktree_preview_row_canvas(
                     offset_map.as_ref(),
                     reveal_whitespace_chars,
                     y,
-                    theme.colors.text,
+                    theme.colors.foreground.primary,
                     line_metrics,
                     ui_scale_percent,
                     true,
@@ -3424,17 +3528,17 @@ fn shaped_gutter_line(
     window: &mut Window,
 ) -> gpui::ShapedLine {
     let mut style = diff_text_style(window);
-    style.color = color.into();
+    style.color = color.into_color();
     let key = {
         let mut hasher = FxHasher::default();
         text.as_ref().hash(&mut hasher);
         metrics.font_size.hash(&mut hasher);
         style.font_family.hash(&mut hasher);
         style.font_weight.hash(&mut hasher);
-        color.r.to_bits().hash(&mut hasher);
-        color.g.to_bits().hash(&mut hasher);
-        color.b.to_bits().hash(&mut hasher);
-        color.a.to_bits().hash(&mut hasher);
+        color.red.to_bits().hash(&mut hasher);
+        color.green.to_bits().hash(&mut hasher);
+        color.blue.to_bits().hash(&mut hasher);
+        color.alpha.to_bits().hash(&mut hasher);
         hasher.finish()
     };
 
@@ -3478,7 +3582,7 @@ fn paint_selectable_diff_text(
     cx: &mut App,
 ) {
     let mut base_style = diff_text_style(window);
-    base_style.color = base_fg.into();
+    base_style.color = base_fg.into_color();
     base_style.white_space = gpui::WhiteSpace::Nowrap;
     base_style.text_overflow = None;
 
@@ -3728,10 +3832,10 @@ fn diff_layout_base_key(
     metrics.font_size.hash(&mut hasher);
     base_style.font_family.hash(&mut hasher);
     base_style.font_weight.hash(&mut hasher);
-    base_fg.r.to_bits().hash(&mut hasher);
-    base_fg.g.to_bits().hash(&mut hasher);
-    base_fg.b.to_bits().hash(&mut hasher);
-    base_fg.a.to_bits().hash(&mut hasher);
+    base_fg.red.to_bits().hash(&mut hasher);
+    base_fg.green.to_bits().hash(&mut hasher);
+    base_fg.blue.to_bits().hash(&mut hasher);
+    base_fg.alpha.to_bits().hash(&mut hasher);
     hasher.finish()
 }
 
@@ -3796,7 +3900,7 @@ mod tests {
     use super::*;
 
     fn rgba(r: f32, g: f32, b: f32) -> gpui::Rgba {
-        gpui::Rgba { r, g, b, a: 1.0 }
+        gpui::Rgba::new(r, g, b, 1.0)
     }
 
     /// `gpui` shapes a line by splitting the text at each run boundary, so a
@@ -3862,7 +3966,7 @@ mod tests {
             query_matcher: (!query.is_empty())
                 .then(|| Arc::new(DiffSearchMatcher::new(query, query_options))),
             word_ranges: Arc::from(Vec::<Range<usize>>::new()),
-            word_color: None,
+            word_kind: None,
             syntax: StreamedDiffTextSyntaxSource::None,
         }
     }

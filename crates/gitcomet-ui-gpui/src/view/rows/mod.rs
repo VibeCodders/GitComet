@@ -246,10 +246,10 @@ impl CommitFileKindTone {
     #[inline]
     pub(in crate::view) fn color(self, theme: &AppTheme) -> gpui::Rgba {
         match self {
-            Self::Success => theme.colors.success,
-            Self::Warning => theme.colors.warning,
-            Self::Danger => theme.colors.danger,
-            Self::Accent => theme.colors.accent,
+            Self::Success => theme.colors.status.success.foreground,
+            Self::Warning => theme.colors.status.warning.foreground,
+            Self::Danger => theme.colors.status.danger.foreground,
+            Self::Accent => theme.colors.accent.foreground,
         }
     }
 }
@@ -268,11 +268,19 @@ impl CommitFileKindVisuals {
     }
 }
 
+/// Indexed by `FileStatusKind as usize`, so the order here is the enum's order,
+/// not `kind_key`'s. `kind_key` is a separate, stable bucket index that callers
+/// count by (`benchmarks/repo_history.rs` reads bucket 0 as "added") and that is
+/// hashed into the presentation signature — change an entry's icon or tone
+/// freely, but never its `kind_key`.
 const COMMIT_FILE_KIND_VISUALS: [CommitFileKindVisuals; 6] = [
+    // Untracked. Commit and range file lists cannot contain one, but a linked
+    // worktree's list can, and it reads as an addition there — the same fold the
+    // status pane, the submodule change rows and the diff title already apply.
     CommitFileKindVisuals {
-        icon: "icons/question.svg",
+        icon: "icons/plus.svg",
         kind_key: 4,
-        tone: CommitFileKindTone::Warning,
+        tone: CommitFileKindTone::Success,
     },
     CommitFileKindVisuals {
         icon: "icons/pencil.svg",
@@ -359,16 +367,20 @@ mod diff_canvas;
 mod diff_text;
 mod history;
 mod history_canvas;
-mod history_graph_paint;
+pub(in crate::view) mod history_graph_paint;
 mod markdown_document;
 mod markdown_flow_text;
-mod sidebar;
+pub(in crate::view) mod sidebar;
 mod status;
 
 #[cfg(feature = "benchmarks")]
 pub(crate) mod benchmarks;
 
-pub(in crate::view) use self::conflict_resolver::resolved_output_gutter_width;
+pub(in crate::view) use self::conflict_resolver::{
+    resolved_output_gutter_width, resolved_output_line_no_width,
+};
+pub(in crate::view) use self::diff::{BlameRenderCtx, build_row_blame_paint};
+pub(in crate::view) use self::diff_canvas::blame_gutter_row_canvas;
 pub(in crate::view) use self::history::{
     MarkdownPreviewImageSource, MarkdownPreviewPictureSizes, markdown_preview_alert_bar_color,
     markdown_preview_alert_label, markdown_preview_flow_image, markdown_preview_highlighted_text,
@@ -380,24 +392,28 @@ pub(in crate::view) use self::markdown_document::{
     MarkdownDocumentBlockCache, MarkdownDocumentBlockScrolls, MarkdownDocumentContext,
     render_markdown_document,
 };
-pub(in crate::view) use self::markdown_flow_text::markdown_flow_row_offset;
 #[cfg(test)]
 pub(in crate::view) use self::markdown_flow_text::{
     clear_markdown_selection_paint_log_for_tests, markdown_selection_paint_log_for_tests,
 };
+pub(in crate::view) use self::markdown_flow_text::{
+    markdown_flow_painted_offset, markdown_flow_row_offset,
+};
 pub(in crate::view) use self::sidebar::active_workspace_paths_by_branch;
 pub(in crate::view) use self::sidebar::listed_workspace_paths_by_branch;
 
+#[cfg(any(test, feature = "benchmarks"))]
+pub(in crate::view) use diff_text::has_pending_prepared_diff_syntax_chunk_builds_for_document;
 pub(in crate::view) use diff_text::{
     BackgroundPreparedDiffSyntaxDocument, DiffSyntaxBudget, DiffSyntaxEdit, DiffSyntaxLanguage,
-    DiffSyntaxMode, PREPARED_DIFF_SYNTAX_DOCUMENT_MAX_TEXT_BYTES, PrepareDiffSyntaxDocumentResult,
+    DiffSyntaxMode, LiveSyntaxDocument, LiveSyntaxSnapshot, LiveSyntaxSyncOutcome,
+    PREPARED_DIFF_SYNTAX_DOCUMENT_MAX_TEXT_BYTES, PrepareDiffSyntaxDocumentResult,
     PreparedDiffSyntaxDocument, PreparedDiffSyntaxLine, PreparedDiffSyntaxReparseSeed,
     diff_syntax_language_for_code_fence_info, diff_syntax_language_for_path,
     diff_wrap_ranges_for_text, drain_completed_prepared_diff_syntax_chunk_builds,
     drain_completed_prepared_diff_syntax_chunk_builds_for_document,
-    has_pending_prepared_diff_syntax_chunk_builds,
-    has_pending_prepared_diff_syntax_chunk_builds_for_document,
-    inject_background_prepared_diff_syntax_document,
+    has_pending_prepared_diff_syntax_chunk_builds, inject_background_prepared_diff_syntax_document,
+    live_syntax_document_supported, live_syntax_reparse,
     prepare_diff_syntax_document_in_background_text_with_reuse,
     prepare_diff_syntax_document_with_budget_reuse_text,
     prepared_diff_syntax_line_for_inline_diff_row, prepared_diff_syntax_line_for_one_based_line,
@@ -639,6 +655,88 @@ mod tests {
         assert_eq!(
             replacement[0].visuals,
             commit_file_kind_visuals(FileStatusKind::Renamed)
+        );
+    }
+
+    /// A linked worktree's file list contains untracked files, which commit and
+    /// range lists never do. The table slot for them used to hold a
+    /// "shouldn't happen" question mark, which is what those rows rendered.
+    #[test]
+    fn untracked_files_read_as_additions() {
+        let untracked = commit_file_kind_visuals(FileStatusKind::Untracked);
+        assert_eq!(untracked.icon, "icons/plus.svg");
+        assert_eq!(
+            untracked.icon,
+            commit_file_kind_visuals(FileStatusKind::Added).icon,
+            "an untracked file reads as an addition, as it does everywhere else"
+        );
+    }
+
+    /// `kind_key` is a separate ordering from the table's own: callers count into
+    /// buckets by it (`benchmarks/repo_history.rs` reads bucket 0 as "added") and
+    /// it is hashed into the row signature. Retoning an entry must never move it.
+    #[test]
+    fn kind_keys_are_stable_buckets() {
+        assert_eq!(commit_file_kind_visuals(FileStatusKind::Added).kind_key, 0);
+        assert_eq!(
+            commit_file_kind_visuals(FileStatusKind::Modified).kind_key,
+            1
+        );
+        assert_eq!(
+            commit_file_kind_visuals(FileStatusKind::Deleted).kind_key,
+            2
+        );
+        assert_eq!(
+            commit_file_kind_visuals(FileStatusKind::Renamed).kind_key,
+            3
+        );
+        assert_eq!(
+            commit_file_kind_visuals(FileStatusKind::Untracked).kind_key,
+            4
+        );
+        assert_eq!(
+            commit_file_kind_visuals(FileStatusKind::Conflicted).kind_key,
+            5
+        );
+    }
+
+    /// `rows_for` returns cached rows when the *key* matches, without looking at
+    /// the files. The worktree list keys on the scan revision, which does not
+    /// move when a different worktree is selected, so the key has to carry the
+    /// worktree too — otherwise one worktree shows another's files.
+    #[test]
+    fn a_key_that_does_not_move_with_the_selection_serves_stale_rows() {
+        let mut cache: CommitFileRowPresentationCache<(u64, std::path::PathBuf)> =
+            CommitFileRowPresentationCache::default();
+
+        let first = cache.rows_for(
+            &(1, PathBuf::from("/wt/a")),
+            &[CommitFileChange {
+                path: PathBuf::from("a.rs"),
+                kind: FileStatusKind::Modified,
+                is_submodule: false,
+                additions: None,
+                deletions: None,
+            }],
+        );
+        assert_eq!(first[0].label.as_ref(), "a.rs");
+
+        // Same revision, different worktree: the path in the key is what keeps
+        // these apart.
+        let second = cache.rows_for(
+            &(1, PathBuf::from("/wt/b")),
+            &[CommitFileChange {
+                path: PathBuf::from("b.rs"),
+                kind: FileStatusKind::Modified,
+                is_submodule: false,
+                additions: None,
+                deletions: None,
+            }],
+        );
+        assert_eq!(
+            second[0].label.as_ref(),
+            "b.rs",
+            "a second worktree must not be served the first one's rows"
         );
     }
 

@@ -6,7 +6,7 @@ use super::util::{
     start_current_conflict_target_reload,
 };
 use crate::model::{
-    AppState, ConflictFileLoadMode, DiagnosticKind, InlineSubmoduleDiffEntry,
+    AppState, ConflictFileLoadMode, DiagnosticKind, FileEditReturnView, InlineSubmoduleDiffEntry,
     InlineSubmoduleDiffSection, InlineSubmoduleDiffState, Loadable, RepoId, RepoState,
     ViewHistoryEntry,
 };
@@ -172,13 +172,34 @@ fn push_inline_submodule_diff_load_effects(
     }
 }
 
+/// What the main content pane shows for a freshly selected target. Passed
+/// through every selection path so no route can leave the two view flags on
+/// `DiffState` disagreeing — in particular so a plain diff selection always
+/// leaves edit mode behind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ContentViewMode {
+    /// A diff of the target (or the conflict resolver, when it is conflicted).
+    Diff,
+    /// The whole file, syntax highlighted, read-only.
+    Preview,
+    /// The whole file, editable. Only reachable for `WorkingTree` targets.
+    Edit,
+}
+
+impl ContentViewMode {
+    /// Both file-content modes render the file rather than a patch.
+    fn is_content_view(self) -> bool {
+        matches!(self, Self::Preview | Self::Edit)
+    }
+}
+
 pub(super) fn select_diff(
     state: &mut AppState,
     repo_id: RepoId,
     target: DiffTarget,
 ) -> Vec<Effect> {
     let mut effects = SelectDiffEffects::new();
-    fill_select_diff_inline(state, repo_id, target, false, &mut effects);
+    fill_select_diff_inline(state, repo_id, target, ContentViewMode::Diff, &mut effects);
     effects.into_vec()
 }
 
@@ -199,7 +220,106 @@ pub(super) fn open_file_content(
             .record(ViewHistoryEntry { source, path });
     }
     let mut effects = SelectDiffEffects::new();
-    fill_select_diff_inline(state, repo_id, target, true, &mut effects);
+    fill_select_diff_inline(
+        state,
+        repo_id,
+        target,
+        ContentViewMode::Preview,
+        &mut effects,
+    );
+    effects.into_vec()
+}
+
+/// Open `path` as an editable buffer over the file on disk.
+///
+/// `source` only decides which file-version history entry is recorded — the
+/// target is always the working tree, because the editor edits the workspace
+/// copy even when the action was invoked from a commit's file list. Returns no
+/// effects for sources that have no working-tree file.
+pub(super) fn open_file_editor(
+    state: &mut AppState,
+    repo_id: RepoId,
+    path: std::path::PathBuf,
+) -> Vec<Effect> {
+    let return_view = state
+        .repos
+        .iter()
+        .find(|repo| repo.id == repo_id)
+        .and_then(|repo| {
+            if repo.diff_state.edit_mode {
+                return repo.diff_state.edit_return_view.clone();
+            }
+            repo.diff_state
+                .diff_target
+                .clone()
+                .map(|target| FileEditReturnView {
+                    target,
+                    content_preview: repo.diff_state.content_preview,
+                })
+        });
+    let target = DiffTarget::WorkingTree {
+        path: path.clone(),
+        area: DiffArea::Unstaged,
+    };
+    if let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) {
+        repo_state.view_history.record(ViewHistoryEntry {
+            source: gitcomet_core::domain::FileSource::WorkingDirectory,
+            path,
+        });
+    }
+    let mut effects = SelectDiffEffects::new();
+    fill_select_diff_inline(state, repo_id, target, ContentViewMode::Edit, &mut effects);
+    if let Some(repo_state) = state.repos.iter_mut().find(|repo| repo.id == repo_id) {
+        repo_state.diff_state.edit_return_view = return_view;
+    }
+    effects.into_vec()
+}
+
+/// Leave the editor and reload the view that was behind it.
+///
+/// Restores the diff or read-only content preview that opened the editor. When
+/// there is no recorded origin (for example a restored legacy session), it
+/// falls back to the read-only working-tree preview of the edited file.
+pub(super) fn exit_diff_edit_mode(state: &mut AppState, repo_id: RepoId) -> Vec<Effect> {
+    let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) else {
+        return Vec::new();
+    };
+    if !repo_state.diff_state.edit_mode {
+        return Vec::new();
+    }
+    let return_view = repo_state.diff_state.edit_return_view.take();
+    let fallback_target = repo_state.diff_state.diff_target.clone();
+
+    let (target, mode) = match return_view {
+        Some(return_view) => (
+            Some(return_view.target),
+            if return_view.content_preview {
+                ContentViewMode::Preview
+            } else {
+                ContentViewMode::Diff
+            },
+        ),
+        None => (fallback_target, ContentViewMode::Preview),
+    };
+    let Some(target) = target else {
+        let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) else {
+            return Vec::new();
+        };
+        repo_state.diff_state.edit_mode = false;
+        repo_state.diff_state.content_preview = true;
+        repo_state.bump_diff_state_rev();
+        return Vec::new();
+    };
+
+    if mode == ContentViewMode::Preview
+        && let Some(entry) = view_history_entry_for_target(&target)
+        && let Some(repo_state) = state.repos.iter_mut().find(|repo| repo.id == repo_id)
+    {
+        repo_state.view_history.seek_or_record(entry);
+    }
+
+    let mut effects = SelectDiffEffects::new();
+    fill_select_diff_inline(state, repo_id, target, mode, &mut effects);
     effects.into_vec()
 }
 
@@ -267,7 +387,13 @@ pub(super) fn viewer_nav(
         return Vec::new();
     };
     let mut effects = SelectDiffEffects::new();
-    fill_select_diff_inline(state, repo_id, target, true, &mut effects);
+    fill_select_diff_inline(
+        state,
+        repo_id,
+        target,
+        ContentViewMode::Preview,
+        &mut effects,
+    );
     effects.into_vec()
 }
 
@@ -327,6 +453,25 @@ pub(super) fn global_nav(
         }
     }
 
+    // Restore (or clear) a linked-worktree row selection. It is mutually
+    // exclusive with the commit selection -- each setter clears the other -- so
+    // it runs after the commit restore and only has the last word when the
+    // snapshot actually named a worktree.
+    {
+        let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) else {
+            return effects;
+        };
+        if repo_state.history_state.worktree_selection != snapshot.worktree_selection {
+            repo_state.set_worktree_selection(snapshot.worktree_selection.clone());
+            if snapshot.worktree_selection.is_some() {
+                repo_state.set_commit_details(Loadable::NotLoaded);
+                // Only the selected worktree's changed files are carried in
+                // state, so the restored row needs a scan to fetch its own.
+                effects.extend(super::effects::request_worktree_dirty_effect(repo_state));
+            }
+        }
+    }
+
     // Restore the two-point comparison. This has to run before the diff-target
     // restore below: entering a comparison clears the diff pane, so doing it
     // afterwards would wipe the very target this step is meant to show.
@@ -374,13 +519,17 @@ pub(super) fn global_nav(
                 repo_state.view_history.seek_or_record(entry);
             }
             let mut inline = SelectDiffEffects::new();
-            fill_select_diff_inline(
-                state,
-                repo_id,
-                target,
-                snapshot.content_preview,
-                &mut inline,
-            );
+            // Edit mode is part of the destination, so a step can land in the
+            // editor and a step away can leave it. `edit_mode` is only ever set
+            // together with `content_preview`, so it is checked first.
+            let mode = if snapshot.edit_mode {
+                ContentViewMode::Edit
+            } else if snapshot.content_preview {
+                ContentViewMode::Preview
+            } else {
+                ContentViewMode::Diff
+            };
+            fill_select_diff_inline(state, repo_id, target, mode, &mut inline);
             effects.extend(inline.into_vec());
         }
         None => {
@@ -395,15 +544,20 @@ pub(super) fn fill_select_diff_inline(
     state: &mut AppState,
     repo_id: RepoId,
     target: DiffTarget,
-    content_preview: bool,
+    mode: ContentViewMode,
     effects: &mut SelectDiffEffects,
 ) {
     let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) else {
         return;
     };
 
+    let content_preview = mode.is_content_view();
     clear_inline_submodule_diff_state(repo_state);
     repo_state.diff_state.content_preview = content_preview;
+    repo_state.diff_state.edit_mode = mode == ContentViewMode::Edit;
+    if mode != ContentViewMode::Edit {
+        repo_state.diff_state.edit_return_view = None;
+    }
 
     if !content_preview && let Some(conflict_target) = selected_conflict_target(repo_state, &target)
     {
@@ -456,6 +610,8 @@ pub(super) fn select_conflict_diff(
 
     clear_inline_submodule_diff_state(repo_state);
     repo_state.diff_state.content_preview = false;
+    repo_state.diff_state.edit_mode = false;
+    repo_state.diff_state.edit_return_view = None;
 
     let target = DiffTarget::WorkingTree {
         path: path.clone(),
@@ -479,6 +635,8 @@ pub(super) fn clear_diff_selection(state: &mut AppState, repo_id: RepoId) -> Vec
 
     clear_inline_submodule_diff_state(repo_state);
     repo_state.diff_state.content_preview = false;
+    repo_state.diff_state.edit_mode = false;
+    repo_state.diff_state.edit_return_view = None;
 
     repo_state.set_diff_target(None);
     repo_state.diff_state.diff = Loadable::NotLoaded;
@@ -493,6 +651,7 @@ pub(super) fn clear_diff_selection(state: &mut AppState, repo_id: RepoId) -> Vec
 pub(super) fn open_inline_submodule_diff(
     state: &mut AppState,
     repo_id: RepoId,
+    origin: crate::model::ForeignDiffOrigin,
     submodule_repo_path: std::path::PathBuf,
     parent_submodule_path: std::path::PathBuf,
     entries: Vec<InlineSubmoduleDiffEntry>,
@@ -509,6 +668,7 @@ pub(super) fn open_inline_submodule_diff(
     let load_plan = inline_submodule_selected_diff_load_plan(&target);
     let rev = next_inline_submodule_diff_rev(repo_state);
     repo_state.diff_state.inline_submodule_diff = Some(InlineSubmoduleDiffState {
+        origin,
         submodule_repo_path,
         parent_submodule_path,
         entries,
@@ -576,6 +736,40 @@ pub(super) fn select_inline_submodule_diff(
         next_load_plan
     };
     repo_state.bump_diff_state_rev();
+
+    let mut effects = SelectDiffEffects::new();
+    push_inline_submodule_diff_load_effects(repo_id, inline_rev, load_plan, &mut effects);
+    effects.into_vec()
+}
+
+/// Re-issues the loads for the inline diff already on screen, without moving the
+/// selection.
+///
+/// `select_inline_submodule_diff` is a no-op once its target is selected, which
+/// is right for a click and wrong for a rescan: a linked worktree's file can
+/// change contents without changing which entry it is, and no other trigger
+/// invalidates that patch -- the filesystem watcher covers the repo the user has
+/// open, not the other worktrees.
+///
+/// The load-plan state is deliberately left alone. Resetting `diff` to `Loading`
+/// would flash the pane empty on every scan; the reply is gated on `inline.rev`,
+/// so bumping it is enough to make the in-flight load stale and let the new one
+/// replace the contents when it lands.
+pub(super) fn refresh_inline_submodule_selected_diff(
+    state: &mut AppState,
+    repo_id: RepoId,
+) -> Vec<Effect> {
+    let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) else {
+        return Vec::new();
+    };
+    let inline_rev = next_inline_submodule_diff_rev(repo_state);
+    let load_plan = {
+        let Some(inline) = repo_state.diff_state.inline_submodule_diff.as_mut() else {
+            return Vec::new();
+        };
+        inline.rev = inline_rev;
+        inline_submodule_selected_diff_load_plan(&inline.target)
+    };
 
     let mut effects = SelectDiffEffects::new();
     push_inline_submodule_diff_load_effects(repo_id, inline_rev, load_plan, &mut effects);

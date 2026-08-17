@@ -6,9 +6,7 @@
 
 use super::*;
 
-/// Blank rows appended below the last line of the source diff lists so the
-/// tail of the file can be scrolled up into a comfortable reading position.
-pub(super) const CONFLICT_BOTTOM_OVERSCROLL_ROWS: usize = 10;
+pub(super) use conflict_resolver::CONFLICT_BOTTOM_OVERSCROLL_ROWS;
 
 fn conflict_output_wheel_requires_notify(delta_y: Pixels, horizontal_changed: bool) -> bool {
     delta_y != px(0.0) || horizontal_changed
@@ -69,9 +67,9 @@ impl MainPaneView {
                 div()
                     .text_xs()
                     .text_color(if unresolved_count == 0 {
-                        theme.colors.success
+                        theme.colors.status.success.foreground
                     } else {
-                        theme.colors.text_muted
+                        theme.colors.foreground.secondary
                     })
                     .child(format!("Resolved {resolved_count}/{conflict_count}")),
             );
@@ -79,7 +77,7 @@ impl MainPaneView {
                 controls = controls.child(
                     div()
                         .text_xs()
-                        .text_color(theme.colors.danger)
+                        .text_color(theme.colors.status.danger.foreground)
                         .child(format!("{unresolved_count} unresolved")),
                 );
             }
@@ -101,19 +99,14 @@ impl MainPaneView {
         theme: AppTheme,
         cx: &mut gpui::Context<Self>,
     ) -> gpui::Div {
+        let active_pick_state = self.conflict_resolver_active_pick_state();
         controls = controls
             .when_some(prev_file_btn, |d, btn| d.child(btn))
             .when(!conflict_rendered_preview_active, |d| {
-                let nav_entries = self.conflict_nav_entries();
-                let current_nav_ix = self.conflict_resolver.nav_anchor.unwrap_or(0);
-                let can_nav_prev =
-                    diff_navigation::diff_nav_prev_target(&nav_entries, current_nav_ix).is_some();
-                let can_nav_next =
-                    diff_navigation::diff_nav_next_target(&nav_entries, current_nav_ix).is_some();
-                let conflict_count = self.conflict_resolver_conflict_count();
-                let active_conflict = self.conflict_resolver.active_conflict;
-                let can_jump_first = conflict_count > 0 && active_conflict > 0;
-                let can_jump_last = conflict_count > 0 && active_conflict + 1 < conflict_count;
+                let can_nav_prev = self.conflict_has_prev();
+                let can_nav_next = self.conflict_has_next();
+                let can_jump_first = self.conflict_has_prev_delta();
+                let can_jump_last = self.conflict_has_next_delta();
                 let can_prev_unresolved = self.conflict_has_prev_unresolved();
                 let can_next_unresolved = self.conflict_has_next_unresolved();
 
@@ -121,7 +114,7 @@ impl MainPaneView {
                     components::Button::new("conflict_first", "")
                         .start_slot(svg_icon(
                             "icons/arrow_up_to_line.svg",
-                            theme.colors.text,
+                            theme.colors.foreground.primary,
                             px(14.0),
                         ))
                         .style(components::ButtonStyle::Outlined)
@@ -134,7 +127,11 @@ impl MainPaneView {
                 )
                 .child(
                     components::Button::new("conflict_prev", "")
-                        .start_slot(svg_icon("icons/arrow_up.svg", theme.colors.text, px(14.0)))
+                        .start_slot(svg_icon(
+                            "icons/arrow_up.svg",
+                            theme.colors.foreground.primary,
+                            px(14.0),
+                        ))
                         .style(components::ButtonStyle::Outlined)
                         .borderless()
                         .disabled(!can_nav_prev)
@@ -155,7 +152,7 @@ impl MainPaneView {
                     components::Button::new("conflict_next", "")
                         .start_slot(svg_icon(
                             "icons/arrow_down.svg",
-                            theme.colors.text,
+                            theme.colors.foreground.primary,
                             px(14.0),
                         ))
                         .style(components::ButtonStyle::Outlined)
@@ -178,7 +175,7 @@ impl MainPaneView {
                     components::Button::new("conflict_last", "")
                         .start_slot(svg_icon(
                             "icons/arrow_down_to_line.svg",
-                            theme.colors.text,
+                            theme.colors.foreground.primary,
                             px(14.0),
                         ))
                         .style(components::ButtonStyle::Outlined)
@@ -193,7 +190,7 @@ impl MainPaneView {
                     components::Button::new("conflict_prev_unresolved", "")
                         .start_slot(svg_icon(
                             "icons/arrow_up.svg",
-                            theme.colors.warning,
+                            theme.colors.status.warning.foreground,
                             px(14.0),
                         ))
                         .style(components::ButtonStyle::Outlined)
@@ -202,13 +199,13 @@ impl MainPaneView {
                         .on_click(theme, cx, |this, _e, _w, cx| {
                             this.conflict_jump_prev_unresolved(cx);
                         })
-                        .gitcomet_tooltip(theme, "Previous unresolved conflict (Ctrl+PgUp)".into()),
+                        .gitcomet_tooltip(theme, "Previous unresolved conflict (Shift+F2)".into()),
                 )
                 .child(
                     components::Button::new("conflict_next_unresolved", "")
                         .start_slot(svg_icon(
                             "icons/arrow_down.svg",
-                            theme.colors.warning,
+                            theme.colors.status.warning.foreground,
                             px(14.0),
                         ))
                         .style(components::ButtonStyle::Outlined)
@@ -217,25 +214,21 @@ impl MainPaneView {
                         .on_click(theme, cx, |this, _e, _w, cx| {
                             this.conflict_jump_next_unresolved(cx);
                         })
-                        .gitcomet_tooltip(theme, "Next unresolved conflict (Ctrl+PgDn)".into()),
+                        .gitcomet_tooltip(theme, "Next unresolved conflict (Shift+F3)".into()),
                 )
             })
             .when(
-                !conflict_rendered_preview_active && self.conflict_resolver_conflict_count() > 0,
+                !conflict_rendered_preview_active && active_pick_state.is_some(),
                 |d| {
-                    // section 30: visible pick affordances for the active conflict,
-                    // mirroring the A/B/C/D quick-pick keys.
-                    let active_ix = self.conflict_resolver.active_conflict;
-                    let has_base = self
-                        .conflict_resolver
-                        .conflict_has_base
-                        .get(active_ix)
-                        .copied()
-                        .unwrap_or(false);
-                    let selected =
-                        self.conflict_resolver_selected_choices_for_conflict_ix(active_ix);
+                    // Pick affordances follow the semantic current delta, not
+                    // just visible marker blocks. This keeps an automatically
+                    // selected plan block overridable after delta navigation.
+                    let (has_base, selected) = active_pick_state
+                        .clone()
+                        .expect("pick controls require an active semantic delta");
                     let is_three_way =
                         self.conflict_resolver.view_mode == ConflictResolverViewMode::ThreeWay;
+                    let output_actions_enabled = !self.conflict_resolver.output_is_protected;
                     let mut pick_btn =
                         |id: &'static str,
                          label: &'static str,
@@ -253,7 +246,8 @@ impl MainPaneView {
                                 })
                                 .gitcomet_tooltip(theme, tooltip.into())
                         };
-                    let cluster = d.child(div().w(px(1.0)).h(px(12.0)).bg(theme.colors.border));
+                    let cluster =
+                        d.child(div().w(px(1.0)).h(px(12.0)).bg(theme.colors.stroke.default));
                     if is_three_way {
                         cluster
                             .child(pick_btn(
@@ -261,7 +255,7 @@ impl MainPaneView {
                                 "Base",
                                 "A",
                                 conflict_resolver::ConflictChoice::Base,
-                                has_base,
+                                has_base && output_actions_enabled,
                                 "Pick the base (ancestor) version for the active conflict \
                                  (A or Ctrl+1; U un-resolves)",
                             ))
@@ -270,7 +264,7 @@ impl MainPaneView {
                                 "Ours",
                                 "B",
                                 conflict_resolver::ConflictChoice::Ours,
-                                true,
+                                output_actions_enabled,
                                 "Pick the local (ours) version for the active conflict \
                                  (B or Ctrl+2; U un-resolves)",
                             ))
@@ -279,7 +273,7 @@ impl MainPaneView {
                                 "Theirs",
                                 "C",
                                 conflict_resolver::ConflictChoice::Theirs,
-                                true,
+                                output_actions_enabled,
                                 "Pick the incoming (theirs) version for the active conflict \
                                  (C or Ctrl+3; U un-resolves)",
                             ))
@@ -288,7 +282,7 @@ impl MainPaneView {
                                 "Both",
                                 "D",
                                 conflict_resolver::ConflictChoice::Both,
-                                true,
+                                output_actions_enabled,
                                 "Keep both versions (ours, then theirs) for the active conflict \
                                  (D; U un-resolves)",
                             ))
@@ -299,7 +293,7 @@ impl MainPaneView {
                                 "Local",
                                 "A",
                                 conflict_resolver::ConflictChoice::Ours,
-                                true,
+                                output_actions_enabled,
                                 "Pick the local (ours) version for the active conflict \
                                  (A or Ctrl+1; U un-resolves)",
                             ))
@@ -308,7 +302,7 @@ impl MainPaneView {
                                 "Remote",
                                 "B",
                                 conflict_resolver::ConflictChoice::Theirs,
-                                true,
+                                output_actions_enabled,
                                 "Pick the incoming (theirs) version for the active conflict \
                                  (B or Ctrl+2; U un-resolves)",
                             ))
@@ -317,7 +311,7 @@ impl MainPaneView {
                                 "Both",
                                 "C",
                                 conflict_resolver::ConflictChoice::Both,
-                                true,
+                                output_actions_enabled,
                                 "Keep both versions (ours, then theirs) for the active conflict \
                                  (C or Ctrl+3; U un-resolves)",
                             ))
@@ -338,53 +332,77 @@ impl MainPaneView {
             };
             let save_path = path.clone();
             let stage_path = path.clone();
+            let gate_unresolved = if self.conflict_resolver.output_is_protected {
+                self.conflict_resolver_input.read_with(cx, |input, _| {
+                    usize::from(conflict_resolver::text_contains_conflict_markers(
+                        input.text(),
+                    ))
+                })
+            } else if self.conflict_resolved_output_is_streamed() {
+                unresolved
+            } else {
+                self.conflict_resolver_input.read_with(cx, |input, _| {
+                    conflict_resolver::conflict_stage_safety_check(
+                        input.text(),
+                        &self.conflict_resolver.marker_segments,
+                        &self.conflict_resolved_output_block_map,
+                    )
+                    .unresolved_blocks
+                })
+            };
+            let save_button = components::Button::new("conflict_save", save_label)
+                .style(components::ButtonStyle::Outlined)
+                .disabled(gate_unresolved > 0)
+                .on_click(theme, cx, move |this, _e, _w, cx| {
+                    let text = this.current_conflict_resolved_output_text(cx);
+                    let blocks_save = if this.conflict_resolver.output_is_protected {
+                        conflict_resolver::text_contains_conflict_markers(&text)
+                    } else {
+                        conflict_resolver::conflict_stage_safety_check(
+                            &text,
+                            &this.conflict_resolver.marker_segments,
+                            &this.conflict_resolved_output_block_map,
+                        )
+                        .blocks_save()
+                    };
+                    if blocks_save {
+                        cx.notify();
+                        return;
+                    }
+                    if this.view_mode == GitCometViewMode::FocusedMergetool {
+                        this.focused_mergetool_save_and_exit(repo_id, save_path.clone(), cx);
+                        return;
+                    }
+                    let text = this.conflict_resolver_save_contents_from_text(text);
+                    this.store.dispatch(Msg::SaveWorktreeFile {
+                        repo_id,
+                        path: save_path.clone(),
+                        contents: text,
+                        stage: false,
+                    });
+                });
             controls = controls
-                .child(div().w(px(1.0)).h(px(12.0)).bg(theme.colors.border))
-                .child(
-                    components::Button::new("conflict_save", save_label)
-                        .style(components::ButtonStyle::Outlined)
-                        .on_click(theme, cx, move |this, _e, _w, cx| {
-                            if this.view_mode == GitCometViewMode::FocusedMergetool {
-                                this.focused_mergetool_save_and_exit(
-                                    repo_id,
-                                    save_path.clone(),
-                                    cx,
-                                );
-                                return;
-                            }
-                            let text = this.conflict_resolver_save_contents(cx);
-                            this.store.dispatch(Msg::SaveWorktreeFile {
-                                repo_id,
-                                path: save_path.clone(),
-                                contents: text,
-                                stage: false,
-                            });
-                        }),
-                )
+                .child(div().w(px(1.0)).h(px(12.0)).bg(theme.colors.stroke.default))
+                .child(save_button)
                 .when(show_conflict_save_stage_action(self.view_mode), |d| {
-                    let gate_unresolved = unresolved;
                     let mut save_stage_btn =
                         components::Button::new("conflict_save_stage", "Save & stage")
                             .style(components::ButtonStyle::Filled)
                             .disabled(gate_unresolved > 0)
-                            .on_click(theme, cx, move |this, e, window, cx| {
+                            .on_click(theme, cx, move |this, _e, _window, cx| {
                                 let text = this.current_conflict_resolved_output_text(cx);
-                                let stage_safety = conflict_resolver::conflict_stage_safety_check(
-                                    &text,
-                                    &this.conflict_resolver.marker_segments,
-                                );
-                                if stage_safety.requires_confirmation() {
-                                    this.open_popover_at(
-                                        PopoverKind::ConflictSaveStageConfirm {
-                                            repo_id,
-                                            path: stage_path.clone(),
-                                            has_conflict_markers: stage_safety.has_conflict_markers,
-                                            unresolved_blocks: stage_safety.unresolved_blocks,
-                                        },
-                                        e.position(),
-                                        window,
-                                        cx,
-                                    );
+                                let blocks_stage = if this.conflict_resolver.output_is_protected {
+                                    conflict_resolver::text_contains_conflict_markers(&text)
+                                } else {
+                                    conflict_resolver::conflict_stage_safety_check(
+                                        &text,
+                                        &this.conflict_resolver.marker_segments,
+                                        &this.conflict_resolved_output_block_map,
+                                    )
+                                    .blocks_save()
+                                };
+                                if blocks_stage {
+                                    cx.notify();
                                 } else {
                                     let text = this.conflict_resolver_save_contents_from_text(text);
                                     this.store.dispatch(Msg::SaveWorktreeFile {
@@ -423,10 +441,18 @@ impl MainPaneView {
         can_reset_from_markers: bool,
         cx: &mut gpui::Context<Self>,
     ) -> impl gpui::IntoElement {
-        let total = self.conflict_resolver_conflict_count();
-        let resolved = self.conflict_resolver_resolved_count();
-        let unresolved = total.saturating_sub(resolved);
-        let auto_solved = self.conflict_resolver_auto_resolved_count().min(total);
+        let counts = self.conflict_resolver_summary_counts().unwrap_or_else(|| {
+            let total = self.conflict_resolver_conflict_count();
+            let resolved = self.conflict_resolver_resolved_count().min(total);
+            conflict_resolver::ConflictSummaryCounts {
+                total,
+                auto_solved: self.conflict_resolver_auto_resolved_count().min(resolved),
+                unsolved: total.saturating_sub(resolved),
+                whitespace_conflicts: None,
+            }
+        });
+        let total = counts.total;
+        let unresolved = counts.unsolved.min(total);
 
         // The footer only needs the marker-presence bit. Scan the editor text
         // in place (`text()` borrows a `&str`) instead of cloning the whole
@@ -437,18 +463,13 @@ impl MainPaneView {
                 conflict_resolver::text_contains_conflict_markers(i.text())
             });
 
-        let progress_label = (total > 0).then(|| {
-            let mut label = format!("{resolved}/{total} resolved");
-            if auto_solved > 0 {
-                label.push_str(&format!(" · {auto_solved} auto-solved"));
-            }
-            SharedString::from(label)
-        });
+        let progress_label = (total > 0)
+            .then(|| SharedString::from(conflict_resolver::format_conflict_summary(counts)));
 
         let status: AnyElement = if total == 0 {
             div()
                 .text_xs()
-                .text_color(theme.colors.text_muted)
+                .text_color(theme.colors.foreground.secondary)
                 .child("No conflicts in this file")
                 .into_any_element()
         } else if unresolved > 0 {
@@ -460,7 +481,7 @@ impl MainPaneView {
             div()
                 .id("conflict_resolver_status")
                 .text_xs()
-                .text_color(theme.colors.warning)
+                .text_color(theme.colors.status.warning.foreground)
                 .child(format!("⚠ {unresolved} {noun} unresolved"))
                 .gitcomet_tooltip(
                     theme,
@@ -473,7 +494,7 @@ impl MainPaneView {
             div()
                 .id("conflict_resolver_status")
                 .text_xs()
-                .text_color(theme.colors.success)
+                .text_color(theme.colors.status.success.foreground)
                 .child("✓ All conflicts resolved")
                 .gitcomet_tooltip(
                     theme,
@@ -498,17 +519,37 @@ impl MainPaneView {
                     .gap_2()
                     .pl_1()
                     .child(status)
+                    // KDiff3 qualifies its unsolved count with the whitespace
+                    // subset ("of which M are whitespace"); with none left there
+                    // is no subset to name, so the chip goes away rather than
+                    // reading "0 whitespace conflicts" for the rest of the merge.
+                    .when_some(
+                        counts.whitespace_conflicts.filter(|count| *count > 0),
+                        |d, whitespace| {
+                            let noun = if whitespace == 1 {
+                                "whitespace conflict"
+                            } else {
+                                "whitespace conflicts"
+                            };
+                            d.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.colors.foreground.secondary)
+                                    .child(format!("{whitespace} {noun}")),
+                            )
+                        },
+                    )
                     .when(has_conflict_markers, |d| {
                         d.child(
                             div()
                                 .text_xs()
-                                .text_color(theme.colors.danger)
+                                .text_color(theme.colors.status.danger.foreground)
                                 .child("markers remain"),
                         )
                     }),
             )
             .child(
-                components::Button::new("conflict_reset_markers", "Reset from markers")
+                components::Button::new("conflict_reset_markers", "Reset conflict markers")
                     .style(components::ButtonStyle::Transparent)
                     .disabled(!can_reset_from_markers)
                     .on_click(theme, cx, |this, _e, _w, cx| {
@@ -528,6 +569,8 @@ impl MainPaneView {
         editor_font_family: String,
         cx: &mut gpui::Context<Self>,
     ) -> AnyElement {
+        let _perf_scope =
+            crate::view::perf::span(crate::view::perf::ViewPerfSpan::RenderConflictResolverPane);
         let repo = self.active_repo();
         match (repo, conflict_target_path) {
             (None, _) => {
@@ -618,6 +661,7 @@ impl MainPaneView {
                                 .conflict_state.conflict_session
                                 .as_ref()
                                 .and_then(|session| {
+                                    let active_conflict = active_conflict?;
                                     conflict_resolver::active_conflict_autosolve_trace_label(
                                         session,
                                         &self.conflict_resolver.conflict_region_indices,
@@ -644,7 +688,7 @@ impl MainPaneView {
                                         d = d.child(
                                             div()
                                                 .text_xs()
-                                                .text_color(theme.colors.accent)
+                                                .text_color(theme.colors.accent.foreground)
                                                 .child(label.clone()),
                                         );
                                     }
@@ -681,10 +725,19 @@ impl MainPaneView {
                                 show_preview_toggle
                                     && preview_mode == ConflictResolverPreviewMode::Preview;
 
+                            // kdiff3's minimap column sits left of the inputs
+                            // and takes its width out of their budget.
+                            let minimap_w = if !is_rendered_preview_active
+                                && self.conflict_resolver.has_minimap()
+                            {
+                                px(components::MINIMAP_COLUMN_WIDTH_PX)
+                            } else {
+                                px(0.0)
+                            };
                             let preview_toggle = show_preview_toggle.then(|| {
-                                let view_toggle_border = theme.colors.border;
-                                let view_toggle_selected_bg = theme.colors.active;
-                                let view_toggle_divider = theme.colors.border;
+                                let view_toggle_border = theme.colors.stroke.default;
+                                let view_toggle_selected_bg = theme.colors.interaction.pressed_background;
+                                let view_toggle_divider = theme.colors.stroke.default;
                                 div()
                                     .id("conflict_preview_toggle")
                                     .flex()
@@ -734,7 +787,12 @@ impl MainPaneView {
                             });
 
                             let top_header = preview_toggle.map(|toggle| {
-                                div().flex().items_center().justify_end().child(toggle)
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_end()
+                                    .gap_2()
+                                    .child(toggle)
                             });
 
                             // Compute three-way column widths
@@ -750,8 +808,10 @@ impl MainPaneView {
                             };
                             let handle_w = px(PANE_RESIZE_HANDLE_PX);
                             let min_col_w = px(DIFF_SPLIT_COL_MIN_PX);
-                            let main_w =
-                                (self.main_pane_content_width(cx) - scrollbar_gutter).max(px(0.0));
+                            let main_w = (self.main_pane_content_width(cx)
+                                - scrollbar_gutter
+                                - minimap_w)
+                                .max(px(0.0));
                             let available = (main_w - handle_w * 2.0).max(px(0.0));
                             let ratios = self.conflict_three_way_col_ratios;
                             let col_a_w = if available <= min_col_w * 3.0 {
@@ -803,7 +863,7 @@ impl MainPaneView {
                                             id,
                                             components::ResizeGripAxis::Vertical,
                                             dragging,
-                                            Some(theme.colors.border),
+                                            Some(theme.colors.stroke.default),
                                         ))
                                         .on_drag(which, |_handle, _offset, _window, cx| {
                                             cx.new(|_cx| ConflictHSplitResizeDragGhost)
@@ -922,7 +982,7 @@ impl MainPaneView {
                                         id,
                                         components::ResizeGripAxis::Vertical,
                                         conflict_diff_split_dragging,
-                                        Some(theme.colors.border),
+                                        Some(theme.colors.stroke.default),
                                     ))
                                     .on_drag(
                                         ConflictDiffSplitResizeHandle::Divider,
@@ -989,6 +1049,11 @@ impl MainPaneView {
                                 .w_full()
                                 .flex()
                                 .items_center()
+                                // Keep the column headers over their columns:
+                                // the minimap column shifts the body right.
+                                .when(minimap_w > px(0.0), |d| {
+                                    d.child(div().w(minimap_w).h_full().flex_shrink_0())
+                                })
                                 .when(view_mode == ConflictResolverViewMode::ThreeWay, |d| {
                                     d.child(
                                         div()
@@ -999,7 +1064,7 @@ impl MainPaneView {
                                             .items_center()
                                             .gap_2()
                                             .text_xs()
-                                            .text_color(theme.colors.text_muted)
+                                            .text_color(theme.colors.foreground.secondary)
                                             .whitespace_nowrap()
                                             .child(div().w(px(38.0)).flex_shrink_0())
                                             .child("Base (A, index :1)"),
@@ -1017,7 +1082,7 @@ impl MainPaneView {
                                             .items_center()
                                             .gap_2()
                                             .text_xs()
-                                            .text_color(theme.colors.text_muted)
+                                            .text_color(theme.colors.foreground.secondary)
                                             .whitespace_nowrap()
                                             .child(div().w(px(38.0)).flex_shrink_0())
                                             .child("Local (B, index :2)"),
@@ -1029,14 +1094,14 @@ impl MainPaneView {
                                     .child(
                                         div()
                                             .w(col_c_w)
-                                            .flex_grow()
+                                            .flex_grow(1.)
                                             .min_w(px(0.0))
                                             .px_2()
                                             .flex()
                                             .items_center()
                                             .gap_2()
                                             .text_xs()
-                                            .text_color(theme.colors.text_muted)
+                                            .text_color(theme.colors.foreground.secondary)
                                             .whitespace_nowrap()
                                             .child(div().w(px(38.0)).flex_shrink_0())
                                             .child("Remote (C, index :3)"),
@@ -1053,7 +1118,7 @@ impl MainPaneView {
                                             .items_center()
                                             .gap_2()
                                             .text_xs()
-                                            .text_color(theme.colors.text_muted)
+                                            .text_color(theme.colors.foreground.secondary)
                                             .whitespace_nowrap()
                                             .child(div().w(px(38.0)).flex_shrink_0())
                                             .child("Local (index :2)"),
@@ -1064,14 +1129,14 @@ impl MainPaneView {
                                     .child(
                                         div()
                                             .w(right_w)
-                                            .flex_grow()
+                                            .flex_grow(1.)
                                             .min_w(px(0.0))
                                             .px_2()
                                             .flex()
                                             .items_center()
                                             .gap_2()
                                             .text_xs()
-                                            .text_color(theme.colors.text_muted)
+                                            .text_color(theme.colors.foreground.secondary)
                                             .whitespace_nowrap()
                                             .child(div().w(px(38.0)).flex_shrink_0())
                                             .child("Remote (index :3)"),
@@ -1210,7 +1275,7 @@ impl MainPaneView {
                                             .relative()
                                             .flex_1()
                                             .min_h(px(0.0))
-                                            .bg(theme.colors.window_bg)
+                                            .bg(theme.colors.surface.canvas)
                                             .font_family(editor_font_family.clone())
                                             .flex()
                                             .child(
@@ -1309,7 +1374,7 @@ impl MainPaneView {
                                                         div()
                                                             .relative()
                                                             .w(col_c_w)
-                                                            .flex_grow()
+                                                            .flex_grow(1.)
                                                             .min_w(px(0.0))
                                                             .h_full()
                                                             .child(
@@ -1438,7 +1503,7 @@ impl MainPaneView {
                                             .relative()
                                             .flex_1()
                                             .min_h(px(0.0))
-                                            .bg(theme.colors.window_bg)
+                                            .bg(theme.colors.surface.canvas)
                                             .font_family(editor_font_family.clone())
                                             .flex()
                                             .child(
@@ -1494,7 +1559,7 @@ impl MainPaneView {
                                                         div()
                                                             .relative()
                                                             .w(right_w)
-                                                            .flex_grow()
+                                                            .flex_grow(1.)
                                                             .min_w(px(0.0))
                                                             .h_full()
                                                             .child(
@@ -1545,6 +1610,53 @@ impl MainPaneView {
                                 }
                             };
 
+                            // The minimap (kdiff3's Overview widget): the
+                            // whole-file change map beside the inputs, framing
+                            // the viewport and jumping the panes on click.
+                            let top_body: AnyElement = if minimap_w > px(0.0) {
+                                let view = cx.entity();
+                                let jump_rows = diff_list_len;
+                                div()
+                                    .flex()
+                                    .flex_1()
+                                    .h_full()
+                                    .min_h(px(0.0))
+                                    .child(
+                                        components::MinimapColumn::new(
+                                            "conflict_minimap",
+                                            self.conflict_resolver.minimap_bands.clone(),
+                                        )
+                                        .driver(self.conflict_resolver_diff_scroll.clone())
+                                        .on_jump(move |fraction, _window, cx| {
+                                            if jump_rows == 0 {
+                                                return;
+                                            }
+                                            let row = ((fraction * jump_rows as f32) as usize)
+                                                .min(jump_rows - 1);
+                                            view.update(cx, |this, cx| {
+                                                this.conflict_resolver_scroll_all_columns(
+                                                    row,
+                                                    gpui::ScrollStrategy::Center,
+                                                );
+                                                cx.notify();
+                                            });
+                                        })
+                                        .render(theme),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .h_full()
+                                            .min_h(px(0.0))
+                                            .child(top_body),
+                                    )
+                                    .into_any_element()
+                            } else {
+                                top_body
+                            };
+
                             let output_modified = self.conflict_resolved_output_is_modified();
                             let output_header = div()
                                 .flex()
@@ -1557,13 +1669,13 @@ impl MainPaneView {
                                         .items_center()
                                         .gap_1()
                                         .text_xs()
-                                        .text_color(theme.colors.text_muted)
+                                        .text_color(theme.colors.foreground.secondary)
                                         .child("Resolved output")
                                         .when(output_modified, |d| {
                                             d.child(
                                                 div()
                                                     .id("conflict_resolved_output_modified")
-                                                    .text_color(theme.colors.warning)
+                                                    .text_color(theme.colors.status.warning.foreground)
                                                     .child("[Modified]"),
                                             )
                                         }),
@@ -1593,7 +1705,7 @@ impl MainPaneView {
                                     "conflict_resolver_vsplit_handle",
                                     components::ResizeGripAxis::Horizontal,
                                     self.conflict_resolver_vsplit_resize.is_some(),
-                                    Some(theme.colors.border),
+                                    Some(theme.colors.stroke.default),
                                 ))
                                 .on_drag(
                                     ConflictVSplitResizeHandle::Divider,
@@ -1678,7 +1790,7 @@ impl MainPaneView {
                                                 .child(
                                                     div()
                                                         .border_t_1()
-                                                        .border_color(theme.colors.border),
+                                                        .border_color(theme.colors.stroke.default),
                                                 )
                                                 .child(top_body),
                                         )
@@ -1701,11 +1813,11 @@ impl MainPaneView {
                                             .py_0p5()
                                             .rounded(px(theme.radii.row))
                                             .bg(with_alpha(
-                                                theme.colors.accent,
+                                                theme.colors.accent.foreground,
                                                 if theme.is_dark { 0.14 } else { 0.10 },
                                             ))
                                             .text_xs()
-                                            .text_color(theme.colors.accent)
+                                            .text_color(theme.colors.accent.foreground)
                                             .child(summary),
                                     )
                                 })
@@ -1720,7 +1832,7 @@ impl MainPaneView {
                                             .overflow_hidden()
                                             .flex()
                                             .flex_col()
-                                            .bg(theme.colors.window_bg)
+                                            .bg(theme.colors.surface.canvas)
                                             .child(
                                                 {
                                                     // Fold-projected row count in collapsed
@@ -1810,13 +1922,21 @@ impl MainPaneView {
                                                         .relative()
                                                         .flex_1()
                                                         .min_h(px(0.0))
-                                                        .bg(theme.colors.window_bg)
+                                                        .bg(theme.colors.surface.canvas)
                                                         .child(
                                                             div()
                                                                 .id("conflict_resolver_output_surface")
                                                                 .h_full()
                                                                 .min_h(px(0.0))
-                                                                .p_2()
+                                                                // Unpadded, like the source columns: rows run to the
+                                                                // edges of the section instead of floating inside a
+                                                                // band of background, so the output's first and last
+                                                                // rows sit flush against the header and footer and
+                                                                // its gutter lines up with the columns' left edge.
+                                                                // The scrollbars position against the body rather
+                                                                // than this surface, so they do not need the space,
+                                                                // and the row that reserves the vertical scrollbar
+                                                                // gutter is the flex row below.
                                                                 .font_family(editor_font_family.clone())
                                                                 // Forward horizontal wheel input to the narrower diff
                                                                 // columns immediately; the normal bidirectional sync also
@@ -1914,7 +2034,7 @@ impl MainPaneView {
                                                                                 .flex_shrink_0()
                                                                                 .border_r_1()
                                                                                 .border_color(
-                                                                                    theme.colors.border,
+                                                                                    theme.colors.stroke.default,
                                                                                 )
                                                                                 .child(outline_list),
                                                                         )
@@ -2079,7 +2199,7 @@ impl MainPaneView {
                 .min_w(px(0.0))
                 .h_full()
                 .border_1()
-                .border_color(theme.colors.border)
+                .border_color(theme.colors.stroke.default)
                 .rounded(px(theme.radii.row))
                 .overflow_hidden()
                 .flex()
@@ -2090,16 +2210,16 @@ impl MainPaneView {
                         .px_2()
                         .flex()
                         .items_center()
-                        .bg(theme.colors.surface_bg_elevated)
+                        .bg(theme.colors.surface.raised)
                         .text_xs()
-                        .text_color(theme.colors.text_muted)
+                        .text_color(theme.colors.foreground.secondary)
                         .child(label),
                 )
                 .child(
                     div()
                         .flex_1()
                         .min_h(px(0.0))
-                        .bg(theme.colors.window_bg)
+                        .bg(theme.colors.surface.canvas)
                         .flex()
                         .items_center()
                         .justify_center()
@@ -2111,22 +2231,22 @@ impl MainPaneView {
                                 .into_any_element(),
                             Loadable::NotLoaded | Loadable::Loading if has_source => div()
                                 .text_xs()
-                                .text_color(theme.colors.text_muted)
+                                .text_color(theme.colors.foreground.secondary)
                                 .child("Processing preview...")
                                 .into_any_element(),
                             Loadable::Error(error) => div()
                                 .text_xs()
-                                .text_color(theme.colors.text_muted)
+                                .text_color(theme.colors.foreground.secondary)
                                 .child(error)
                                 .into_any_element(),
                             Loadable::Ready(None) if has_source => div()
                                 .text_xs()
-                                .text_color(theme.colors.text_muted)
+                                .text_color(theme.colors.foreground.secondary)
                                 .child("Preview unavailable.")
                                 .into_any_element(),
                             _ => div()
                                 .text_xs()
-                                .text_color(theme.colors.text_muted)
+                                .text_color(theme.colors.foreground.secondary)
                                 .child("(empty)")
                                 .into_any_element(),
                         }),
@@ -2141,7 +2261,7 @@ impl MainPaneView {
             .flex()
             .gap_2()
             .p_2()
-            .bg(theme.colors.window_bg)
+            .bg(theme.colors.surface.canvas)
             .child(preview_cell(
                 "conflict_preview_base",
                 "Base (A)",
@@ -2215,7 +2335,7 @@ impl MainPaneView {
             .min_h(px(0.0))
             .w_full()
             .p_2()
-            .bg(theme.colors.window_bg)
+            .bg(theme.colors.surface.canvas)
             .child(
                 div()
                     .flex()
@@ -2295,7 +2415,7 @@ impl MainPaneView {
                 .justify_center()
                 .p_2()
                 .text_xs()
-                .text_color(theme.colors.text_muted)
+                .text_color(theme.colors.foreground.secondary)
                 .child(message)
                 .into_any_element()
         };
@@ -2369,7 +2489,7 @@ impl MainPaneView {
             .min_w(px(0.0))
             .h_full()
             .border_1()
-            .border_color(theme.colors.border)
+            .border_color(theme.colors.stroke.default)
             .rounded(px(theme.radii.row))
             .overflow_hidden()
             .flex()
@@ -2380,16 +2500,16 @@ impl MainPaneView {
                     .px_2()
                     .flex()
                     .items_center()
-                    .bg(theme.colors.surface_bg_elevated)
+                    .bg(theme.colors.surface.raised)
                     .text_xs()
-                    .text_color(theme.colors.text_muted)
+                    .text_color(theme.colors.foreground.secondary)
                     .child(label),
             )
             .child(
                 div()
                     .flex_1()
                     .min_h(px(0.0))
-                    .bg(theme.colors.window_bg)
+                    .bg(theme.colors.surface.canvas)
                     .child(body),
             )
             .into_any_element()

@@ -1,9 +1,35 @@
 use super::*;
 
 /// Slimmer than the tab-bar slot the bottom bar used to borrow; it hosts the
-/// pane collapse toggles and the zoom control on one shared centerline, so
-/// every saved pixel goes to the content area.
+/// pane collapse toggles, the zoom control and the branding strip on one shared
+/// centerline, so every saved pixel goes to the content area.
 const BOTTOM_STATUS_BAR_HEIGHT_PX: f32 = 26.0;
+
+/// Shared shape for the branding links on the bar's trailing end. No plate and
+/// no outline — beside the wordmark and the version number these read as links,
+/// and a badge each would turn the corner into a row of buttons. Hover is
+/// carried entirely by the accent tint, which the Discord glyph picks up through
+/// `group_hover` on this element's group.
+fn status_bar_chip(
+    id: &'static str,
+    theme: AppTheme,
+    ui_scale_percent: u32,
+) -> gpui::Stateful<gpui::Div> {
+    let scaled_px = |value: f32| crate::ui_scale::design_px_from_percent(value, ui_scale_percent);
+
+    div()
+        .id(id)
+        .group(id)
+        .debug_selector(move || id.to_string())
+        .h(scaled_px(18.0))
+        .px(scaled_px(4.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor(CursorStyle::PointingHand)
+        .hover(move |s| s.text_color(theme.colors.accent.foreground))
+        .active(move |s| s.text_color(theme.colors.accent.foreground))
+}
 
 pub(in super::super) struct BottomStatusBarView {
     theme: AppTheme,
@@ -72,8 +98,10 @@ impl Render for BottomStatusBarView {
             .active_context_menu_invoker
             .as_ref()
             .is_some_and(|id| id.as_ref() == zoom_picker_invoker.as_ref());
-        let zoom_button_bg =
-            with_alpha(theme.colors.accent, if theme.is_dark { 0.26 } else { 0.20 });
+        let zoom_button_bg = with_alpha(
+            theme.colors.accent.foreground,
+            if theme.is_dark { 0.26 } else { 0.20 },
+        );
         let zoom_label = if ui_scale_percent == crate::ui_scale::DEFAULT_UI_SCALE_PERCENT {
             String::new()
         } else {
@@ -81,9 +109,9 @@ impl Render for BottomStatusBarView {
         };
 
         let zoom_icon_color = if zoom_picker_active {
-            theme.colors.accent
+            theme.colors.accent.foreground
         } else {
-            theme.colors.text_muted
+            theme.colors.foreground.secondary
         };
         let zoom_button = components::Button::new("bottom_status_bar_zoom", zoom_label)
             .start_slot(
@@ -92,7 +120,11 @@ impl Render for BottomStatusBarView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(svg_icon("icons/zoom.svg", zoom_icon_color, scaled_px(14.0))),
+                    .child(svg_icon(
+                        "icons/zoom_in.svg",
+                        zoom_icon_color,
+                        scaled_px(14.0),
+                    )),
             )
             .style(components::ButtonStyle::Subtle)
             .borderless()
@@ -124,7 +156,7 @@ impl Render for BottomStatusBarView {
                 } else {
                     "icons/arrow_left.svg"
                 },
-                theme.colors.text_muted,
+                theme.colors.foreground.secondary,
                 scaled_px(12.0),
             ))
             .style(components::ButtonStyle::Transparent)
@@ -149,7 +181,7 @@ impl Render for BottomStatusBarView {
                 } else {
                     "icons/arrow_right.svg"
                 },
-                theme.colors.text_muted,
+                theme.colors.foreground.secondary,
                 scaled_px(12.0),
             ))
             .style(components::ButtonStyle::Transparent)
@@ -167,6 +199,97 @@ impl Render for BottomStatusBarView {
                 },
             );
 
+        // Branding strip: the edition badge moved down here from the title bar,
+        // where it crowded the repository tabs.
+        let discord_badge = status_bar_chip("bottom_status_bar_discord", theme, ui_scale_percent)
+            .child(
+                gpui::svg()
+                    .path("icons/discord.svg")
+                    .w(scaled_px(12.0))
+                    .h(scaled_px(12.0))
+                    .flex_shrink_0()
+                    .text_color(theme.colors.foreground.secondary)
+                    .group_hover("bottom_status_bar_discord", move |s| {
+                        s.text_color(theme.colors.accent.foreground)
+                    }),
+            )
+            .on_click(cx.listener(|_this, _e: &ClickEvent, _window, cx| {
+                cx.stop_propagation();
+                cx.open_url(DISCORD_URL);
+            }))
+            .gitcomet_tooltip(theme, "Join the GitComet Discord".into());
+
+        let free_badge = status_bar_chip("bottom_status_bar_free_badge", theme, ui_scale_percent)
+            .text_size(scaled_px(11.0))
+            .line_height(scaled_px(12.0))
+            .font_weight(FontWeight::NORMAL)
+            .text_color(with_alpha(
+                theme.colors.foreground.primary,
+                if theme.is_dark { 0.72 } else { 0.62 },
+            ))
+            .on_click(cx.listener(|_this, _e: &ClickEvent, _window, cx| {
+                cx.stop_propagation();
+                cx.open_url(EDITIONS_URL);
+            }))
+            .gitcomet_tooltip(theme, "See GitComet editions".into())
+            .child("FREE");
+
+        // GPUI paints an SVG as a mask tinted by the text color, so the mark's
+        // own brand blue never reaches the screen — an untinted mark renders
+        // invisible. Tint it with the accent so it stays legible in every theme.
+        //
+        // The color lives on the link itself and the wordmark inherits it, so
+        // one `.hover()` on this stateful element tints the text. A style on the
+        // stateless child could not do it: gpui only repaints on hover for
+        // elements that carry state, so the child's own hover would compute a
+        // tint that never reaches the screen.
+        let brand = div()
+            .id("bottom_status_bar_brand_link")
+            .debug_selector(|| "bottom_status_bar_brand_link".to_string())
+            .flex()
+            .items_center()
+            .gap(scaled_px(4.0))
+            .cursor(CursorStyle::PointingHand)
+            .text_color(theme.colors.foreground.secondary)
+            .hover(move |s| s.text_color(theme.colors.accent.foreground))
+            .active(move |s| s.text_color(theme.colors.accent.foreground))
+            .child(svg_icon(
+                "icons/gitcomet_mark.svg",
+                theme.colors.accent.foreground,
+                scaled_px(13.0),
+            ))
+            .child(
+                div()
+                    .debug_selector(|| "bottom_status_bar_brand".to_string())
+                    .text_size(scaled_px(11.0))
+                    .line_height(scaled_px(12.0))
+                    .child("GitComet"),
+            )
+            .on_click(cx.listener(|_this, _e: &ClickEvent, _window, cx| {
+                cx.stop_propagation();
+                cx.open_url(WEBSITE_URL);
+            }))
+            .gitcomet_tooltip(theme, "Open gitcomet.dev".into());
+
+        let version_label: SharedString = format!("v{}", env!("CARGO_PKG_VERSION")).into();
+        let version_link = div()
+            .id("bottom_status_bar_version")
+            .debug_selector(|| "bottom_status_bar_version".to_string())
+            .flex()
+            .items_center()
+            .cursor(CursorStyle::PointingHand)
+            .text_size(scaled_px(11.0))
+            .line_height(scaled_px(12.0))
+            .text_color(theme.colors.foreground.secondary)
+            .hover(move |s| s.text_color(theme.colors.accent.foreground))
+            .active(move |s| s.text_color(theme.colors.accent.foreground))
+            .on_click(cx.listener(|_this, _e: &ClickEvent, _window, cx| {
+                cx.stop_propagation();
+                cx.open_url(RELEASES_URL);
+            }))
+            .gitcomet_tooltip(theme, "View GitComet releases".into())
+            .child(version_label);
+
         div()
             .id("bottom_status_bar")
             .w_full()
@@ -176,7 +299,7 @@ impl Render for BottomStatusBarView {
             .items_center()
             .justify_between()
             .px_2()
-            .bg(theme.colors.sidebar_bg)
+            .bg(theme.colors.surface.chrome)
             .when_some(
                 crate::view::chrome::client_frame_corner_rounding(theme, window),
                 |d, rounding| {
@@ -191,7 +314,20 @@ impl Render for BottomStatusBarView {
                     .items_center()
                     .gap(scaled_px(2.0))
                     .child(details_toggle)
-                    .child(zoom_button),
+                    .child(zoom_button)
+                    .child(
+                        // Branding chips want more air between them than the
+                        // toggles, which read as one control group.
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(scaled_px(6.0))
+                            .pl(scaled_px(6.0))
+                            .child(discord_badge)
+                            .child(free_badge)
+                            .child(brand)
+                            .child(version_link),
+                    ),
             )
     }
 }

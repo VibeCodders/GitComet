@@ -47,6 +47,10 @@ pub enum RepoCommandKind {
         remote: String,
         branch: String,
     },
+    DeleteRemoteBranches {
+        remote: String,
+        branches: Vec<String>,
+    },
     Reset {
         mode: ResetMode,
         target: String,
@@ -134,6 +138,9 @@ pub enum RepoCommandKind {
     SaveWorktreeFile {
         path: PathBuf,
         stage: bool,
+    },
+    AppendGitignorePatterns {
+        patterns: Vec<String>,
     },
     ExportPatch {
         commit_id: CommitId,

@@ -1,11 +1,10 @@
 use crate::util::git_workdir_cmd_for as util_git_workdir_cmd_for;
 use gitcomet_core::conflict_session::ConflictSession;
-use gitcomet_core::domain::{
-    Branch, Commit, CommitDetails, CommitFileChange, CommitId, CommitRefSummary, Diff, DiffArea,
+use gitcomet_core::domain::{    Branch, Commit, CommitDetails, CommitFileChange, CommitId, CommitRefSummary, Diff, DiffArea,
     DiffPreviewTextSide, DiffTarget, FileDiffImage, FileDiffText, FileEntry, HistoryMode, LogCursor,
-    LogPage, RecentCommitMessage, ReflogEntry, Remote, RemoteBranch, RemoteTag, RepoSpec, RepoStatus,
-    StashEntry, Submodule, SubmoduleDiffSummary, Tag, UpstreamDivergence, Worktree,
-};
+    LogPage, RecentCommitMessage, RefMetadata, ReflogEntry, Remote, RemoteBranch, RemoteTag, RepoSpec,
+    RepoStatus, StashEntry, Submodule, SubmoduleDiffSummary, Tag, UpstreamDivergence, Worktree,
+  };
 use gitcomet_core::error::{Error, ErrorKind};
 use gitcomet_core::git_ops_trace::{self, GitOpTraceKind};
 use gitcomet_core::services::{
@@ -46,6 +45,7 @@ mod git_ops;
 mod history;
 mod log;
 mod mergetool;
+mod mergetool_builtin;
 mod patch;
 mod porcelain;
 mod remotes;
@@ -146,10 +146,9 @@ struct LogHeadPageCacheKey {
     head_oid: Option<gix::ObjectId>,
     limit: usize,
     last_seen: Option<CommitId>,
-    resume_from: Option<CommitId>,
-    /// Lowercased author filter, or `None` for the unfiltered walk.
-    author: Option<String>,
-}
+    resume_from: Option<CommitId>,    /// Author filter, or `None` for the unfiltered walk.
+    author: Option<log::AuthorFilter>,
+  }
 
 #[derive(Clone, Debug)]
 struct LogHeadPageCacheEntry {
@@ -169,17 +168,36 @@ struct LogFileFollowCacheEntry {
     commits: Arc<Vec<Commit>>,
 }
 
-type LogPagedWalk = gix::traverse::commit::Simple<gix::OdbHandleArc, fn(&gix::oid) -> bool>;
+/// The paged walk's commit filter. Boxed rather than a plain `fn` because a
+/// shallow repository needs one that carries state — the grafted parents still
+/// to be skipped — and the walk it belongs to is parked in [`LogPagedWalkCache`],
+/// so it can borrow nothing.
+type LogPagedWalkFilter = Box<dyn FnMut(&gix::oid) -> bool + Send>;
+
+type LogPagedWalk = gix::traverse::commit::Simple<gix::OdbHandleArc, LogPagedWalkFilter>;
 
 struct LogPagedWalkState {
-    pending: Option<gix::traverse::commit::Info>,
+    /// Commits pulled from the walk but not yet placed on a page. Decoding runs
+    /// in batches, so a page can end mid-batch and the rest has to wait for the
+    /// next one — in walk order. Bounded by one batch, which is what keeps the
+    /// walks parked in [`LogPagedWalkCache`] from retaining an unbounded amount
+    /// of traversal state.
+    pending: std::collections::VecDeque<gix::traverse::commit::Info>,
     walk: LogPagedWalk,
 }
 
 struct LogPagedWalkCacheEntry {
     token: Arc<str>,
     mode: HistoryMode,
-    head_oid: gix::ObjectId,
+    /// The commits the walk was seeded from — one head for most modes, every
+    /// ref for `AllBranches`. A walk started from different tips covers a
+    /// different history, so a token minted for one must not resume the other.
+    tips: Arc<[gix::ObjectId]>,
+    /// Author filter the walk was started with, or `None` for the unfiltered
+    /// walk. The walk's *position* depends on the filter — every non-matching
+    /// commit was already consumed — so resuming one walk under a different
+    /// filter would silently skip whatever the first pass rejected.
+    author: Option<log::AuthorFilter>,
     state: LogPagedWalkState,
 }
 
@@ -262,27 +280,24 @@ impl GitRepository for GixRepo {
         self.log_history_mode_page_cancellable_impl(mode, limit, cursor, cancellation)
     }
 
-    fn log_history_mode_page_filtered(
-        &self,
-        mode: HistoryMode,
-        author: Option<&str>,
-        limit: usize,
-        cursor: Option<&LogCursor>,
-    ) -> Result<LogPage> {
-        let _scope = git_ops_trace::scope(GitOpTraceKind::LogWalk);
-        self.log_history_mode_page_filtered_impl(mode, author, limit, cursor)
-    }
-
-    fn log_history_mode_page_filtered_cancellable(
+    fn log_history_mode_page_streaming(
         &self,
         mode: HistoryMode,
         author: Option<&str>,
         limit: usize,
         cursor: Option<&LogCursor>,
         cancellation: &CancellationToken,
+        on_chunk: &mut dyn FnMut(gitcomet_core::services::LogChunk),
     ) -> Result<LogPage> {
         let _scope = git_ops_trace::scope(GitOpTraceKind::LogWalk);
-        self.log_history_mode_page_filtered_cancellable_impl(mode, author, limit, cursor, cancellation)
+        self.log_history_mode_page_streaming_impl(
+            mode,
+            author,
+            limit,
+            cursor,
+            cancellation,
+            on_chunk,
+        )
     }
 
     fn log_head_page(&self, limit: usize, cursor: Option<&LogCursor>) -> Result<LogPage> {
@@ -872,6 +887,14 @@ impl GitRepository for GixRepo {
         self.delete_remote_branch_with_output_impl(remote, branch)
     }
 
+    fn delete_remote_branches_with_output(
+        &self,
+        remote: &str,
+        branches: &[String],
+    ) -> Result<CommandOutput> {
+        self.delete_remote_branches_with_output_impl(remote, branches)
+    }
+
     fn blame_file(&self, path: &Path, rev: Option<&str>) -> Result<Vec<BlameLine>> {
         let _scope = git_ops_trace::scope(GitOpTraceKind::Blame);
         self.blame_file_impl(path, rev)
@@ -948,6 +971,20 @@ impl GitRepository for GixRepo {
         Ok(worktrees)
     }
 
+    fn list_ref_metadata(&self) -> Result<Vec<(String, RefMetadata)>> {
+        self.list_ref_metadata_impl()
+    }
+
+    fn list_ref_metadata_cancellable(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<(String, RefMetadata)>> {
+        cancellation.check_cancelled()?;
+        let metadata = self.list_ref_metadata_impl()?;
+        cancellation.check_cancelled()?;
+        Ok(metadata)
+    }
+
     fn add_worktree_with_output(
         &self,
         path: &Path,
@@ -975,8 +1012,8 @@ impl GitRepository for GixRepo {
         self.list_submodules_cancellable_impl(cancellation)
     }
 
-    fn list_tree_files(&self) -> Result<Vec<FileEntry>> {
-        self.list_tree_files_impl()
+    fn list_worktree_files(&self) -> Result<Vec<FileEntry>> {
+        self.list_worktree_files_impl()
     }
 
     fn list_tree_files_at_commit(&self, commit_id: &CommitId) -> Result<Vec<FileEntry>> {

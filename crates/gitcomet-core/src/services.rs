@@ -35,6 +35,17 @@ impl CancellationToken {
     }
 }
 
+/// A partially built log page, reported while a walk is still running.
+///
+/// `commits` is the page so far — every chunk is a prefix of the next one and
+/// of the final page — and `scanned` counts the commits the walk has visited,
+/// matching or not, so a filter that is finding nothing still shows progress.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LogChunk {
+    pub commits: Vec<crate::domain::Commit>,
+    pub scanned: u64,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CommandOutput {
     pub command: String,
@@ -318,8 +329,38 @@ pub trait GitRepository: Send + Sync {
 
     /// Like [`Self::log_history_mode_page`], but restricted to commits whose
     /// author matches `author` (case-insensitive substring match against the
-    /// author name shown in the UI). The default implementation ignores the
-    /// filter; backends that support it override this method.
+    /// author name shown in the UI), cancellable, and reporting the page as it
+    /// is built.
+    ///
+    /// An author filter has to walk history until it has found `limit` matching
+    /// commits, which for a rare author means walking all of it — over ten
+    /// seconds on a repository with a million commits. `on_chunk` lets the
+    /// caller show what has been found so far instead of nothing at all, and
+    /// `cancellation` lets a filter the user has moved on from be dropped
+    /// rather than waited out.
+    ///
+    /// Each chunk carries the whole page built up to that point, so chunks are
+    /// prefixes of each other and of the returned page, and applying one is
+    /// idempotent. The default implementation ignores the filter and reports
+    /// nothing; backends that support filtering override this method.
+    fn log_history_mode_page_streaming(
+        &self,
+        mode: HistoryMode,
+        author: Option<&str>,
+        limit: usize,
+        cursor: Option<&LogCursor>,
+        cancellation: &CancellationToken,
+        on_chunk: &mut dyn FnMut(LogChunk),
+    ) -> Result<LogPage> {
+        let _ = (author, on_chunk);
+        cancellation.check_cancelled()?;
+        let page = self.log_history_mode_page(mode, limit, cursor)?;
+        cancellation.check_cancelled()?;
+        Ok(page)
+    }
+
+    /// [`Self::log_history_mode_page_streaming`] for callers with nothing to
+    /// cancel and no use for the intermediate pages.
     fn log_history_mode_page_filtered(
         &self,
         mode: HistoryMode,
@@ -327,21 +368,14 @@ pub trait GitRepository: Send + Sync {
         limit: usize,
         cursor: Option<&LogCursor>,
     ) -> Result<LogPage> {
-        let _ = author;
-        self.log_history_mode_page(mode, limit, cursor)
-    }
-    fn log_history_mode_page_filtered_cancellable(
-        &self,
-        mode: HistoryMode,
-        author: Option<&str>,
-        limit: usize,
-        cursor: Option<&LogCursor>,
-        cancellation: &CancellationToken,
-    ) -> Result<LogPage> {
-        cancellation.check_cancelled()?;
-        let page = self.log_history_mode_page_filtered(mode, author, limit, cursor)?;
-        cancellation.check_cancelled()?;
-        Ok(page)
+        self.log_history_mode_page_streaming(
+            mode,
+            author,
+            limit,
+            cursor,
+            &CancellationToken::new(),
+            &mut |_| {},
+        )
     }
 
     fn log_head_page(&self, limit: usize, cursor: Option<&LogCursor>) -> Result<LogPage>;
@@ -956,6 +990,24 @@ pub trait GitRepository: Send + Sync {
         )))
     }
 
+    /// Delete several branches on one remote.
+    ///
+    /// A batch method rather than a caller-side loop because deleting is a push:
+    /// one invocation carrying every ref is a single network round trip, where
+    /// the loop pays one per branch. The default keeps that loop so backends
+    /// that only implement the single-branch call stay correct.
+    fn delete_remote_branches_with_output(
+        &self,
+        remote: &str,
+        branches: &[String],
+    ) -> Result<CommandOutput> {
+        let mut last = CommandOutput::empty_success("git push --delete");
+        for branch in branches {
+            last = self.delete_remote_branch_with_output(remote, branch)?;
+        }
+        Ok(last)
+    }
+
     fn commit_amend_with_output(&self, message: &str) -> Result<CommandOutput> {
         self.commit_amend(message)?;
         Ok(CommandOutput::empty_success("git commit --amend"))
@@ -1137,6 +1189,25 @@ pub trait GitRepository: Send + Sync {
         Ok(worktrees)
     }
 
+    /// Tip-commit author/date/summary for every local and remote-tracking ref,
+    /// as `(short refname, metadata)` pairs. Purely decorative — callers render
+    /// name-only rows when this is unavailable, so backends may leave it
+    /// unimplemented.
+    fn list_ref_metadata(&self) -> Result<Vec<(String, RefMetadata)>> {
+        Err(Error::new(ErrorKind::Unsupported(
+            "ref metadata listing is not implemented for this backend",
+        )))
+    }
+    fn list_ref_metadata_cancellable(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<(String, RefMetadata)>> {
+        cancellation.check_cancelled()?;
+        let metadata = self.list_ref_metadata()?;
+        cancellation.check_cancelled()?;
+        Ok(metadata)
+    }
+
     fn add_worktree_with_output(
         &self,
         _path: &Path,
@@ -1174,9 +1245,10 @@ pub trait GitRepository: Send + Sync {
         Ok(submodules)
     }
 
-    fn list_tree_files(&self) -> Result<Vec<FileEntry>> {
+    /// The working directory as it is on disk, not `HEAD`'s tree.
+    fn list_worktree_files(&self) -> Result<Vec<FileEntry>> {
         Err(Error::new(ErrorKind::Unsupported(
-            "tree file listing is not implemented for this backend",
+            "worktree file listing is not implemented for this backend",
         )))
     }
 

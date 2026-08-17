@@ -1659,7 +1659,7 @@ fn conflict_markdown_preview_hides_text_controls_and_ignores_text_hotkeys(
         view.update(app, |this, cx| {
             this.main_pane.update(cx, |pane, cx| {
                 pane.conflict_resolver.resolver_preview_mode = ConflictResolverPreviewMode::Preview;
-                pane.conflict_resolver.active_conflict = 0;
+                pane.conflict_resolver.active_conflict = Some(0);
                 pane.conflict_resolver.nav_anchor = None;
                 cx.notify();
             });
@@ -1706,7 +1706,7 @@ fn conflict_markdown_preview_hides_text_controls_and_ignores_text_hotkeys(
             ConflictResolverViewMode::TwoWayDiff
         );
         assert!(!pane.reveal_whitespace_chars);
-        assert_eq!(pane.conflict_resolver.active_conflict, 0);
+        assert_eq!(pane.conflict_resolver.active_conflict, Some(0));
         assert!(
             pane.conflict_resolver.nav_anchor.is_none(),
             "preview hotkeys should not mutate conflict navigation state"
@@ -1717,7 +1717,7 @@ fn conflict_markdown_preview_hides_text_controls_and_ignores_text_hotkeys(
         view.update(app, |this, cx| {
             this.main_pane.update(cx, |pane, cx| {
                 pane.conflict_resolver.resolver_preview_mode = ConflictResolverPreviewMode::Preview;
-                pane.conflict_resolver.active_conflict = 1;
+                pane.conflict_resolver.active_conflict = Some(1);
                 cx.notify();
             });
         });
@@ -1737,7 +1737,7 @@ fn conflict_markdown_preview_hides_text_controls_and_ignores_text_hotkeys(
             ConflictResolverViewMode::TwoWayDiff
         );
         assert!(!pane.reveal_whitespace_chars);
-        assert_eq!(pane.conflict_resolver.active_conflict, 1);
+        assert_eq!(pane.conflict_resolver.active_conflict, Some(1));
         assert!(
             pane.conflict_resolver.nav_anchor.is_none(),
             "preview hotkeys should not mutate conflict navigation state",
@@ -1801,14 +1801,19 @@ fn conflict_markdown_preview_scroll_sync_matrix_covers_all_modes_and_axes(
                 theirs_text.clone(),
                 current_text.clone(),
             );
-            repo.conflict_state.conflict_session = Some(ConflictSession::from_merged_text(
+            let mut session = ConflictSession::from_merged_text(
                 file_rel.clone(),
                 gitcomet_core::domain::FileConflictKind::BothModified,
                 ConflictPayload::Text(base_text.clone().into()),
                 ConflictPayload::Text(ours_text.clone().into()),
                 ConflictPayload::Text(theirs_text.clone().into()),
                 &current_text,
-            ));
+            );
+            for region in &mut session.regions {
+                region.resolution =
+                    gitcomet_core::conflict_session::ConflictRegionResolution::PickOurs;
+            }
+            repo.conflict_state.conflict_session = Some(session);
 
             push_test_state(this, app_state_with_repo(repo, repo_id), cx);
         });
@@ -1831,6 +1836,17 @@ fn conflict_markdown_preview_scroll_sync_matrix_covers_all_modes_and_axes(
             )
         },
     );
+
+    cx.update(|_window, app| {
+        let pane = view.read(app).main_pane.read(app);
+        let output = pane.conflict_resolver_input.read(app).text().to_string();
+        assert!(
+            output.lines().any(|line| line.len() >= 240),
+            "resolved output should retain the selected long markdown source; output_len={} longest_line={}",
+            output.len(),
+            output.lines().map(str::len).max().unwrap_or_default(),
+        );
+    });
 
     cx.update(|_window, app| {
         view.update(app, |this, cx| {
@@ -1921,7 +1937,14 @@ fn conflict_markdown_preview_scroll_sync_matrix_covers_all_modes_and_axes(
 
             cx.update(|_window, app| {
                 let pane = view.read(app).main_pane.read(app);
-                let expected = if axis.includes(mode) {
+                // In markdown preview the columns render formatted content
+                // rather than the aligned row space, so a vertical
+                // correspondence with the output text is even less meaningful
+                // than in the code view, where it was already dropped. Only
+                // the horizontal axis stays coupled.
+                let expected = if axis.includes(mode)
+                    && matches!(axis, ScrollSyncAxis::Horizontal)
+                {
                     axis.component(output_offset)
                 } else {
                     px(0.0)
@@ -1939,7 +1962,11 @@ fn conflict_markdown_preview_scroll_sync_matrix_covers_all_modes_and_axes(
                     axis.component(uniform_list_offset(&pane.conflict_resolver_diff_scroll)),
                     expected,
                     "conflict markdown base preview should {} {} scrolling from resolved output in {:?} mode",
-                    if axis.includes(mode) { "sync" } else { "not sync" },
+                    if axis.includes(mode) && matches!(axis, ScrollSyncAxis::Horizontal) {
+                        "sync"
+                    } else {
+                        "not sync"
+                    },
                     axis.label(),
                     mode,
                 );
@@ -1980,6 +2007,16 @@ fn conflict_markdown_preview_scroll_sync_matrix_covers_all_modes_and_axes(
                 } else {
                     px(0.0)
                 };
+                // The columns share one row space and stay coupled on both
+                // axes; the resolved output is a separate document and follows
+                // only horizontally.
+                let output_expected = if axis.includes(mode)
+                    && matches!(axis, ScrollSyncAxis::Horizontal)
+                {
+                    axis.component(base_offset)
+                } else {
+                    px(0.0)
+                };
                 assert_eq!(
                     axis.component(uniform_list_offset(&pane.conflict_resolver_diff_scroll)),
                     axis.component(base_offset),
@@ -2007,9 +2044,13 @@ fn conflict_markdown_preview_scroll_sync_matrix_covers_all_modes_and_axes(
                     axis.component(scroll_handle_offset(
                         &pane.conflict_resolved_output_editor_scroll,
                     )),
-                    expected,
+                    output_expected,
                     "conflict markdown resolved output should {} {} scrolling from the base preview in {:?} mode",
-                    if axis.includes(mode) { "sync" } else { "not sync" },
+                    if axis.includes(mode) && matches!(axis, ScrollSyncAxis::Horizontal) {
+                        "sync"
+                    } else {
+                        "not sync"
+                    },
                     axis.label(),
                     mode,
                 );
@@ -2504,7 +2545,7 @@ fn clicking_a_badge_opens_its_menu_without_arming_a_selection(cx: &mut gpui::Tes
             assert!(
                 matches!(
                     popover,
-                    Some(PopoverKind::MarkdownLinkMenu { ref url })
+                    Some(PopoverKind::WebLinkMenu { ref url })
                         if url.as_ref() == "https://example.com/badge"
                 ),
                 "clicking a badge opens its link menu, got {popover:?}"
@@ -4202,13 +4243,13 @@ fn clicking_a_markdown_preview_link_opens_the_open_in_browser_menu(cx: &mut gpui
 
     cx.update(|_window, app| {
         view.update(app, |this, cx| {
-            let link = this.main_pane.read(cx).markdown_preview_link_at(
+            let link = this.main_pane.read(cx).markdown_preview_link_span_at(
                 0,
                 DiffTextRegion::Inline,
                 on_link,
             );
             assert_eq!(
-                link.as_deref(),
+                link.as_ref().map(|(url, _)| url.as_ref()),
                 Some("https://example.com/docs"),
                 "the click position must resolve to the link destination"
             );
@@ -4217,10 +4258,38 @@ fn clicking_a_markdown_preview_link_opens_the_open_in_browser_menu(cx: &mut gpui
             assert!(
                 matches!(
                     popover,
-                    Some(PopoverKind::MarkdownLinkMenu { ref url })
+                    Some(PopoverKind::WebLinkMenu { ref url })
                         if url.as_ref() == "https://example.com/docs"
                 ),
                 "clicking a link should open its menu, got {popover:?}"
+            );
+
+            // The same menu is reachable from a commit message, where handing
+            // focus back to the diff panel on close would be wrong. Closing
+            // reads this flag, so a preview link has to set it.
+            assert!(
+                this.popover_host
+                    .read(cx)
+                    .popover_opened_from_diff_panel_for_tests(),
+                "a preview link is a diff-panel invoker, so its focus returns there"
+            );
+
+            // The menu hangs off the link's own box rather than the row that
+            // holds it, so it opens flush under the words it describes.
+            let anchor = this
+                .popover_host
+                .read(cx)
+                .popover_anchor_bounds_for_tests()
+                .expect("a preview link menu anchors on the link's box");
+            assert!(
+                anchor.contains(&on_link),
+                "the anchor must be the box the click landed in, got {anchor:?}"
+            );
+            assert!(
+                anchor.top() >= text_bounds.top()
+                    && anchor.bottom() <= text_bounds.bottom() + px(1.0),
+                "the anchor must be a line of the row, not the row's own edges; \
+                 anchor={anchor:?} row={text_bounds:?}"
             );
         });
     });

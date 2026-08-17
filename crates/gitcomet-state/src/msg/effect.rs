@@ -79,6 +79,9 @@ pub enum Effect {
     },
     LoadLog {
         repo_id: RepoId,
+        /// Identifies this walk, so its replies can be told from those of a
+        /// walk a newer request superseded. See [`crate::model::LogLoadSeq`].
+        seq: crate::model::LogLoadSeq,
         scope: LogScope,
         /// Case-insensitive author filter, or `None` for all authors.
         author: Option<String>,
@@ -145,6 +148,17 @@ pub enum Effect {
     LoadWorktrees {
         repo_id: RepoId,
     },
+    LoadWorktreeDirty {
+        repo_id: RepoId,
+        workdir: PathBuf,
+        /// Worktree whose changed-file lists the scan should carry back; every
+        /// other worktree reports counts alone. `None` while no worktree row is
+        /// selected. See [`gitcomet_core::domain::WorktreeDirtySummary`].
+        files_for: Option<PathBuf>,
+    },
+    LoadRefMetadata {
+        repo_id: RepoId,
+    },
     LoadSubmodules {
         repo_id: RepoId,
     },
@@ -164,6 +178,16 @@ pub enum Effect {
     LoadCommitDetails {
         repo_id: RepoId,
         commit_id: CommitId,
+    },
+    LoadHoverCommitMessage {
+        repo_id: RepoId,
+        commit_id: CommitId,
+    },
+    /// Resolve a possibly abbreviated commit reference and load its details in
+    /// one call, so a reveal can show the commit before the log reaches it.
+    ResolveCommitForReveal {
+        repo_id: RepoId,
+        reference: CommitId,
     },
     LoadRangeFiles {
         repo_id: RepoId,
@@ -257,6 +281,10 @@ pub enum Effect {
         contents: String,
         stage: bool,
     },
+    AppendGitignorePatterns {
+        repo_id: RepoId,
+        patterns: Vec<String>,
+    },
 
     CheckoutBranch {
         repo_id: RepoId,
@@ -312,6 +340,11 @@ pub enum Effect {
     ForceDeleteBranch {
         repo_id: RepoId,
         name: String,
+    },
+    DeleteBranches {
+        repo_id: RepoId,
+        names: Vec<String>,
+        force: bool,
     },
     CloneRepo {
         url: String,
@@ -508,6 +541,12 @@ pub enum Effect {
         repo_id: RepoId,
         remote: String,
         branch: String,
+        auth: Option<StagedGitAuth>,
+    },
+    DeleteRemoteBranches {
+        repo_id: RepoId,
+        remote: String,
+        branches: Vec<String>,
         auth: Option<StagedGitAuth>,
     },
     Reset {

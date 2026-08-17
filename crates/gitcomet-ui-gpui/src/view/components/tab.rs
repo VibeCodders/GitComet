@@ -149,10 +149,16 @@ impl Tab {
     const TAB_BOTTOM_FUSE_PAD_PX: f32 = 4.0;
     const TAB_TOP_PADDING_PX: f32 = 2.0;
     const TAB_HORIZONTAL_PADDING_PX: f32 = 10.0;
-    const TAB_HORIZONTAL_MARGIN_PX: f32 = 4.0;
-    const TAB_BOTTOM_CURVE_RADIUS_PX: f32 = 8.0;
-    /// Tabs shrink no further than this before the strip scrolls.
-    const TAB_MIN_WIDTH_PX: f32 = 102.0;
+    /// Half the gutter between two neighbouring tabs. Public so anything
+    /// painted into that shared gap (the idle-tab separator) tracks it.
+    pub const HORIZONTAL_MARGIN_PX: f32 = 3.0;
+    /// The selected tab's lower curves flare this far past its box on each
+    /// side. Kept at the full gutter width so the curve lands exactly on the
+    /// neighbouring tab's edge instead of stopping short or running under it.
+    const TAB_BOTTOM_CURVE_RADIUS_PX: f32 = Self::HORIZONTAL_MARGIN_PX * 2.0;
+    /// Tabs shrink no further than this before the strip scrolls. Public so
+    /// tests can pin the floor without restating the number.
+    pub const MIN_WIDTH_PX: f32 = 126.0;
 
     /// Overlay an idle tab picks up on hover. Exposed so anything painted on
     /// top of a tab (the label fade) can flatten it into a matching color.
@@ -165,14 +171,14 @@ impl Tab {
     /// contrast in the correct direction for both dark and light themes.
     pub fn outline_color(theme: AppTheme) -> gpui::Rgba {
         let amount = if theme.is_dark { 0.18 } else { 0.14 };
-        let border = theme.colors.border;
-        let text = theme.colors.text;
-        gpui::Rgba {
-            r: border.r + (text.r - border.r) * amount,
-            g: border.g + (text.g - border.g) * amount,
-            b: border.b + (text.b - border.b) * amount,
-            a: border.a + (text.a - border.a) * amount,
-        }
+        let border = theme.colors.stroke.default;
+        let text = theme.colors.foreground.primary;
+        gpui::Rgba::new(
+            border.red + (text.red - border.red) * amount,
+            border.green + (text.green - border.green) * amount,
+            border.blue + (text.blue - border.blue) * amount,
+            border.alpha + (text.alpha - border.alpha) * amount,
+        )
     }
 
     pub fn new(id: impl Into<ElementId>) -> Self {
@@ -218,7 +224,7 @@ impl Tab {
         let chrome = horizontal_padding * 2.0
             // Left and right borders are physical one-pixel rules.
             + px(2.0);
-        (content_width + chrome).max(ui_scale.px(Self::TAB_MIN_WIDTH_PX))
+        (content_width + chrome).max(ui_scale.px(Self::MIN_WIDTH_PX))
     }
 
     pub fn end_slot(mut self, slot: impl IntoElement) -> Self {
@@ -238,14 +244,14 @@ impl Tab {
             .horizontal_padding
             .unwrap_or_else(|| scaled_px(Self::TAB_HORIZONTAL_PADDING_PX));
         let text_color = if self.selected {
-            theme.colors.text
+            theme.colors.foreground.primary
         } else {
-            theme.colors.text_muted
+            theme.colors.foreground.secondary
         };
         let natural_width = self.natural_width;
         let selected_shape = self.selected.then(|| {
             selected_tab_shape(
-                theme.colors.sidebar_bg,
+                theme.colors.surface.chrome,
                 Self::outline_color(theme),
                 px(theme.radii.control),
                 scaled_px(Self::TAB_BOTTOM_CURVE_RADIUS_PX),
@@ -279,8 +285,8 @@ impl Tab {
             .div
             .group("tab")
             .h(scaled_px(TAB_HEIGHT_PX))
-            .min_w(scaled_px(Self::TAB_MIN_WIDTH_PX))
-            .mx(scaled_px(Self::TAB_HORIZONTAL_MARGIN_PX))
+            .min_w(scaled_px(Self::MIN_WIDTH_PX))
+            .mx(scaled_px(Self::HORIZONTAL_MARGIN_PX))
             .px(horizontal_padding)
             .pt(scaled_px(Self::TAB_TOP_PADDING_PX))
             .pb(scaled_px(Self::TAB_BOTTOM_FUSE_PAD_PX))
@@ -308,7 +314,7 @@ impl Tab {
         }
 
         if !self.selected {
-            let hover_text = theme.colors.text;
+            let hover_text = theme.colors.foreground.primary;
             base = base.hover(move |s| s.text_color(hover_text));
         }
 

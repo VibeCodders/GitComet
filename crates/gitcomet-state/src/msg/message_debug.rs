@@ -92,6 +92,7 @@ impl std::fmt::Debug for InternalMsg {
                 .finish(),
             InternalMsg::LogLoaded {
                 repo_id,
+                seq,
                 scope,
                 author,
                 cursor,
@@ -99,10 +100,23 @@ impl std::fmt::Debug for InternalMsg {
             } => f
                 .debug_struct("LogLoaded")
                 .field("repo_id", repo_id)
+                .field("seq", seq)
                 .field("scope", scope)
                 .field("author", author)
                 .field("cursor", cursor)
                 .field("result", result)
+                .finish(),
+            InternalMsg::LogChunkLoaded {
+                repo_id,
+                seq,
+                commits,
+                scanned,
+            } => f
+                .debug_struct("LogChunkLoaded")
+                .field("repo_id", repo_id)
+                .field("seq", seq)
+                .field("commits", &commits.len())
+                .field("scanned", scanned)
                 .finish(),
             InternalMsg::TagsLoaded { repo_id, result } => f
                 .debug_struct("TagsLoaded")
@@ -208,6 +222,16 @@ impl std::fmt::Debug for InternalMsg {
                 .field("repo_id", repo_id)
                 .field("result", result)
                 .finish(),
+            InternalMsg::HoverCommitMessageLoaded {
+                repo_id,
+                commit_id,
+                result,
+            } => f
+                .debug_struct("HoverCommitMessageLoaded")
+                .field("repo_id", repo_id)
+                .field("commit_id", commit_id)
+                .field("result", result)
+                .finish(),
             InternalMsg::FileHistoryLoaded {
                 repo_id,
                 path,
@@ -244,6 +268,16 @@ impl std::fmt::Debug for InternalMsg {
                 .finish(),
             InternalMsg::WorktreesLoaded { repo_id, result } => f
                 .debug_struct("WorktreesLoaded")
+                .field("repo_id", repo_id)
+                .field("result", result)
+                .finish(),
+            InternalMsg::WorktreeDirtyLoaded { repo_id, result } => f
+                .debug_struct("WorktreeDirtyLoaded")
+                .field("repo_id", repo_id)
+                .field("result", result)
+                .finish(),
+            InternalMsg::RefMetadataLoaded { repo_id, result } => f
+                .debug_struct("RefMetadataLoaded")
                 .field("repo_id", repo_id)
                 .field("result", result)
                 .finish(),
@@ -303,6 +337,16 @@ impl std::fmt::Debug for InternalMsg {
                 .debug_struct("CommitDetailsLoaded")
                 .field("repo_id", repo_id)
                 .field("commit_id", commit_id)
+                .field("result", result)
+                .finish(),
+            InternalMsg::CommitRevealResolved {
+                repo_id,
+                reference,
+                result,
+            } => f
+                .debug_struct("CommitRevealResolved")
+                .field("repo_id", repo_id)
+                .field("reference", reference)
                 .field("result", result)
                 .finish(),
             InternalMsg::RangeFilesLoaded {

@@ -97,11 +97,11 @@ impl Render for TooltipBubbleView {
             div()
                 .px_2()
                 .py_1()
-                .bg(self.theme.colors.tooltip_bg)
+                .bg(self.theme.colors.tooltip.background)
                 .rounded(px(self.theme.radii.row))
                 .shadow(crate::theme::shadow_popover(self.theme))
                 .text_xs()
-                .text_color(self.theme.colors.tooltip_text)
+                .text_color(self.theme.colors.tooltip.foreground)
                 .child(self.text.clone()),
         )
     }
@@ -158,6 +158,8 @@ impl GitCometView {
                             .history_tag_preferences(cx);
                         let history_relative_dates =
                             this.main_pane.read(cx).history_relative_dates(cx);
+                        let history_highlight_commit_chain =
+                            this.main_pane.read(cx).history_highlight_commit_chain(cx);
                         let (
                             mergetool_auto_advance,
                             mergetool_collapse_unchanged,
@@ -197,6 +199,7 @@ impl GitCometView {
                             change_tracking_view: Some(this.change_tracking_view.key().to_string()),
                             // Owned by the repository picker, not this snapshot.
                             repo_picker_sort: None,
+                            repo_picker_collapsed_sections: None,
                             diff_scroll_sync: Some(this.diff_scroll_sync.key().to_string()),
                             diff_content_mode: Some(this.diff_content_mode.key().to_string()),
                             diff_whitespace_mode: Some(
@@ -209,6 +212,10 @@ impl GitCometView {
                             ),
                             diff_word_wrap: Some(this.diff_word_wrap),
                             diff_show_line_numbers: Some(this.diff_show_line_numbers),
+                            // Auto-save is only ever changed from the settings
+                            // window; the main window mirrors it to drive the
+                            // editor, so None keeps the stored value.
+                            auto_save_file_edits: None,
                             mergetool_auto_advance: Some(mergetool_auto_advance),
                             mergetool_collapse_unchanged: Some(mergetool_collapse_unchanged),
                             mergetool_output_scroll_sync: Some(mergetool_output_scroll_sync),
@@ -221,6 +228,7 @@ impl GitCometView {
                             history_show_date: Some(history_show_date),
                             history_show_sha: Some(history_show_sha),
                             history_relative_dates: Some(history_relative_dates),
+                            history_highlight_commit_chain: Some(history_highlight_commit_chain),
                             terminal_external_mode: None,
                             terminal_external_program: None,
                             terminal_external_args: None,

@@ -12,6 +12,23 @@ where
     crate::ui_scale::design_px(ACTION_BAR_HEIGHT_PX, cx)
 }
 
+/// Longest badge label rendered before eliding. The badges sit in the action
+/// bar's `flex_1` left group and `components::Button` takes a plain string with
+/// no truncation of its own, so an unbounded branch name or folder name would
+/// squeeze the Pull/Push/Terminal controls off the right edge. The full value
+/// stays available in each badge's tooltip.
+const BADGE_LABEL_MAX_CHARS: usize = 28;
+
+fn truncate_badge_label(label: &str) -> SharedString {
+    let mut chars = label.chars();
+    let head: String = chars.by_ref().take(BADGE_LABEL_MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{head}…").into()
+    } else {
+        head.into()
+    }
+}
+
 fn head_branch_has_tracking_upstream(
     head_branch: &Loadable<String>,
     branches: &Loadable<Arc<Vec<Branch>>>,
@@ -224,8 +241,11 @@ impl Render for ActionBarView {
         let ui_scale_percent = crate::ui_scale::current(cx).percent;
         let scaled_px =
             |value: f32| crate::ui_scale::design_px_from_percent(value, ui_scale_percent);
-        let icon_primary = theme.colors.accent;
-        let icon_muted = with_alpha(theme.colors.accent, if theme.is_dark { 0.72 } else { 0.82 });
+        let icon_primary = theme.colors.accent.foreground;
+        let icon_muted = with_alpha(
+            theme.colors.accent.foreground,
+            if theme.is_dark { 0.72 } else { 0.82 },
+        );
         let icon = |path: &'static str, color: gpui::Rgba| svg_icon(path, color, scaled_px(14.0));
         let spinner =
             |id: (&'static str, u64), color: gpui::Rgba| svg_spinner(id, color, scaled_px(14.0));
@@ -238,8 +258,18 @@ impl Render for ActionBarView {
                 .into_any_element()
         };
 
+        // Workspace, branch and historical badges all light up while their own
+        // picker is open, so they need the active invoker before any of them.
+        let menu_selected_bg = with_alpha(
+            theme.colors.accent.foreground,
+            if theme.is_dark { 0.26 } else { 0.20 },
+        );
+        let active_invoker = self.active_context_menu_invoker.clone();
+
         // Badge shown next to the selectors when the file directory is pinned to
-        // a historical commit (not the live state). Click → back to live.
+        // a historical commit (not the live state). Click → back to live. Same
+        // geometry and behaviour as the workspace/branch badges, in the fixed
+        // "off-live" purple rather than the theme accent.
         let historical_badge = self
             .active_repo()
             .and_then(|repo| {
@@ -251,36 +281,28 @@ impl Render for ActionBarView {
             })
             .map(|(repo_id, sha, short)| {
                 let purple = crate::theme::historical_outline(theme.is_dark);
-                div()
-                    .id("historical_browse_badge")
-                    .debug_selector(|| "historical_browse_badge".to_string())
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .px_2()
-                    .py_1()
-                    .rounded(px(theme.radii.pill))
+                let invoker: SharedString = "historical_browse_badge".into();
+                let is_active = active_invoker
+                    .as_ref()
+                    .is_some_and(|id| id.as_ref() == invoker.as_ref());
+                components::Button::new("historical_browse_badge", short)
+                    .start_slot(icon("icons/history.svg", purple))
+                    .style(components::ButtonStyle::Subtle)
+                    .text_color(purple)
                     .bg(with_alpha(purple, 0.12))
-                    .border_1()
-                    .border_color(purple)
-                    .cursor_pointer()
-                    .child(icon("icons/history.svg", purple))
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(purple)
-                            .child(short),
-                    )
-                    .on_click(cx.listener(move |this, e: &ClickEvent, window, cx| {
-                        this.activate_context_menu_invoker("historical_browse_badge".into(), cx);
-                        this.open_popover_at(
+                    .hover_bg(with_alpha(purple, if theme.is_dark { 0.22 } else { 0.18 }))
+                    .selected(is_active)
+                    .selected_bg(with_alpha(purple, if theme.is_dark { 0.30 } else { 0.24 }))
+                    .on_click_with_bounds(theme, cx, move |this, _e, bounds, window, cx| {
+                        this.activate_context_menu_invoker(invoker.clone(), cx);
+                        this.open_popover_for_bounds(
                             PopoverKind::BrowseHistoryMenu { repo_id },
-                            e.position(),
+                            bounds,
                             window,
                             cx,
                         );
-                    }))
+                    })
+                    .debug_selector(|| "historical_browse_badge".to_string())
                     .gitcomet_tooltip(
                         theme,
                         format!("Browsing commit {sha} — click for history / go live").into(),
@@ -367,9 +389,9 @@ impl Render for ActionBarView {
             .start_slot(icon(
                 "icons/arrow_left.svg",
                 if nav_can_back {
-                    theme.colors.text
+                    theme.colors.foreground.primary
                 } else {
-                    theme.colors.text_muted
+                    theme.colors.foreground.secondary
                 },
             ))
             .style(components::ButtonStyle::Transparent)
@@ -391,9 +413,9 @@ impl Render for ActionBarView {
             .start_slot(icon(
                 "icons/arrow_right.svg",
                 if nav_can_forward {
-                    theme.colors.text
+                    theme.colors.foreground.primary
                 } else {
-                    theme.colors.text_muted
+                    theme.colors.foreground.secondary
                 },
             ))
             .style(components::ButtonStyle::Transparent)
@@ -420,15 +442,85 @@ impl Render for ActionBarView {
             .child(nav_back)
             .child(nav_forward);
 
+        // Workspace (worktree) and branch badges: current state at a glance,
+        // each opening a filterable picker. Both sit right after the nav arrows.
+        let workspace_badge = self.active_repo().map(|repo| {
+            let repo_id = repo.id;
+            let label = truncate_badge_label(&crate::view::path_display::repo_path_name(
+                &repo.spec.workdir,
+            ));
+            let workdir = repo.spec.workdir.display().to_string();
+            let invoker: SharedString = "workspace_badge".into();
+            let is_active = active_invoker
+                .as_ref()
+                .is_some_and(|id| id.as_ref() == invoker.as_ref());
+            components::Button::new("workspace_badge", label.clone())
+                .start_slot(icon("icons/git_worktree.svg", icon_primary))
+                .style(components::ButtonStyle::Subtle)
+                .selected(is_active)
+                .selected_bg(menu_selected_bg)
+                .on_click_with_bounds(theme, cx, move |this, _e, bounds, window, cx| {
+                    this.activate_context_menu_invoker(invoker.clone(), cx);
+                    this.open_popover_for_bounds(
+                        PopoverKind::worktree(repo_id, WorktreePopoverKind::BadgePicker),
+                        bounds,
+                        window,
+                        cx,
+                    );
+                })
+                .debug_selector(|| "workspace_badge".to_string())
+                .gitcomet_tooltip(theme, format!("Switch worktree\n{workdir}").into())
+        });
+
+        let branch_badge = self.active_repo().and_then(|repo| {
+            let Loadable::Ready(head) = &repo.head_branch else {
+                return None;
+            };
+            // Detached HEAD surfaces as the literal "HEAD"; label it as such
+            // rather than pretending it is a branch.
+            let detached = head == "HEAD";
+            let label: SharedString = if detached {
+                "detached".into()
+            } else {
+                truncate_badge_label(head)
+            };
+            let invoker: SharedString = "branch_badge".into();
+            let is_active = active_invoker
+                .as_ref()
+                .is_some_and(|id| id.as_ref() == invoker.as_ref());
+            let tooltip: SharedString = if detached {
+                "Detached HEAD — click to check out a branch".into()
+            } else {
+                format!("On branch {head} — click to switch").into()
+            };
+            Some(
+                components::Button::new("branch_badge", label)
+                    .start_slot(icon("icons/git_branch.svg", icon_primary))
+                    .style(components::ButtonStyle::Subtle)
+                    .selected(is_active)
+                    .selected_bg(menu_selected_bg)
+                    .on_click_with_bounds(theme, cx, move |this, _e, bounds, window, cx| {
+                        this.activate_context_menu_invoker(invoker.clone(), cx);
+                        this.open_popover_for_bounds(
+                            PopoverKind::BranchPicker {
+                                purpose: BranchPickerPurpose::Checkout,
+                            },
+                            bounds,
+                            window,
+                            cx,
+                        );
+                    })
+                    .debug_selector(|| "branch_badge".to_string())
+                    .gitcomet_tooltip(theme, tooltip),
+            )
+        });
+
         let pull_color = if pull_count > 0 {
-            theme.colors.warning
+            theme.colors.status.warning.foreground
         } else {
             icon_muted
         };
-        let menu_selected_bg =
-            with_alpha(theme.colors.accent, if theme.is_dark { 0.26 } else { 0.20 });
         let mut pull_main = components::Button::new("pull_main", "Pull")
-            .borderless()
             .rounded_left()
             .start_slot(if pull_loading {
                 spinner(("pull_spinner", active_repo_key), pull_color).into_any_element()
@@ -436,7 +528,6 @@ impl Render for ActionBarView {
                 icon("icons/arrow_down.svg", pull_color).into_any_element()
             })
             .style(components::ButtonStyle::Subtle)
-            .no_hover_border()
             .disabled(!pull_default_enabled);
         if pull_count > 0 {
             pull_main = pull_main.end_slot(count_badge(pull_count, pull_color));
@@ -448,16 +539,14 @@ impl Render for ActionBarView {
             .is_some_and(|id| id.as_ref() == pull_picker_invoker.as_ref());
         let pull_tracking_branch_name = tracking_branch_name.clone();
         let pull_menu_icon_color = if pull_picker_active {
-            theme.colors.accent
+            theme.colors.accent.foreground
         } else {
             icon_muted
         };
         let pull_menu = components::Button::new("pull_menu", "")
-            .borderless()
             .rounded_right()
             .start_slot(icon("icons/chevron_down.svg", pull_menu_icon_color))
             .style(components::ButtonStyle::Subtle)
-            .no_hover_border()
             .selected(pull_picker_active)
             .selected_bg(menu_selected_bg);
 
@@ -487,7 +576,7 @@ impl Render for ActionBarView {
                         },
                     ),
                 )
-                .style(components::SplitButtonStyle::Outlined)
+                .style(components::SplitButtonStyle::Borderless)
                 .render(theme, ui_scale_percent),
             )
             .gitcomet_tooltip(
@@ -496,7 +585,7 @@ impl Render for ActionBarView {
             );
 
         let push_color = if push_count > 0 {
-            theme.colors.success
+            theme.colors.status.success.foreground
         } else {
             icon_muted
         };
@@ -526,15 +615,13 @@ impl Render for ActionBarView {
             })
             .gitcomet_tooltip(theme, terminal_tooltip);
         let mut push_main = components::Button::new("push_main", "Push")
-            .borderless()
             .rounded_left()
             .start_slot(if push_loading {
                 spinner(("push_spinner", active_repo_key), push_color).into_any_element()
             } else {
                 icon("icons/arrow_up.svg", push_color).into_any_element()
             })
-            .style(components::ButtonStyle::Subtle)
-            .no_hover_border();
+            .style(components::ButtonStyle::Subtle);
         if push_count > 0 {
             push_main = push_main.end_slot(count_badge(push_count, push_color));
         }
@@ -545,16 +632,14 @@ impl Render for ActionBarView {
             .is_some_and(|id| id.as_ref() == push_picker_invoker.as_ref());
         let push_tracking_branch_name = tracking_branch_name.clone();
         let push_menu_icon_color = if push_picker_active {
-            theme.colors.accent
+            theme.colors.accent.foreground
         } else {
             icon_muted
         };
         let push_menu = components::Button::new("push_menu", "")
-            .borderless()
             .rounded_right()
             .start_slot(icon("icons/chevron_down.svg", push_menu_icon_color))
             .style(components::ButtonStyle::Subtle)
-            .no_hover_border()
             .selected(push_picker_active)
             .selected_bg(menu_selected_bg);
 
@@ -631,7 +716,7 @@ impl Render for ActionBarView {
                         },
                     ),
                 )
-                .style(components::SplitButtonStyle::Outlined)
+                .style(components::SplitButtonStyle::Borderless)
                 .render(theme, ui_scale_percent),
             )
             .gitcomet_tooltip(
@@ -691,6 +776,7 @@ impl Render for ActionBarView {
                             repo_id,
                             target,
                             source_selectable: true,
+                            name_prefix: String::new(),
                         },
                         bounds,
                         window,
@@ -739,7 +825,7 @@ impl Render for ActionBarView {
             .items_center()
             .justify_between()
             .px_2()
-            .bg(theme.colors.sidebar_bg)
+            .bg(theme.colors.surface.chrome)
             .child(
                 div()
                     .flex()
@@ -747,6 +833,8 @@ impl Render for ActionBarView {
                     .gap_2()
                     .flex_1()
                     .child(global_nav)
+                    .children(workspace_badge)
+                    .children(branch_badge)
                     .children(historical_badge)
                     .when(is_merging, |d| {
                         d.child(
@@ -757,7 +845,7 @@ impl Render for ActionBarView {
                                 .child(
                                     div()
                                         .text_xs()
-                                        .text_color(theme.colors.warning)
+                                        .text_color(theme.colors.status.warning.foreground)
                                         .font_weight(FontWeight::BOLD)
                                         .child("MERGING"),
                                 )
@@ -789,7 +877,7 @@ impl Render for ActionBarView {
                                     .child(
                                         div()
                                             .text_xs()
-                                            .text_color(theme.colors.warning)
+                                            .text_color(theme.colors.status.warning.foreground)
                                             .font_weight(FontWeight::BOLD)
                                             .child(sequencer_label),
                                     )
@@ -865,6 +953,28 @@ mod tests {
             upstream,
             divergence: None,
         }
+    }
+
+    #[test]
+    fn truncate_badge_label_leaves_short_labels_alone() {
+        assert_eq!(truncate_badge_label("main"), "main");
+    }
+
+    #[test]
+    fn truncate_badge_label_elides_long_labels() {
+        // Unbounded labels would push the Pull/Push controls off the right edge.
+        let long = "feature/PROJ-1234-refactor-the-entire-rendering-pipeline";
+        let out = truncate_badge_label(long);
+        assert!(out.ends_with('\u{2026}'), "expected an ellipsis, got {out}");
+        assert_eq!(out.chars().count(), BADGE_LABEL_MAX_CHARS + 1);
+    }
+
+    #[test]
+    fn truncate_badge_label_counts_characters_not_bytes() {
+        // Multi-byte names must not be cut mid-character.
+        let label = "ä".repeat(BADGE_LABEL_MAX_CHARS + 5);
+        let out = truncate_badge_label(&label);
+        assert_eq!(out.chars().count(), BADGE_LABEL_MAX_CHARS + 1);
     }
 
     #[test]

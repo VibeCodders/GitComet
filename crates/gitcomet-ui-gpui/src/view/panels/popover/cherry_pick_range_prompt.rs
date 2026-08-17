@@ -25,7 +25,16 @@ fn picker_row(
     });
 
     if is_focused {
-        let refs = this.active_branch_ref_picker_items(true, true);
+        // The source/range rows are plain ref lists (HEAD, branches, tags), the
+        // same shape as the create-branch-from-ref prompt's list, so they go
+        // through the shared ref-row cache and picker prompt.
+        let query = input.read_with(cx, |input, _| input.text().trim().to_string());
+        let built = branch_picker::ref_rows_cached(
+            this,
+            branch_picker::RefRowsSpec::source_ref(),
+            &query,
+        );
+        let payloads = std::rc::Rc::clone(&built.payloads);
         div()
             .flex()
             .flex_col()
@@ -34,22 +43,31 @@ fn picker_row(
                     .px_2()
                     .py_1()
                     .text_sm()
-                    .text_color(theme.colors.text_muted)
+                    .text_color(theme.colors.foreground.secondary)
                     .child(label),
             )
             .child(
                 div().px_2().pb_1().w_full().min_w(px(0.0)).child(
-                    components::BranchRefPicker::new(
+                    branch_picker::ref_picker_prompt(
                         input.clone(),
                         this.picker_prompt_scroll.clone(),
-                        refs,
+                        &built,
+                        cx,
                     )
                     .tooltip_host(this.tooltip_host.clone())
                     .empty_text("No matches")
                     .max_height(scaled_px(240.0))
                     .selected_index(this.branch_picker_selected_index)
-                    .select_on_mouse_down()
-                    .render(theme, ui_scale_percent, cx, on_select),
+                    .render(
+                        theme,
+                        ui_scale_percent,
+                        cx,
+                        move |this, ix, event, window, cx| {
+                            if let Some(name) = payloads.get(ix).cloned() {
+                                on_select(this, name, event, window, cx);
+                            }
+                        },
+                    ),
                 ),
             )
     } else {
@@ -61,7 +79,7 @@ fn picker_row(
                     .px_2()
                     .py_1()
                     .text_sm()
-                    .text_color(theme.colors.text_muted)
+                    .text_color(theme.colors.foreground.secondary)
                     .child(label),
             )
             .child(div().px_2().pb_1().w_full().min_w(px(0.0)).child(input.clone()))
@@ -95,7 +113,7 @@ fn preview_section(
             .px_2()
             .py_1()
             .text_xs()
-            .text_color(theme.colors.text_muted)
+            .text_color(theme.colors.foreground.secondary)
             .child("Pick a source and a range to preview the commits to cherry-pick.")
     } else {
         match preview.map(|p| &p.commits) {
@@ -139,7 +157,7 @@ fn preview_section(
                                     .flex_none()
                                     .text_xs()
                                     .font_family("ui-monospace")
-                                    .text_color(theme.colors.text_muted)
+                                    .text_color(theme.colors.foreground.secondary)
                                     .child(short.to_string()),
                             )
                             .child(
@@ -149,7 +167,7 @@ fn preview_section(
                                     .text_xs()
                                     .whitespace_nowrap()
                                     .line_clamp(1)
-                                    .text_color(theme.colors.text)
+                                    .text_color(theme.colors.foreground.primary)
                                     .child(commit.summary.to_string()),
                             ),
                     );
@@ -162,7 +180,7 @@ fn preview_section(
                             .px_2()
                             .py_1()
                             .text_xs()
-                            .text_color(theme.colors.text_muted)
+                            .text_color(theme.colors.foreground.secondary)
                             .child(if more > 0 {
                                 format!(
                                     "{} commits will be cherry-picked (showing first {} — click one to open it)",
@@ -188,13 +206,13 @@ fn preview_section(
                 .px_2()
                 .py_1()
                 .text_xs()
-                .text_color(theme.colors.text_muted)
+                .text_color(theme.colors.foreground.secondary)
                 .child("No commits to cherry-pick in this range."),
             Some(gitcomet_state::model::Loadable::Error(error)) => div()
                 .px_2()
                 .py_1()
                 .text_xs()
-                .text_color(theme.colors.warning)
+                .text_color(theme.colors.status.warning.foreground)
                 .child(error.clone()),
             Some(gitcomet_state::model::Loadable::NotLoaded)
             | Some(gitcomet_state::model::Loadable::Loading)
@@ -202,7 +220,7 @@ fn preview_section(
                 .px_2()
                 .py_1()
                 .text_xs()
-                .text_color(theme.colors.text_muted)
+                .text_color(theme.colors.foreground.secondary)
                 .child("Loading preview…"),
         }
     };
@@ -211,7 +229,7 @@ fn preview_section(
         .flex()
         .flex_col()
         .w_full()
-        .child(div().border_t_1().border_color(theme.colors.border))
+        .child(div().border_t_1().border_color(theme.colors.stroke.default))
         .child(body)
 }
 
@@ -246,13 +264,13 @@ pub(super) fn panel(
         .flex_col()
         .w(scaled_px(540.0))
         .child(popover_title("Cherry-pick branch"))
-        .child(div().border_t_1().border_color(theme.colors.border))
+        .child(div().border_t_1().border_color(theme.colors.stroke.default))
         .child(
             div()
                 .px_2()
                 .py_1()
                 .text_sm()
-                .text_color(theme.colors.text_muted)
+                .text_color(theme.colors.foreground.secondary)
                 .child(
                     "Creates a new branch C from D, checks it out, and cherry-picks every commit unique to A relative to B (B..A, oldest first, merge commits skipped). B must be an ancestor of A.",
                 ),
@@ -306,11 +324,11 @@ pub(super) fn panel(
                     .px_2()
                     .pb_1()
                     .text_sm()
-                    .text_color(theme.colors.warning)
+                    .text_color(theme.colors.status.warning.foreground)
                     .child("Source and range are the same — there is nothing to cherry-pick."),
             )
         })
-        .child(div().border_t_1().border_color(theme.colors.border))
+        .child(div().border_t_1().border_color(theme.colors.stroke.default))
         .child(
             div()
                 .px_2()

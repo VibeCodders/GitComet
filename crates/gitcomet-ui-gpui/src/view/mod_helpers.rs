@@ -1,7 +1,7 @@
 use super::*;
 use gitcomet_core::path_utils::canonicalize_or_original;
 use gitcomet_core::services::InteractiveRebaseAction;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 type AlacrittyTermLock = super::terminal_alacritty::AlacrittyTermLock;
 
@@ -598,11 +598,30 @@ pub(super) struct DiffTextHitbox {
     pub(super) text_start_offset: usize,
     pub(super) text_len: usize,
     pub(super) offset_map: Option<DiffTextOffsetMap>,
+    /// Exactly the text this row painted, tabs expanded and whitespace revealed
+    /// as they were on screen.
+    ///
+    /// Offsets into it are the display offsets `x_for_index` wants, which is why
+    /// the search reveal measures against this rather than re-deriving the row's
+    /// text: the two do not always agree, and a row whose text cannot be found
+    /// again reveals nothing.
+    pub(super) painted_text: SharedString,
     pub(super) streamed_ascii_monospace_cell_width: Option<Pixels>,
     /// Set by rows that painted their text with wrapping. Those rows cover
     /// several visual lines, so a click resolves through the layout they were
     /// painted with rather than through an x offset along one shaped line.
     pub(super) wrapped: Option<DiffTextWrappedHit>,
+}
+
+/// Where one merge-tool column row painted its text, and the line it shaped.
+///
+/// The conflict columns are their own canvases and register nothing in
+/// [`DiffTextHitbox`], so quick search's sideways reveal measures against this
+/// instead. `layout.text` is exactly what was painted, so offsets into it are
+/// the display offsets `x_for_index` wants.
+pub(super) struct ConflictTextHitbox {
+    pub(super) bounds: Bounds<Pixels>,
+    pub(super) layout: gpui::ShapedLine,
 }
 
 /// The wrapped layout a row painted, plus what it takes to read offsets back
@@ -934,10 +953,10 @@ pub(super) fn reconcile_status_multi_selection(
     selection: &mut StatusMultiSelection,
     status: &gitcomet_core::domain::RepoStatus,
 ) {
-    let mut untracked_paths: HashSet<&std::path::Path> =
-        HashSet::with_capacity_and_hasher(status.unstaged.len(), Default::default());
-    let mut unstaged_paths: HashSet<&std::path::Path> =
-        HashSet::with_capacity_and_hasher(status.unstaged.len(), Default::default());
+    let mut untracked_paths: FxHashSet<&std::path::Path> =
+        FxHashSet::with_capacity_and_hasher(status.unstaged.len(), Default::default());
+    let mut unstaged_paths: FxHashSet<&std::path::Path> =
+        FxHashSet::with_capacity_and_hasher(status.unstaged.len(), Default::default());
     for entry in &status.unstaged {
         unstaged_paths.insert(entry.path.as_path());
         if entry.kind == FileStatusKind::Untracked {
@@ -969,8 +988,8 @@ pub(super) fn reconcile_status_multi_selection(
         selection.unstaged_anchor_status_rev = None;
     }
 
-    let mut staged_paths: HashSet<&std::path::Path> =
-        HashSet::with_capacity_and_hasher(status.staged.len(), Default::default());
+    let mut staged_paths: FxHashSet<&std::path::Path> =
+        FxHashSet::with_capacity_and_hasher(status.staged.len(), Default::default());
     for entry in &status.staged {
         staged_paths.insert(entry.path.as_path());
     }
@@ -994,10 +1013,10 @@ pub(super) fn reconcile_status_multi_selection_with_repo(
     repo: &RepoState,
 ) {
     if let Some(worktree) = repo.worktree_status_entries() {
-        let mut untracked_paths: HashSet<&std::path::Path> =
-            HashSet::with_capacity_and_hasher(worktree.len(), Default::default());
-        let mut unstaged_paths: HashSet<&std::path::Path> =
-            HashSet::with_capacity_and_hasher(worktree.len(), Default::default());
+        let mut untracked_paths: FxHashSet<&std::path::Path> =
+            FxHashSet::with_capacity_and_hasher(worktree.len(), Default::default());
+        let mut unstaged_paths: FxHashSet<&std::path::Path> =
+            FxHashSet::with_capacity_and_hasher(worktree.len(), Default::default());
         for entry in worktree {
             unstaged_paths.insert(entry.path.as_path());
             if entry.kind == FileStatusKind::Untracked {
@@ -1031,8 +1050,8 @@ pub(super) fn reconcile_status_multi_selection_with_repo(
     }
 
     if let Some(staged) = repo.staged_status_entries() {
-        let mut staged_paths: HashSet<&std::path::Path> =
-            HashSet::with_capacity_and_hasher(staged.len(), Default::default());
+        let mut staged_paths: FxHashSet<&std::path::Path> =
+            FxHashSet::with_capacity_and_hasher(staged.len(), Default::default());
         for entry in staged {
             staged_paths.insert(entry.path.as_path());
         }
@@ -1195,6 +1214,22 @@ pub(super) type LoadableMarkdownDiff =
     Loadable<Arc<crate::view::markdown_preview::MarkdownPreviewDiff>>;
 
 pub(super) type LoadableImagePreview = Loadable<Option<Arc<gpui::Image>>>;
+
+/// The rendered markdown surface quick search is looking at.
+///
+/// Each shape has its own row space and its own way of being scrolled, which
+/// is why search dispatches on this rather than on the preview kind alone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::view) enum MarkdownSearchSurface {
+    /// Rendered file preview: one flowing document, no fixed row height.
+    Worktree,
+    /// Rendered markdown diff, inline: one virtualized list on `diff_scroll`.
+    DiffInline,
+    /// Rendered markdown diff, split: two lists sharing one visual row space.
+    DiffSplit,
+    /// Merge tool rendered preview: one unwrapped list per input column.
+    Conflict,
+}
 
 /// Which markdown preview list a wrap plan belongs to. Split view wraps its
 /// two columns to different widths, and the inline and worktree lists have
@@ -1417,7 +1452,7 @@ pub(super) struct ResolvedOutlineData {
     /// Per-line conflict marker metadata for gutter markers.
     pub(super) markers: Vec<Option<ResolvedOutputConflictMarker>>,
     /// Source line keys currently represented in resolved output (for dedupe/plus-icon).
-    pub(super) sources_index: HashSet<conflict_resolver::SourceLineKey>,
+    pub(super) sources_index: FxHashSet<conflict_resolver::SourceLineKey>,
 }
 
 /// Mode-specific state for streamed (giant-file) conflict resolution.
@@ -1512,16 +1547,14 @@ pub(super) struct ConflictResolverUiState {
     /// section 30 collapsed context mode: fold unchanged runs in the source columns.
     pub(super) collapse_context: bool,
     /// Per-fold reveal state for collapsed context mode, keyed by fold id.
-    pub(super) context_fold_reveals:
-        std::collections::HashMap<usize, conflict_resolver::ConflictFoldReveal>,
+    pub(super) context_fold_reveals: FxHashMap<usize, conflict_resolver::ConflictFoldReveal>,
     /// section 30 collapsed context mode for the resolved output pane: fold
     /// projection in output line space. `None` ⇒ pass-through (one row per
     /// line). Rebuilt lazily after its inputs change.
     pub(super) resolved_output_visible: Option<conflict_resolver::ThreeWayVisibleProjection>,
     pub(super) resolved_output_visible_dirty: bool,
     /// Per-fold reveal state for resolved-output folds (output-line fold ids).
-    pub(super) output_context_fold_reveals:
-        std::collections::HashMap<usize, conflict_resolver::ConflictFoldReveal>,
+    pub(super) output_context_fold_reveals: FxHashMap<usize, conflict_resolver::ConflictFoldReveal>,
     /// Mapping from visible block index to `ConflictSession` region index.
     pub(super) conflict_region_indices: Vec<usize>,
     /// Mapping from visible marker block index to its semantic merge-plan
@@ -1582,7 +1615,7 @@ pub(super) struct ConflictResolverUiState {
     pub(super) conflict_choices: Vec<conflict_resolver::ConflictChoice>,
     /// Ignore-whitespace visual row kinds by two-way split source row.
     pub(super) two_way_split_visual_kind_cache:
-        HashMap<usize, gitcomet_core::file_diff::FileDiffRowKind>,
+        FxHashMap<usize, gitcomet_core::file_diff::FileDiffRowKind>,
     /// Visible-row indices used to measure horizontal width for the two-way split inputs.
     pub(super) two_way_horizontal_measure_rows: [usize; 2],
     pub(super) three_way_word_highlights: ThreeWaySides<conflict_resolver::WordHighlights>,
@@ -1639,7 +1672,7 @@ impl Default for ConflictResolverUiState {
             shared_path: None,
             loaded_file: None,
             collapse_context: false,
-            context_fold_reveals: std::collections::HashMap::default(),
+            context_fold_reveals: FxHashMap::default(),
             conflict_syntax_language: None,
             source_hash: None,
             output_is_protected: false,
@@ -1668,7 +1701,7 @@ impl Default for ConflictResolverUiState {
             three_way_horizontal_measure_rows: [0; 3],
             conflict_has_base: Vec::new(),
             conflict_choices: Vec::new(),
-            two_way_split_visual_kind_cache: HashMap::default(),
+            two_way_split_visual_kind_cache: FxHashMap::default(),
             two_way_horizontal_measure_rows: [0; 2],
             three_way_word_highlights: ThreeWaySides::default(),
             two_way_aligned_word_highlights: FxHashMap::default(),
@@ -1688,7 +1721,7 @@ impl Default for ConflictResolverUiState {
             resolved_outline_gutter_rows: Vec::new(),
             resolved_output_visible: None,
             resolved_output_visible_dirty: true,
-            output_context_fold_reveals: std::collections::HashMap::default(),
+            output_context_fold_reveals: FxHashMap::default(),
             markdown_preview: ConflictResolverMarkdownPreviewState::default(),
             image_preview: ConflictResolverImagePreviewState::default(),
             resolver_preview_mode: ConflictResolverPreviewMode::default(),
@@ -1889,6 +1922,89 @@ impl ConflictResolverUiState {
                 || (aligned_rows.is_empty() && aligned_rows.start == aligned_row))
                 .then_some(meta.output_line as usize)
         })
+    }
+
+    /// Map a visible input-column row to the resolved-output line it produced.
+    ///
+    /// Quick search walks the *input* columns, so a hit arrives as a visible
+    /// row rather than a nav target and
+    /// [`Self::output_line_for_nav_target_provenance`] cannot be reused. This
+    /// reads the same provenance table, keyed on the row's own side lines: an
+    /// output line belongs to this row when it names one of them as its origin.
+    /// `meta` is ordered by output line, so the first hit is the earliest line
+    /// the row contributed.
+    ///
+    /// Returns `None` when the outline carries no provenance — large outputs
+    /// skip building it (`should_skip_resolved_outline_provenance`), exactly as
+    /// conflict navigation's output reveal already degrades there.
+    pub(super) fn output_line_for_visible_row(&self, visible_ix: usize) -> Option<usize> {
+        // Indexed by `ResolvedLineSource` A/B/C, which names different columns
+        // per view mode — see `output_line_for_nav_target_provenance`.
+        let source_lines: [Option<usize>; 3] = match self.view_mode {
+            ConflictResolverViewMode::ThreeWay => {
+                let aligned_row = self.three_way_aligned_row_for_visible_row(visible_ix)?;
+                [
+                    self.three_way_aligned
+                        .side_line_for_row(ThreeWayColumn::Base.side_index(), aligned_row),
+                    self.three_way_aligned
+                        .side_line_for_row(ThreeWayColumn::Ours.side_index(), aligned_row),
+                    self.three_way_aligned
+                        .side_line_for_row(ThreeWayColumn::Theirs.side_index(), aligned_row),
+                ]
+            }
+            ConflictResolverViewMode::TwoWayDiff => {
+                // Split rows carry 1-based line numbers: `old` is Ours (source
+                // A here), `new` is Theirs (source B). There is no C.
+                //
+                // Deliberately *not* dispatched on `two_way_uses_aligned_rows`
+                // the way `two_way_visible_len` and friends are: the two-way
+                // scan that produces these indices resolves them through
+                // `two_way_split_projection` unconditionally, so this has to
+                // read the same space to agree with it. Both are wrong together
+                // whenever the aligned rows are in use — a pre-existing gap
+                // between what two-way search indexes and what it renders, which
+                // needs fixing on both sides at once.
+                let row = self.two_way_split_visible_row(visible_ix)?.row;
+                [
+                    row.old_line.and_then(|line| (line as usize).checked_sub(1)),
+                    row.new_line.and_then(|line| (line as usize).checked_sub(1)),
+                    None,
+                ]
+            }
+        };
+
+        if source_lines.iter().all(Option::is_none) {
+            return None;
+        }
+
+        self.resolved_outline.meta.iter().find_map(|meta| {
+            let side_ix = match meta.source {
+                conflict_resolver::ResolvedLineSource::A => 0,
+                conflict_resolver::ResolvedLineSource::B => 1,
+                conflict_resolver::ResolvedLineSource::C => 2,
+                conflict_resolver::ResolvedLineSource::Manual => return None,
+            };
+            let source_line = usize::try_from(meta.input_line?).ok()?.checked_sub(1)?;
+            (source_lines[side_ix] == Some(source_line)).then_some(meta.output_line as usize)
+        })
+    }
+
+    /// The aligned merge-plan row a visible three-way row stands for.
+    ///
+    /// Fold summary rows answer with the first row they cover, so a match
+    /// inside a fold still reveals the right neighbourhood of the output.
+    fn three_way_aligned_row_for_visible_row(&self, visible_ix: usize) -> Option<usize> {
+        match self.three_way_visible_item(visible_ix)? {
+            conflict_resolver::ThreeWayVisibleItem::Line(row) => Some(row),
+            conflict_resolver::ThreeWayVisibleItem::CollapsedContext {
+                source_line_start, ..
+            } => Some(source_line_start),
+            conflict_resolver::ThreeWayVisibleItem::CollapsedBlock(conflict_ix) => {
+                let range =
+                    self.three_way_conflict_ranges[ThreeWayColumn::Ours].get(conflict_ix)?;
+                Some(self.three_way_row_for_side_line(ThreeWayColumn::Ours, range.start))
+            }
+        }
     }
 
     pub(super) fn cached_loaded_file_for_target(
@@ -4321,11 +4437,6 @@ pub(super) enum PopoverKind {
         /// a value would make them compare equal.
         name_prefix: String,
     },
-    /// Pick a source ref A, a range ref B, a base branch D, and a name for a
-    /// new branch C: C is created from D, checked out, and every commit
-    /// unique to A relative to B (B..A, oldest first, merges skipped) is
-    /// cherry-picked onto it. B must be an ancestor of A.
-    ///
     /// The `prefill_*` fields seed the pickers when opened from a branch's
     /// context menu: source = the clicked branch, range = its upstream (when
     /// it has one), base = the current branch.
@@ -4384,6 +4495,14 @@ pub(super) enum PopoverKind {
         repo_id: RepoId,
         path: std::path::PathBuf,
     },
+    /// Right-click menu on a reflog panel row: the same reset actions the
+    /// history log's commit context menu offers, targeting the commit the
+    /// clicked reflog entry points at.
+    ReflogEntryMenu {
+        repo_id: RepoId,
+        target: CommitId,
+        selector: SharedString,
+    },
     ReflogPrompt {
         repo_id: RepoId,
     },
@@ -4419,6 +4538,10 @@ pub(super) enum PopoverKind {
         repo_id: RepoId,
     },
     CherryPickCommitConfirm {
+        repo_id: RepoId,
+        commit_id: CommitId,
+    },
+    MergeCommitConfirm {
         repo_id: RepoId,
         commit_id: CommitId,
     },
@@ -5143,6 +5266,16 @@ pub(crate) struct TerminalPanelResizeState {
     pub(super) start_height: Pixels,
 }
 
+/// Which content the bottom panel currently shows for a repository, when more
+/// than one of its panels (terminal, reflog, …) is open at once. A tab strip
+/// only appears once a second panel is available; with just one open, that
+/// panel fills the area exactly like before this switcher existed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum BottomPanelTab {
+    Terminal,
+    Reflog,
+}
+
 /// A cell in alacritty's grid coordinate space. `row` is a `Line`: `0` is the
 /// top of the visible screen at the live tail, and scrollback history is
 /// negative down to `-history_size`. Field order matters — the derived `Ord`
@@ -5546,7 +5679,7 @@ pub struct GitCometView {
     pub(super) last_window_size: Size<Pixels>,
     pub(super) ui_window_size_last_seen: Size<Pixels>,
     pub(super) ui_settings_persist_seq: u64,
-    pub(super) last_repo_activation_dispatch_at: HashMap<RepoId, Instant>,
+    pub(super) last_repo_activation_dispatch_at: FxHashMap<RepoId, Instant>,
     /// Set when a deactivation was caused by a move/resize grab we requested, so
     /// the matching re-activation does not trigger a repo refresh.
     pub(super) window_grab_activation_suppressed_at: Option<Instant>,
@@ -5556,7 +5689,7 @@ pub struct GitCometView {
     pub(super) show_timezone: bool,
     pub(super) change_tracking_view: ChangeTrackingView,
     pub(super) terminal_preferences: TerminalPreferences,
-    pub(super) terminal_sessions: HashMap<RepoId, RepoTerminalSession>,
+    pub(super) terminal_sessions: FxHashMap<RepoId, RepoTerminalSession>,
     pub(super) terminal_panel_height: Pixels,
     pub(super) terminal_panel_resize: Option<TerminalPanelResizeState>,
     pub(super) next_terminal_session_seq: u64,
@@ -5565,6 +5698,14 @@ pub struct GitCometView {
     pub(super) terminal_cursor_blink_active: bool,
     pub(super) terminal_cursor_blink_task_scheduled: bool,
     pub(super) terminal_cursor_blink_seq: u64,
+    /// The reflog panel. It owns its own per-repository state (filter text,
+    /// scroll, selection) — a separate entity so that hovering one of its rows
+    /// repaints the panel instead of the whole application window.
+    pub(super) reflog_pane: Entity<ReflogPaneView>,
+    /// Which of the bottom panel's contents is currently visible for a repo,
+    /// when more than one is open. Absent (and single-panel repos) fall back
+    /// to whichever panel is actually open.
+    pub(super) active_bottom_panel: FxHashMap<RepoId, BottomPanelTab>,
     pub(super) commit_push_after_enabled: bool,
     pub(super) diff_scroll_sync: DiffScrollSync,
     pub(super) diff_content_mode: DiffContentMode,
@@ -5622,7 +5763,7 @@ pub struct GitCometView {
         Option<gitcomet_state::model::SubmoduleTrustPromptState>,
     pub(super) pending_submodule_trust_check:
         Option<gitcomet_state::model::SubmoduleTrustCheckState>,
-    pub(super) pending_worktree_branch_removals: HashMap<(RepoId, std::path::PathBuf), String>,
+    pub(super) pending_worktree_branch_removals: FxHashMap<(RepoId, std::path::PathBuf), String>,
     pub(super) startup_crash_report: Option<StartupCrashReport>,
     #[cfg(target_os = "macos")]
     pub(super) recent_repos_menu_fingerprint: Vec<std::path::PathBuf>,

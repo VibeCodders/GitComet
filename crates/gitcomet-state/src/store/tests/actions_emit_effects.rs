@@ -4552,7 +4552,7 @@ fn cherry_pick_range_preview_loads_and_applies_matching_result() {
     state.repos.push(repo);
 
     let reduce_msg =
-        |state: &mut AppState, msg: Msg| reduce(&mut HashMap::default(), &AtomicU64::new(1), state, msg);
+        |state: &mut AppState, msg: Msg| reduce(&mut FxHashMap::default(), &AtomicU64::new(1), state, msg);
 
     let _ = reduce_msg(
         &mut state,

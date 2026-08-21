@@ -201,9 +201,11 @@ fn repo_for_popover<'a>(state: &'a AppState, popover: &PopoverKind) -> Option<&'
         | PopoverKind::HistoryBranchFilter { repo_id }
         | PopoverKind::HistoryAuthorFilter { repo_id }
         | PopoverKind::ReflogPrompt { repo_id }
+        | PopoverKind::ReflogEntryMenu { repo_id, .. }
         | PopoverKind::VirtualBranchesPrompt { repo_id }
         | PopoverKind::VirtualBranchPicker { repo_id, .. }
         | PopoverKind::VirtualBranchMovePicker { repo_id, .. }
+        | PopoverKind::MergeCommitConfirm { repo_id, .. }
         | PopoverKind::CommitShaLinkMenu { repo_id, .. } => Some(*repo_id),
     }?;
 
@@ -424,6 +426,8 @@ fn hash_repo_for_popover<H: Hasher>(repo: &RepoState, popover: &PopoverKind, has
         | PopoverKind::TerminalMenu { .. }
         | PopoverKind::RepoPicker
         | PopoverKind::CloneRepo
+        | PopoverKind::ReflogEntryMenu { .. }
+        | PopoverKind::MergeCommitConfirm { .. }
         | PopoverKind::CommitPrompt { .. } => {}
 
         PopoverKind::ReflogPrompt { .. } => {
@@ -625,6 +629,11 @@ fn hash_popover_kind<H: Hasher>(kind: &PopoverKind, hasher: &mut H) {
         }
         PopoverKind::CherryPickCommitConfirm { repo_id, commit_id } => {
             76u8.hash(hasher);
+            repo_id.hash(hasher);
+            commit_id.hash(hasher);
+        }
+        PopoverKind::MergeCommitConfirm { repo_id, commit_id } => {
+            106u8.hash(hasher);
             repo_id.hash(hasher);
             commit_id.hash(hasher);
         }
@@ -936,6 +945,16 @@ fn hash_popover_kind<H: Hasher>(kind: &PopoverKind, hasher: &mut H) {
         PopoverKind::ReflogPrompt { repo_id } => {
             98u8.hash(hasher);
             repo_id.hash(hasher);
+        }
+        PopoverKind::ReflogEntryMenu {
+            repo_id,
+            target,
+            selector,
+        } => {
+            107u8.hash(hasher);
+            repo_id.hash(hasher);
+            target.hash(hasher);
+            selector.hash(hasher);
         }
         PopoverKind::VirtualBranchesPrompt { repo_id } => {
             99u8.hash(hasher);

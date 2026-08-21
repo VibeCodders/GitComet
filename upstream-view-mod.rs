@@ -158,7 +158,6 @@ mod diff_preview;
 mod diff_text_model;
 mod diff_text_selection;
 mod diff_utils;
-mod dnd;
 mod file_diff_display;
 mod file_icons;
 mod fingerprint;
@@ -1661,6 +1660,7 @@ impl GitCometView {
                 tooltip_host.downgrade(),
                 main_pane.clone(),
                 details_pane.clone(),
+                reflog_pane.clone(),
                 sidebar_pane.clone(),
                 ui_session.repo_sidebar_pinned_branches.clone(),
                 ui_session.repo_sidebar_collapsed_items.clone(),

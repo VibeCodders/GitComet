@@ -1130,17 +1130,6 @@ pub struct InteractiveCherryPickSetup {
     pub full_messages: Loadable<()>,
 }
 
-/// The commits `range..source` would cherry-pick (oldest first, merges
-/// skipped), previewed in the Cherry-pick dialog. `range`/`source` record the
-/// pair the preview was computed for so a stale result for another pair can
-/// be ignored.
-#[derive(Clone, Debug)]
-pub struct CherryPickRangePreview {
-    pub range: String,
-    pub source: String,
-    pub commits: Loadable<Arc<Vec<CommitRefSummary>>>,
-}
-
 #[derive(Clone, Debug)]
 pub struct RepoState {
     pub id: RepoId,
@@ -1188,15 +1177,8 @@ pub struct RepoState {
     pub stashes_rev: u64,
     pub reflog: Loadable<Arc<Vec<ReflogEntry>>>,
     pub reflog_rev: u64,
-    /// Prototype virtual-branch workspace: in-app groupings of worktree paths.
-    /// Transient (not persisted to session yet).
-    pub virtual_branches: Vec<VirtualBranch>,
-    pub next_virtual_branch_id: u64,
-    /// Bumped on every virtual-branch mutation; drives sidebar row caching.
-    pub virtual_branches_rev: u64,
     pub recent_commit_messages: Loadable<Arc<Vec<RecentCommitMessage>>>,
     pub recent_commit_messages_rev: u64,
-    pub cherry_pick_range_preview: Option<CherryPickRangePreview>,
     pub rebase_in_progress: Loadable<bool>,
     pub sequencer_state: Loadable<SequencerState>,
     pub merge_commit_message: Loadable<Option<String>>,
@@ -1314,12 +1296,8 @@ impl RepoState {
             stashes_rev: 0,
             reflog: Loadable::NotLoaded,
             reflog_rev: 0,
-            virtual_branches: Vec::new(),
-            next_virtual_branch_id: 1,
-            virtual_branches_rev: 0,
             recent_commit_messages: Loadable::NotLoaded,
             recent_commit_messages_rev: 0,
-            cherry_pick_range_preview: None,
             rebase_in_progress: Loadable::NotLoaded,
             sequencer_state: Loadable::NotLoaded,
             merge_commit_message: Loadable::NotLoaded,
@@ -2149,33 +2127,6 @@ impl<T> Loadable<T> {
             _ => None,
         }
     }
-}
-
-/// Virtual branches whose assigned paths no longer have any changes in the
-/// worktree (unstaged or staged) and that hold no parked patch. Such a branch
-/// is purely leftover accounting: its changes were committed, discarded, or
-/// reverted outside the virtual-branch flow. Branches with a parked
-/// `stored_patch` are never stale (their hunks are recoverable by applying).
-pub fn stale_virtual_branch_ids(repo: &RepoState) -> Vec<u64> {
-    let mut changed_paths: FxHashSet<&std::path::Path> = FxHashSet::default();
-    for loaded in [&repo.worktree_status, &repo.staged_status] {
-        if let Loadable::Ready(entries) = loaded {
-            for entry in entries.iter() {
-                changed_paths.insert(entry.path.as_path());
-            }
-        }
-    }
-    repo.virtual_branches
-        .iter()
-        .filter(|branch| {
-            branch.stored_patch.is_none()
-                && branch
-                    .paths
-                    .iter()
-                    .all(|path| !changed_paths.contains(path.as_path()))
-        })
-        .map(|branch| branch.id)
-        .collect()
 }
 
 #[cfg(test)]

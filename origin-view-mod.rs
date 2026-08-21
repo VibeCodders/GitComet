@@ -33,7 +33,7 @@ use gpui::{
     Tiling, UniformListScrollHandle, WeakEntity, Window, WindowControlArea, actions, anchored, div,
     fill, point, px, relative, size, uniform_list,
 };
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 #[cfg(test)]
 use std::collections::BTreeMap;
 use std::hash::Hash;
@@ -122,7 +122,7 @@ fn consume_window_grab_activation(suppressed_at: &mut Option<Instant>, now: Inst
 
 fn repo_activation_msg(
     state: &AppState,
-    last_activation_dispatch: &mut FxHashMap<RepoId, Instant>,
+    last_activation_dispatch: &mut HashMap<RepoId, Instant>,
     now: Instant,
 ) -> Option<Msg> {
     let repo_id = state.active_repo?;
@@ -175,11 +175,10 @@ mod panels;
 mod panes;
 mod patch_split;
 mod path_display;
-mod perf;
 mod permalink;
+mod perf;
 pub(super) mod platform_open;
 mod poller;
-mod reflog_panel;
 mod repo_open;
 pub(crate) mod rows;
 mod settings_window;
@@ -253,8 +252,7 @@ pub use mod_helpers::{
 use panels::{ActionBarView, BottomStatusBarView, PopoverHost, RepoTabsBarView, action_bar_height};
 pub(crate) use panes::MainPaneView;
 use panes::{
-    CollapsedSidebarSection, DetailsPaneInit, DetailsPaneView, HistoryView, ReflogPaneInit,
-    ReflogPaneView, SidebarPaneView,
+    CollapsedSidebarSection, DetailsPaneInit, DetailsPaneView, HistoryView, SidebarPaneView,
 };
 pub(crate) use settings_window::{SettingsWindowView, open_settings_window};
 use toast_host::ToastHost;
@@ -679,15 +677,6 @@ impl GitCometView {
             .update(cx, |host, cx| host.open_popover_centered(kind, window, cx));
     }
 
-    #[cfg(target_os = "macos")]
-    pub(crate) fn open_clone_repository_prompt(
-        &mut self,
-        window: &mut Window,
-        cx: &mut gpui::Context<Self>,
-    ) {
-        self.open_popover_centered(PopoverKind::CloneRepo, window, cx);
-    }
-
     pub(in crate::view) fn open_popover_for_bounds(
         &mut self,
         kind: PopoverKind,
@@ -1077,7 +1066,27 @@ impl GitCometView {
                 // TODO: Implement delete tag
             }
             "show-reflog" => {
-                self.open_reflog_panel_for_active_repo(cx);
+                if let Some(repo_id) = self.active_repo_id()
+                    && let Some(window) = window
+                {
+                    self.store.dispatch(Msg::LoadReflog { repo_id });
+                    self.open_popover_centered(
+                        PopoverKind::ReflogPrompt { repo_id },
+                        window,
+                        cx,
+                    );
+                }
+            }
+            "virtual-branches" => {
+                if let Some(repo_id) = self.active_repo_id()
+                    && let Some(window) = window
+                {
+                    self.open_popover_centered(
+                        PopoverKind::VirtualBranchesPrompt { repo_id },
+                        window,
+                        cx,
+                    );
+                }
             }
             "add-remote" => {
                 if let Some(repo_id) = self.active_repo_id()
@@ -1624,22 +1633,6 @@ impl GitCometView {
             )
         });
 
-        let reflog_pane = cx.new(|cx| {
-            ReflogPaneView::new(
-                Arc::clone(&store),
-                ui_model.clone(),
-                ReflogPaneInit {
-                    theme: initial_theme,
-                    ui_scale_percent: ui_scale.percent,
-                    date_time_format,
-                    timezone,
-                    show_timezone,
-                    root_view: weak_view.clone(),
-                },
-                cx,
-            )
-        });
-
         let popover_host = cx.new(|cx| {
             PopoverHost::new(
                 Arc::clone(&store),
@@ -1909,14 +1902,14 @@ impl GitCometView {
             last_window_size: size(px(0.0), px(0.0)),
             ui_window_size_last_seen: size(px(0.0), px(0.0)),
             ui_settings_persist_seq: 0,
-            last_repo_activation_dispatch_at: FxHashMap::default(),
+            last_repo_activation_dispatch_at: HashMap::default(),
             window_grab_activation_suppressed_at: None,
             date_time_format,
             timezone,
             show_timezone,
             change_tracking_view,
             terminal_preferences,
-            terminal_sessions: FxHashMap::default(),
+            terminal_sessions: HashMap::default(),
             terminal_panel_height: px(TERMINAL_PANEL_DEFAULT_HEIGHT_PX),
             terminal_panel_resize: None,
             next_terminal_session_seq: 1,
@@ -1925,8 +1918,6 @@ impl GitCometView {
             terminal_cursor_blink_active: false,
             terminal_cursor_blink_task_scheduled: false,
             terminal_cursor_blink_seq: 0,
-            reflog_pane,
-            active_bottom_panel: FxHashMap::default(),
             commit_push_after_enabled,
             diff_scroll_sync,
             diff_content_mode,
@@ -1969,7 +1960,7 @@ impl GitCometView {
             pending_force_remove_worktree_prompt: None,
             pending_submodule_trust_prompt: None,
             pending_submodule_trust_check: None,
-            pending_worktree_branch_removals: FxHashMap::default(),
+            pending_worktree_branch_removals: HashMap::default(),
             startup_crash_report,
             #[cfg(target_os = "macos")]
             recent_repos_menu_fingerprint: ui_session.recent_repos.clone(),
@@ -2024,8 +2015,6 @@ impl GitCometView {
             .update(cx, |pane, cx| pane.set_theme(theme, cx));
         self.details_pane
             .update(cx, |pane, cx| pane.set_theme(theme, cx));
-        self.reflog_pane
-            .update(cx, |pane, cx| pane.set_theme(theme, cx));
         self.repo_tabs_bar
             .update(cx, |bar, cx| bar.set_theme(theme, cx));
         self.action_bar
@@ -2068,7 +2057,6 @@ impl GitCometView {
         self.main_pane
             .update(cx, |pane, cx| pane.invalidate_font_metrics(cx));
         self.details_pane.update(cx, |_pane, cx| cx.notify());
-        self.reflog_pane.update(cx, |_pane, cx| cx.notify());
         self.repo_tabs_bar.update(cx, |_bar, cx| cx.notify());
         self.action_bar.update(cx, |_bar, cx| cx.notify());
         self.bottom_status_bar.update(cx, |_bar, cx| cx.notify());
@@ -2179,9 +2167,6 @@ impl GitCometView {
         });
         self.main_pane.update(cx, |pane, cx| {
             pane.apply_ui_scale_percent(previous_percent, percent, cx);
-        });
-        self.reflog_pane.update(cx, |pane, cx| {
-            pane.set_ui_scale_percent(percent, cx);
         });
         self.popover_host.update(cx, |_host, cx| {
             cx.notify();

@@ -1,7 +1,7 @@
 use super::*;
 
-fn fixture_repo() -> (HashMap<RepoId, Arc<dyn GitRepository>>, AtomicU64, AppState, RepoId) {
-    let repos: HashMap<RepoId, Arc<dyn GitRepository>> = HashMap::default();
+fn fixture_repo() -> (FxHashMap<RepoId, Arc<dyn GitRepository>>, AtomicU64, AppState, RepoId) {
+    let repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
     let repo_id = RepoId(1);
     let mut state = AppState::default();

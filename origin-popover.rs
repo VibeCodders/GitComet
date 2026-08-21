@@ -23,7 +23,6 @@ mod force_delete_branch_confirm;
 mod force_push_confirm;
 mod force_remove_worktree_confirm;
 mod merge_abort_confirm;
-mod merge_commit_confirm;
 mod prune_virtual_branches_confirm;
 mod picker_nav;
 mod picker_row_menu;
@@ -340,7 +339,7 @@ pub(in super::super) struct PopoverHost {
     reflog_selected_index: Option<usize>,
     reflog_search_input: Option<Entity<components::TextInput>>,
     _reflog_search_input_subscription: Option<gpui::Subscription>,
-    commit_prompt_message_drafts: FxHashMap<RepoId, SharedString>,
+    commit_prompt_message_drafts: HashMap<RepoId, SharedString>,
     commit_prompt_message_input: Entity<components::TextInput>,
     commit_prompt_message_scroll: ScrollHandle,
     commit_prompt_focus: DialogFocus,
@@ -884,7 +883,6 @@ pub(in super::super) fn popover_width_spec(kind: &PopoverKind) -> Option<Popover
         | PopoverKind::RebaseOntoConfirm { .. }
         | PopoverKind::CherryPickCommitConfirm { .. } => Some(DIALOG_380_WIDTH),
         PopoverKind::MergeAbortConfirm { .. } => Some(DIALOG_360_WIDTH),
-        PopoverKind::MergeCommitConfirm { .. } => Some(DIALOG_380_WIDTH),
         PopoverKind::ForceRemoveWorktreeConfirm { .. } => Some(DIALOG_460_WIDTH),
         PopoverKind::PullReconcilePrompt { .. } | PopoverKind::AddToGitignorePrompt { .. } => {
             Some(DIALOG_440_WIDTH)
@@ -985,10 +983,10 @@ pub(in super::super) fn popover_width_spec(kind: &PopoverKind) -> Option<Popover
         | PopoverKind::FileBrowserFolderMenu { .. }
         | PopoverKind::BranchGroupMenu { .. }
         | PopoverKind::PinnedSectionMenu { .. }
-        | PopoverKind::ReflogEntryMenu { .. }
         | PopoverKind::BrowseHistoryMenu { .. } => Some(DEFAULT_CONTEXT_MENU_WIDTH),
         PopoverKind::RepoTabMenu { .. } => Some(REPO_TAB_MENU_WIDTH),
         PopoverKind::HistoryBranchFilter { .. }
+        | PopoverKind::HistoryAuthorFilter { .. }
         | PopoverKind::DiffContentModeSettings
         | PopoverKind::UiScalePicker
         | PopoverKind::DiffHunkMenu { .. } => Some(NARROW_CONTEXT_MENU_WIDTH),
@@ -1847,7 +1845,7 @@ impl PopoverHost {
             reflog_selected_index: None,
             reflog_search_input: None,
             _reflog_search_input_subscription: None,
-            commit_prompt_message_drafts: FxHashMap::default(),
+            commit_prompt_message_drafts: HashMap::default(),
             commit_prompt_message_input,
             commit_prompt_message_scroll,
             commit_prompt_focus,
@@ -4530,9 +4528,6 @@ impl PopoverHost {
             PopoverKind::CherryPickCommitConfirm { repo_id, commit_id } => {
                 cherry_pick_commit_confirm::panel(self, repo_id, commit_id, cx)
             }
-            PopoverKind::MergeCommitConfirm { repo_id, commit_id } => {
-                merge_commit_confirm::panel(self, repo_id, commit_id, cx)
-            }
             PopoverKind::CherryPickRangePrompt { repo_id, .. } => {
                 cherry_pick_range_prompt::panel(self, repo_id, window, cx)
             }
@@ -4620,18 +4615,6 @@ impl PopoverHost {
             PopoverKind::CommitMenu { repo_id, commit_id } => {
                 self.context_menu_view(PopoverKind::CommitMenu { repo_id, commit_id }, cx)
             }
-            PopoverKind::ReflogEntryMenu {
-                repo_id,
-                target,
-                selector,
-            } => self.context_menu_view(
-                PopoverKind::ReflogEntryMenu {
-                    repo_id,
-                    target,
-                    selector,
-                },
-                cx,
-            ),
             PopoverKind::TagMenu { repo_id, commit_id } => {
                 self.context_menu_view(PopoverKind::TagMenu { repo_id, commit_id }, cx)
             }

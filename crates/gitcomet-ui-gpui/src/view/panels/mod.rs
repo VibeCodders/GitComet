@@ -18,6 +18,10 @@ pub(in crate::view) enum AppMenuAction {
     ApplyPatch {
         repo_id: Option<RepoId>,
     },
+    /// Show the reflog panel for the active repository, in the bottom panel.
+    ShowReflog {
+        repo_id: Option<RepoId>,
+    },
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     InstallDesktopIntegration,
     Quit,
@@ -518,10 +522,10 @@ struct ContextMenuModel {
     shortcut_keycaps: bool,
     /// Optional hover tooltip per entry index (e.g. the full commit message in the
     /// browse-history menu). Sparse — most menus leave this empty.
-    entry_tooltips: std::collections::HashMap<usize, SharedString>,
+    entry_tooltips: FxHashMap<usize, SharedString>,
     /// Stable debug selectors for menus whose entries predate the shared context-menu
     /// renderer. Sparse so ordinary menus continue deriving selectors from labels.
-    entry_debug_selectors: std::collections::HashMap<usize, SharedString>,
+    entry_debug_selectors: FxHashMap<usize, SharedString>,
 }
 
 impl ContextMenuModel {
@@ -529,8 +533,8 @@ impl ContextMenuModel {
         Self {
             items,
             shortcut_keycaps: false,
-            entry_tooltips: std::collections::HashMap::new(),
-            entry_debug_selectors: std::collections::HashMap::new(),
+            entry_tooltips: FxHashMap::default(),
+            entry_debug_selectors: FxHashMap::default(),
         }
     }
 
@@ -539,17 +543,14 @@ impl ContextMenuModel {
         self
     }
 
-    fn with_entry_tooltips(
-        mut self,
-        entry_tooltips: std::collections::HashMap<usize, SharedString>,
-    ) -> Self {
+    fn with_entry_tooltips(mut self, entry_tooltips: FxHashMap<usize, SharedString>) -> Self {
         self.entry_tooltips = entry_tooltips;
         self
     }
 
     fn with_entry_debug_selectors(
         mut self,
-        entry_debug_selectors: std::collections::HashMap<usize, SharedString>,
+        entry_debug_selectors: FxHashMap<usize, SharedString>,
     ) -> Self {
         self.entry_debug_selectors = entry_debug_selectors;
         self

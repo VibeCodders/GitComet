@@ -19,7 +19,7 @@ use crate::store::repo_load_trace;
 use gitcomet_core::domain::RepoSpec;
 use gitcomet_core::error::{Error, ErrorKind};
 use gitcomet_core::services::{CommandOutput, GitRepository};
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -201,7 +201,11 @@ fn clear_cancelled_repo_loading(repo_state: &mut RepoState) {
     if repo_state.stashes.is_loading() {
         repo_state.set_stashes(Loadable::NotLoaded);
     }
-    clear_loading(&mut repo_state.reflog);
+    // `clear_loading` cannot be used here: it mutates the field in place, which
+    // would leave `reflog_rev` stale for the panel that keys its row cache on it.
+    if repo_state.reflog.is_loading() {
+        repo_state.set_reflog(Loadable::NotLoaded);
+    }
     if repo_state.rebase_in_progress.is_loading() {
         repo_state.set_rebase_in_progress(Loadable::NotLoaded);
     }
@@ -432,7 +436,7 @@ pub(super) fn open_repo(id_alloc: &AtomicU64, state: &mut AppState, path: PathBu
     if saved_history_mode.is_none() {
         effects.push(persist_repo_history_mode_effect(
             Some(repo_id),
-            spec.workdir.clone(),
+            spec.workdir,
             history_mode,
         ));
     }
@@ -440,7 +444,7 @@ pub(super) fn open_repo(id_alloc: &AtomicU64, state: &mut AppState, path: PathBu
 }
 
 pub(super) fn restore_session(
-    repos: &mut HashMap<RepoId, Arc<dyn GitRepository>>,
+    repos: &mut FxHashMap<RepoId, Arc<dyn GitRepository>>,
     id_alloc: &AtomicU64,
     state: &mut AppState,
     open_repos: Vec<PathBuf>,
@@ -459,7 +463,7 @@ pub(super) fn restore_session(
 
     let open_repos = dedup_paths_in_order(open_repos);
     let mut effects = Vec::with_capacity(4);
-    let mut seen_workdirs: HashSet<PathBuf> = HashSet::default();
+    let mut seen_workdirs: FxHashSet<PathBuf> = FxHashSet::default();
     seen_workdirs.reserve(open_repos.len());
 
     for path in open_repos.into_iter().map(normalize_repo_path) {
@@ -546,7 +550,7 @@ pub(super) fn restore_session(
 }
 
 pub(super) fn close_repo(
-    repos: &mut HashMap<RepoId, Arc<dyn GitRepository>>,
+    repos: &mut FxHashMap<RepoId, Arc<dyn GitRepository>>,
     state: &mut AppState,
     repo_id: RepoId,
 ) -> Vec<Effect> {
@@ -601,12 +605,12 @@ pub(super) fn close_repo(
 }
 
 pub(super) fn close_repos(
-    repos: &mut HashMap<RepoId, Arc<dyn GitRepository>>,
+    repos: &mut FxHashMap<RepoId, Arc<dyn GitRepository>>,
     state: &mut AppState,
     repo_ids: Vec<RepoId>,
     activate_after: Option<RepoId>,
 ) -> Vec<Effect> {
-    let mut close_ids = HashSet::default();
+    let mut close_ids = FxHashSet::default();
     for repo_id in repo_ids {
         if state.repos.iter().any(|repo| repo.id == repo_id) {
             close_ids.insert(repo_id);
@@ -623,7 +627,7 @@ pub(super) fn close_repos(
 
     let mut effects =
         Vec::with_capacity(2 * close_ids.len() + 2 + SET_ACTIVE_REPO_INLINE_EFFECT_CAPACITY);
-    // Tab order, not `close_ids` iteration order: a `HashSet` would leave the
+    // Tab order, not `close_ids` iteration order: a `FxHashSet` would leave the
     // Recently Closed entries for one bulk close in an order that varies run to
     // run. Walking left to right puts the rightmost tab at the top of the list.
     for repo_id in original_order.iter().copied() {
@@ -985,22 +989,26 @@ pub(super) fn clone_repo(state: &mut AppState, url: String, dest: PathBuf) -> Ve
 
 fn parse_clone_progress_percent(line: &str) -> Option<u8> {
     let percent_ix = line.find('%')?;
-    let digits = line[..percent_ix]
-        .chars()
-        .rev()
-        .skip_while(|ch| ch.is_ascii_whitespace())
-        .take_while(|ch| ch.is_ascii_digit())
-        .collect::<String>();
+    let before_percent = &line.as_bytes()[..percent_ix];
+    let end = before_percent
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())?
+        + 1;
+    let start = before_percent[..end]
+        .iter()
+        .rposition(|byte| !byte.is_ascii_digit())
+        .map_or(0, |ix| ix + 1);
+    let digits = &before_percent[start..end];
     if digits.is_empty() {
         return None;
     }
-    digits
-        .chars()
-        .rev()
-        .collect::<String>()
-        .parse::<u8>()
-        .ok()
-        .map(|percent| percent.min(100))
+    // Byte indices rather than `line[start..end]` because `end` can land inside a
+    // multi-byte char -- a trailing `\u{e4}` is neither whitespace nor a digit, so
+    // the scans stop on its continuation byte and string slicing would panic
+    // there. Every byte that survives both scans is an ASCII digit, so this
+    // conversion cannot actually fail.
+    let digits = std::str::from_utf8(digits).ok()?;
+    digits.parse::<u8>().ok().map(|percent| percent.min(100))
 }
 
 fn parse_clone_progress_meter(line: &str) -> Option<CloneProgressMeter> {
@@ -1098,7 +1106,7 @@ pub(super) fn clone_repo_finished(
 }
 
 pub(super) fn repo_opened_ok(
-    repos: &mut HashMap<RepoId, Arc<dyn GitRepository>>,
+    repos: &mut FxHashMap<RepoId, Arc<dyn GitRepository>>,
     state: &mut AppState,
     repo_id: RepoId,
     spec: RepoSpec,
@@ -1137,7 +1145,7 @@ pub(super) fn repo_opened_ok(
             repo_state.set_log(Loadable::Loading);
             repo_state.set_log_loading_more(false);
             repo_state.set_stashes(Loadable::NotLoaded);
-            repo_state.reflog = Loadable::NotLoaded;
+            repo_state.set_reflog(Loadable::NotLoaded);
             repo_state.set_rebase_in_progress(Loadable::Loading);
             repo_state.set_sequencer_state(Loadable::Loading);
             repo_state.set_merge_commit_message(Loadable::Loading);
@@ -1208,7 +1216,7 @@ pub(super) fn repo_opened_ok(
 }
 
 pub(super) fn repo_opened_err(
-    repos: &mut HashMap<RepoId, Arc<dyn GitRepository>>,
+    repos: &mut FxHashMap<RepoId, Arc<dyn GitRepository>>,
     state: &mut AppState,
     repo_id: RepoId,
     spec: RepoSpec,
@@ -1289,4 +1297,83 @@ pub(super) fn repo_opened_err(
         clear_banner_error_for_repo(state, repo_id);
     }
     Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_clone_progress_percent;
+
+    #[test]
+    fn clone_progress_percent_reads_the_digits_before_the_sign() {
+        assert_eq!(
+            parse_clone_progress_percent("Receiving objects:  42% (42/100)"),
+            Some(42)
+        );
+        assert_eq!(
+            parse_clone_progress_percent("remote: Counting 7% done"),
+            Some(7)
+        );
+        assert_eq!(
+            parse_clone_progress_percent("Updating files: 100% (4/4), done."),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn clone_progress_percent_skips_whitespace_between_digits_and_sign() {
+        assert_eq!(
+            parse_clone_progress_percent("Receiving objects: 42 %"),
+            Some(42)
+        );
+        assert_eq!(
+            parse_clone_progress_percent("Receiving objects: 42\t%"),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn clone_progress_percent_stops_at_the_first_non_digit() {
+        // The digit run is bounded backwards, so an earlier number in the same
+        // line must not be folded into it.
+        assert_eq!(parse_clone_progress_percent("12 34%"), Some(34));
+        assert_eq!(parse_clone_progress_percent("(42/100) 7%"), Some(7));
+    }
+
+    #[test]
+    fn clone_progress_percent_rejects_lines_without_usable_digits() {
+        assert_eq!(parse_clone_progress_percent("no sign here"), None);
+        // `%` at byte 0 leaves an empty slice for both backward scans.
+        assert_eq!(parse_clone_progress_percent("%"), None);
+        assert_eq!(parse_clone_progress_percent("% (0/0)"), None);
+        // Whitespace-only prefix: the non-whitespace scan finds nothing at all.
+        assert_eq!(parse_clone_progress_percent("   %"), None);
+        assert_eq!(parse_clone_progress_percent("done%"), None);
+    }
+
+    #[test]
+    fn clone_progress_percent_handles_multibyte_text_around_the_digits() {
+        // A continuation byte is neither ASCII whitespace nor an ASCII digit, so
+        // both scans stop on it -- the indices must stay byte indices.
+        assert_eq!(
+            parse_clone_progress_percent("l\u{e4}hetet\u{e4}\u{e4}n: 42%"),
+            Some(42)
+        );
+        assert_eq!(parse_clone_progress_percent("valmis \u{e4}%"), None);
+        assert_eq!(parse_clone_progress_percent("\u{5360}7%"), Some(7));
+    }
+
+    #[test]
+    fn clone_progress_percent_clamps_and_rejects_out_of_range_values() {
+        // Git can report over 100 while it deltifies; anything a `u8` cannot
+        // hold is treated as unparseable rather than clamped.
+        assert_eq!(
+            parse_clone_progress_percent("Resolving deltas: 150%"),
+            Some(100)
+        );
+        assert_eq!(
+            parse_clone_progress_percent("Resolving deltas: 255%"),
+            Some(100)
+        );
+        assert_eq!(parse_clone_progress_percent("Resolving deltas: 300%"), None);
+    }
 }

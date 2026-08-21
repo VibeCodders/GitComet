@@ -304,21 +304,45 @@ fn bracket_overlay_is_a_no_op_without_a_pair() {
 #[test]
 fn provider_binding_key_changes_only_when_something_changed() {
     let pair = (3..4, 9..10);
-    let base = file_editor_provider_binding_key(7, 1, Some(&pair));
+    let no_matches: &[std::ops::Range<usize>] = &[];
+    // Two ranges, not one: clippy reads a single-range array literal as a typo.
+    let one_match: &[std::ops::Range<usize>] = &[20..25, 40..45];
+    let other_match: &[std::ops::Range<usize>] = &[30..35, 40..45];
+    let base = file_editor_provider_binding_key(7, 1, Some(&pair), no_matches);
 
     assert_eq!(
         base,
-        file_editor_provider_binding_key(7, 1, Some(&pair)),
+        file_editor_provider_binding_key(7, 1, Some(&pair), no_matches),
         "an unchanged binding must not rebind — that is what stops the observe cycle"
     );
-    assert_ne!(base, file_editor_provider_binding_key(8, 1, Some(&pair)));
-    assert_ne!(base, file_editor_provider_binding_key(7, 2, Some(&pair)));
     assert_ne!(
         base,
-        file_editor_provider_binding_key(7, 1, Some(&(3..4, 12..13))),
+        file_editor_provider_binding_key(8, 1, Some(&pair), no_matches)
+    );
+    assert_ne!(
+        base,
+        file_editor_provider_binding_key(7, 2, Some(&pair), no_matches)
+    );
+    assert_ne!(
+        base,
+        file_editor_provider_binding_key(7, 1, Some(&(3..4, 12..13)), no_matches),
         "moving the caret to another pair must rebind"
     );
-    assert_ne!(base, file_editor_provider_binding_key(7, 1, None));
+    assert_ne!(
+        base,
+        file_editor_provider_binding_key(7, 1, None, no_matches)
+    );
+    assert_ne!(
+        base,
+        file_editor_provider_binding_key(7, 1, Some(&pair), one_match),
+        "a search match moves no text and touches no tree, so this key is the \
+         only thing that can tell the input its highlights changed"
+    );
+    assert_ne!(
+        file_editor_provider_binding_key(7, 1, Some(&pair), one_match),
+        file_editor_provider_binding_key(7, 1, Some(&pair), other_match),
+        "stepping to the next match changes which hits are washed"
+    );
 }
 
 #[gpui::test]
@@ -656,23 +680,9 @@ async fn editing_markdown_highlights_and_leaves_the_rendered_preview(
     let _ = std::fs::remove_dir_all(&workdir);
 }
 
-#[gpui::test]
-async fn blame_is_available_and_rendered_while_editing(cx: &mut gpui::TestAppContext) {
-    // The editor used to leave Blame inert: the toggle was reachable but the
-    // buffer had no annotation column, so turning it on did nothing visible.
-    let _visual_guard = lock_visual_test();
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
-    let (view, cx) = cx.add_window_view(|window, cx| {
-        super::super::GitCometView::new(store, events, None, window, cx)
-    });
-
-    let repo_id = gitcomet_state::model::RepoId(950);
-    let workdir = unique_workdir("file_editor_blame");
-    let file_rel = std::path::PathBuf::from("main.rs");
-    let contents = "fn main() {}\nfn other() {}\n";
-    std::fs::write(workdir.join(&file_rel), contents).expect("write fixture");
-
-    let blame_lines = vec![
+/// Two lines of blame for the `open_annotated_editor` fixture file.
+fn editor_blame_lines() -> Vec<gitcomet_core::services::BlameLine> {
+    vec![
         gitcomet_core::services::BlameLine {
             commit_id: std::sync::Arc::from("abcdef1"),
             author: "Sampo Kivistö".into(),
@@ -695,19 +705,29 @@ async fn blame_is_available_and_rendered_while_editing(cx: &mut gpui::TestAppCon
             source_path: None,
             prior_commit: None,
         },
-    ];
+    ]
+}
 
+/// Show `file_rel` in the editor with annotate on and blame already loaded for
+/// it, so the gutter has a populated annotation column.
+fn open_annotated_editor(
+    cx: &mut gpui::VisualTestContext,
+    view: &gpui::Entity<super::super::GitCometView>,
+    repo_id: gitcomet_state::model::RepoId,
+    workdir: &Path,
+    file_rel: &Path,
+) {
     cx.update(|_window, app| {
         view.update(app, |this, cx| {
-            let mut state = editor_state(repo_id, &workdir, &file_rel);
+            let mut state = editor_state(repo_id, workdir, file_rel);
             let repo = &mut Arc::make_mut(&mut state).repos[0];
-            repo.history_state.blame_path = Some(file_rel.clone());
+            repo.history_state.blame_path = Some(file_rel.to_path_buf());
             repo.history_state.blame_source =
                 Some(gitcomet_core::domain::BlameSource::WorkingTree(
                     gitcomet_core::domain::DiffArea::Unstaged,
                 ));
             repo.history_state.blame =
-                gitcomet_state::model::Loadable::Ready(std::sync::Arc::new(blame_lines));
+                gitcomet_state::model::Loadable::Ready(std::sync::Arc::new(editor_blame_lines()));
             push_test_state(this, state, cx);
             this.main_pane.update(cx, |pane, cx| {
                 pane.set_annotate_enabled(true, cx);
@@ -716,6 +736,25 @@ async fn blame_is_available_and_rendered_while_editing(cx: &mut gpui::TestAppCon
         });
     });
     cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn blame_is_available_and_rendered_while_editing(cx: &mut gpui::TestAppContext) {
+    // The editor used to leave Blame inert: the toggle was reachable but the
+    // buffer had no annotation column, so turning it on did nothing visible.
+    let _visual_guard = lock_visual_test();
+    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::GitCometView::new(store, events, None, window, cx)
+    });
+
+    let repo_id = gitcomet_state::model::RepoId(950);
+    let workdir = unique_workdir("file_editor_blame");
+    let file_rel = std::path::PathBuf::from("main.rs");
+    let contents = "fn main() {}\nfn other() {}\n";
+    std::fs::write(workdir.join(&file_rel), contents).expect("write fixture");
+
+    open_annotated_editor(cx, &view, repo_id, &workdir, &file_rel);
 
     cx.update(|_window, app| {
         let pane = view.read(app).main_pane.read(app);
@@ -729,6 +768,182 @@ async fn blame_is_available_and_rendered_while_editing(cx: &mut gpui::TestAppCon
             "the editor must resolve a blame context so its gutter has something to draw"
         );
     });
+
+    let _ = std::fs::remove_dir_all(&workdir);
+}
+
+/// Left offset of the annotate resize handle within the editor. Panics if the
+/// handle is absent.
+fn editor_annotate_handle_offset(cx: &mut gpui::VisualTestContext) -> Pixels {
+    let handle = cx
+        .debug_bounds("annotate_resize_handle")
+        .expect("edit mode must mount the annotate resize handle");
+    let editor = cx
+        .debug_bounds("file_editor")
+        .expect("expected `file_editor` bounds");
+    handle.center().x - editor.left()
+}
+
+/// Press the handle and drag it `dx` to the right. Two moves: gpui starts the
+/// drag on the first button-held move and only delivers `DragMoveEvent` on the
+/// ones after it.
+fn drag_annotate_handle(cx: &mut gpui::VisualTestContext, dx: f32) {
+    let start = cx
+        .debug_bounds("annotate_resize_handle")
+        .expect("expected the annotate resize handle")
+        .center();
+    cx.simulate_mouse_move(start, None, Modifiers::default());
+    cx.simulate_event(MouseDownEvent {
+        position: start,
+        modifiers: Modifiers::default(),
+        button: MouseButton::Left,
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.simulate_mouse_move(
+        point(start.x + px(dx.signum() * 8.0), start.y),
+        Some(MouseButton::Left),
+        Modifiers::default(),
+    );
+    draw_and_drain_test_window(cx);
+    let end = point(start.x + px(dx), start.y);
+    cx.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
+    cx.simulate_event(MouseUpEvent {
+        position: end,
+        modifiers: Modifiers::default(),
+        button: MouseButton::Left,
+        click_count: 1,
+    });
+    draw_and_drain_test_window(cx);
+}
+
+#[gpui::test]
+async fn annotate_column_is_resizable_while_editing(cx: &mut gpui::TestAppContext) {
+    // The editor drew the annotation column but mounted no drag handle, so the
+    // column was stuck at whatever width the diff view had last left it at.
+    let _visual_guard = lock_visual_test();
+    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::GitCometView::new(store, events, None, window, cx)
+    });
+
+    let repo_id = gitcomet_state::model::RepoId(952);
+    let workdir = unique_workdir("file_editor_annotate_resize");
+    let file_rel = std::path::PathBuf::from("main.rs");
+    std::fs::write(workdir.join(&file_rel), "fn main() {}\nfn other() {}\n")
+        .expect("write fixture");
+
+    open_annotated_editor(cx, &view, repo_id, &workdir, &file_rel);
+    draw_and_drain_test_window(cx);
+
+    let offset = editor_annotate_handle_offset(cx);
+    let column_width = cx.update(|_window, app| {
+        let pane = view.read(app).main_pane.read(app);
+        pane.annotate_column_width_px(crate::ui_scale::DEFAULT_UI_SCALE_PERCENT)
+    });
+    assert!(
+        (f32::from(offset) - f32::from(column_width)).abs() <= 1.0,
+        "the handle must straddle the annotation column's right edge, got {offset:?} for a \
+         {column_width:?} column"
+    );
+
+    drag_annotate_handle(cx, 60.0);
+
+    cx.update(|_window, app| {
+        let pane = view.read(app).main_pane.read(app);
+        assert_eq!(
+            pane.annotate_column_width, 360.0,
+            "dragging 60px right at 100% ui scale must widen the column by 60"
+        );
+        assert!(
+            pane.annotate_resize.is_none(),
+            "the release must end the drag"
+        );
+    });
+
+    let widened_offset = editor_annotate_handle_offset(cx);
+    assert!(
+        f32::from(widened_offset) - f32::from(offset) > 55.0,
+        "the handle must follow the column it resized, moved {:?}",
+        widened_offset - offset
+    );
+
+    // Past the maximum the clamp takes over rather than the column running on.
+    drag_annotate_handle(cx, 1_000.0);
+    cx.update(|_window, app| {
+        assert_eq!(
+            view.read(app).main_pane.read(app).annotate_column_width,
+            crate::view::rows::DIFF_ANNOTATION_MAX_WIDTH_PX,
+            "the drag must clamp at the maximum column width"
+        );
+    });
+
+    // ...and the minimum on the way back.
+    drag_annotate_handle(cx, -1_000.0);
+    cx.update(|_window, app| {
+        assert_eq!(
+            view.read(app).main_pane.read(app).annotate_column_width,
+            crate::view::rows::DIFF_ANNOTATION_MIN_WIDTH_PX,
+            "the drag must clamp at the minimum column width"
+        );
+    });
+
+    let _ = std::fs::remove_dir_all(&workdir);
+}
+
+#[gpui::test]
+async fn annotate_resize_handle_waits_for_the_column_it_resizes(cx: &mut gpui::TestAppContext) {
+    // The editor reserves the annotation column only once blame resolves, so
+    // the handle has to follow the column rather than the toggle: gated on
+    // `annotation_active()` it would sit at x=0 over a column nobody drew.
+    let _visual_guard = lock_visual_test();
+    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::GitCometView::new(store, events, None, window, cx)
+    });
+
+    let repo_id = gitcomet_state::model::RepoId(953);
+    let workdir = unique_workdir("file_editor_annotate_no_blame");
+    let file_rel = std::path::PathBuf::from("main.rs");
+    std::fs::write(workdir.join(&file_rel), "fn main() {}\nfn other() {}\n")
+        .expect("write fixture");
+
+    // Annotate on, but no blame ever loads — `TestBackend` opens no repository.
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            push_test_state(this, editor_state(repo_id, &workdir, &file_rel), cx);
+            this.main_pane.update(cx, |pane, cx| {
+                pane.set_annotate_enabled(true, cx);
+                pane.ensure_file_editor_loaded(cx);
+            });
+        });
+    });
+    cx.run_until_parked();
+    draw_and_drain_test_window(cx);
+
+    cx.update(|_window, app| {
+        let pane = view.read(app).main_pane.read(app);
+        assert!(
+            pane.annotation_active(),
+            "the toggle is on and the target is blameable"
+        );
+        assert!(
+            pane.blame_render_ctx_for_test().is_none(),
+            "no blame resolved, so the editor draws no annotation column"
+        );
+    });
+    assert!(
+        cx.debug_bounds("annotate_resize_handle").is_none(),
+        "a handle without a column would drag nothing"
+    );
+
+    // Blame arrives: the column appears, and the handle with it.
+    open_annotated_editor(cx, &view, repo_id, &workdir, &file_rel);
+    draw_and_drain_test_window(cx);
+    assert!(
+        cx.debug_bounds("annotate_resize_handle").is_some(),
+        "the handle must appear once there is a column to resize"
+    );
 
     let _ = std::fs::remove_dir_all(&workdir);
 }
@@ -2008,6 +2223,505 @@ async fn switching_files_mid_load_never_stashes_the_blank_placeholder(
             "returning to the file must show the file, not a stashed blank"
         );
     });
+
+    let _ = std::fs::remove_dir_all(&workdir);
+}
+
+/// Put `contents` on disk and show it in the editor.
+fn seed_editor(
+    view: &gpui::Entity<super::super::GitCometView>,
+    cx: &mut gpui::VisualTestContext,
+    repo_id: u64,
+    label: &str,
+    contents: &str,
+) -> std::path::PathBuf {
+    let repo_id = gitcomet_state::model::RepoId(repo_id);
+    let workdir = unique_workdir(label);
+    let file_rel = std::path::PathBuf::from("main.rs");
+    std::fs::write(workdir.join(&file_rel), contents).expect("write fixture");
+
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            push_test_state(this, editor_state(repo_id, &workdir, &file_rel), cx);
+            this.main_pane
+                .update(cx, |pane, cx| pane.ensure_file_editor_loaded(cx));
+        });
+    });
+    cx.run_until_parked();
+    draw_and_drain_test_window(cx);
+    workdir
+}
+
+/// Open the search box over the editor and put `query` in it, the way Ctrl+F
+/// followed by typing does. Returns once the reveal has been drawn.
+fn search_the_editor_for(
+    view: &gpui::Entity<super::super::GitCometView>,
+    cx: &mut gpui::VisualTestContext,
+    query: &str,
+) {
+    cx.update(|window, app| {
+        view.update(app, |this, cx| {
+            this.main_pane.update(cx, |pane, cx| {
+                assert!(
+                    pane.open_search_for_active_view(window, cx),
+                    "the editor is showing a working-tree file, so search must open over it"
+                );
+                pane.diff_search_input
+                    .update(cx, |input, cx| input.set_text(query, cx));
+            });
+        });
+    });
+    cx.run_until_parked();
+    // Typing schedules a debounced recompute; run it now rather than on a timer.
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            this.main_pane.update(cx, |pane, _cx| {
+                pane.diff_search_recompute_matches_and_scroll_to_first();
+            });
+        });
+    });
+    draw_and_drain_test_window(cx);
+}
+
+fn editor_search_matches(
+    view: &gpui::Entity<super::super::GitCometView>,
+    cx: &mut gpui::VisualTestContext,
+) -> Vec<std::ops::Range<usize>> {
+    cx.update(|_window, app| {
+        view.read(app)
+            .main_pane
+            .read(app)
+            .file_editor_search_matches
+            .clone()
+    })
+}
+
+fn editor_selected_range(
+    view: &gpui::Entity<super::super::GitCometView>,
+    cx: &mut gpui::VisualTestContext,
+) -> std::ops::Range<usize> {
+    cx.update(|_window, app| {
+        let main_pane = view.read(app).main_pane.clone();
+        main_pane.update(app, |pane, cx| {
+            pane.file_editor_input
+                .update(cx, |input, _| input.selected_range())
+        })
+    })
+}
+
+fn set_editor_text(
+    view: &gpui::Entity<super::super::GitCometView>,
+    cx: &mut gpui::VisualTestContext,
+    text: &str,
+) {
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            this.main_pane.update(cx, |pane, cx| {
+                pane.file_editor_input
+                    .update(cx, |input, cx| input.set_text(text, cx));
+            });
+        });
+    });
+    cx.run_until_parked();
+}
+
+/// The editor counts occurrences, not rows. Every other view counts matching
+/// rows, and reusing that here would make Enter skip repeats within a line.
+#[gpui::test]
+async fn file_editor_search_counts_every_occurrence_in_the_live_buffer(
+    cx: &mut gpui::TestAppContext,
+) {
+    let _visual_guard = lock_visual_test();
+    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::GitCometView::new(store, events, None, window, cx)
+    });
+
+    let contents = "let needle = needle.needle();\nfn other() {}\nlast needle\n";
+    let workdir = seed_editor(&view, cx, 981, "file_editor_search_count", contents);
+
+    search_the_editor_for(&view, cx, "needle");
+
+    let matches = editor_search_matches(&view, cx);
+    assert_eq!(
+        matches.len(),
+        4,
+        "three hits on the first line and one on the last are four stops"
+    );
+    for range in &matches {
+        assert_eq!(&contents[range.clone()], "needle");
+    }
+    cx.update(|_window, app| {
+        let pane = view.read(app).main_pane.read(app);
+        assert_eq!(
+            pane.diff_search_matches,
+            vec![0, 0, 0, 2],
+            "the list the `n/N` label reads holds one entry per occurrence, \
+             carrying the line that occurrence sits on"
+        );
+    });
+
+    let _ = std::fs::remove_dir_all(&workdir);
+}
+
+/// The regression this change exists for: edit mode leaves `content_preview`
+/// set, so the search used to take the file preview's branch and count the
+/// *pre-edit* preview text — a plausible number against a document that is not
+/// on screen.
+#[gpui::test]
+async fn file_editor_search_reads_the_buffer_not_the_stale_preview(cx: &mut gpui::TestAppContext) {
+    let _visual_guard = lock_visual_test();
+    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::GitCometView::new(store, events, None, window, cx)
+    });
+
+    let workdir = seed_editor(
+        &view,
+        cx,
+        982,
+        "file_editor_search_live",
+        "fn main() {\n    let value = 1;\n}\n",
+    );
+
+    // A needle that exists nowhere on disk.
+    set_editor_text(&view, cx, "fn main() {\n    let needle = needle;\n}\n");
+    search_the_editor_for(&view, cx, "needle");
+    assert_eq!(
+        editor_search_matches(&view, cx).len(),
+        2,
+        "the search must read the buffer, including edits that are not on disk"
+    );
+
+    set_editor_text(&view, cx, "needle needle needle\n");
+    assert_eq!(
+        editor_search_matches(&view, cx).len(),
+        3,
+        "editing the buffer with the search open must recount against it"
+    );
+
+    let _ = std::fs::remove_dir_all(&workdir);
+}
+
+/// Every match wears the search wash except the current one, which the
+/// selection marks instead. Selection quads are painted *before* highlight
+/// backgrounds, so a wash over the current match would cover it.
+#[gpui::test]
+async fn file_editor_search_selects_the_current_match_and_washes_the_rest(
+    cx: &mut gpui::TestAppContext,
+) {
+    let _visual_guard = lock_visual_test();
+    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::GitCometView::new(store, events, None, window, cx)
+    });
+
+    let contents = "alpha needle beta\nneedle gamma\n";
+    let workdir = seed_editor(&view, cx, 983, "file_editor_search_paint", contents);
+
+    search_the_editor_for(&view, cx, "needle");
+
+    let matches = editor_search_matches(&view, cx);
+    assert_eq!(matches.len(), 2);
+    let (first, second) = (matches[0].clone(), matches[1].clone());
+
+    assert_eq!(
+        editor_selected_range(&view, cx),
+        first,
+        "activating the search lands on the first match and selects it"
+    );
+
+    cx.update(|_window, app| {
+        let main_pane = view.read(app).main_pane.clone();
+        let wash = main_pane
+            .read(app)
+            .theme
+            .colors
+            .editor
+            .search_match_background
+            .into_color();
+        let highlights = main_pane.update(app, |pane, cx| {
+            pane.file_editor_input.update(cx, |input, _| {
+                input.debug_effective_highlights_for_range(0..contents.len())
+            })
+        });
+
+        assert!(
+            !highlights
+                .iter()
+                .any(|(range, style)| *range == first && style.background_color == Some(wash)),
+            "the current match is left to the selection, not washed over it: {highlights:?}"
+        );
+        assert!(
+            highlights
+                .iter()
+                .any(|(range, style)| *range == second && style.background_color == Some(wash)),
+            "every other match wears the search wash: {highlights:?}"
+        );
+    });
+
+    let _ = std::fs::remove_dir_all(&workdir);
+}
+
+/// Stepping visits repeats within a line, then wraps.
+#[gpui::test]
+async fn file_editor_search_next_match_steps_within_a_line(cx: &mut gpui::TestAppContext) {
+    let _visual_guard = lock_visual_test();
+    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::GitCometView::new(store, events, None, window, cx)
+    });
+
+    let workdir = seed_editor(
+        &view,
+        cx,
+        984,
+        "file_editor_search_step",
+        "needle needle needle\n",
+    );
+
+    search_the_editor_for(&view, cx, "needle");
+    let matches = editor_search_matches(&view, cx);
+    assert_eq!(matches.len(), 3);
+
+    let mut walked = Vec::new();
+    for _ in 0..4 {
+        walked.push(editor_selected_range(&view, cx));
+        cx.update(|_window, app| {
+            view.update(app, |this, cx| {
+                this.main_pane
+                    .update(cx, |pane, _cx| pane.diff_search_next_match());
+            });
+        });
+        draw_and_drain_test_window(cx);
+    }
+
+    assert_eq!(
+        walked,
+        vec![
+            matches[0].clone(),
+            matches[1].clone(),
+            matches[2].clone(),
+            matches[0].clone(),
+        ],
+        "three same-line hits are three stops, and the walk wraps"
+    );
+
+    let _ = std::fs::remove_dir_all(&workdir);
+}
+
+/// A match below the fold has to bring the buffer with it. The editor is a
+/// `TextInput` over a plain `ScrollHandle`, so there is no deferred
+/// `scroll_to_item` to inherit.
+#[gpui::test]
+async fn file_editor_search_scrolls_a_distant_match_into_view(cx: &mut gpui::TestAppContext) {
+    let _visual_guard = lock_visual_test();
+    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::GitCometView::new(store, events, None, window, cx)
+    });
+
+    let mut lines: Vec<String> = (0..400)
+        .map(|line| format!("fn line_{line}() {{}}"))
+        .collect();
+    lines.push("fn needle() {}".to_string());
+    let contents = format!("{}\n", lines.join("\n"));
+    let workdir = seed_editor(&view, cx, 985, "file_editor_search_scroll", &contents);
+
+    cx.update(|_window, app| {
+        let pane = view.read(app).main_pane.read(app);
+        assert!(
+            pane.file_editor_scroll.max_offset().y > px(0.0),
+            "the fixture must be taller than the viewport for this to mean anything"
+        );
+        assert_eq!(pane.file_editor_scroll.offset().y, px(0.0));
+    });
+
+    search_the_editor_for(&view, cx, "needle");
+    // The reveal is applied by the render pass, and the input's own caret
+    // autoscroll settles on the frame after that.
+    draw_and_drain_test_window(cx);
+
+    cx.update(|_window, app| {
+        let pane = view.read(app).main_pane.read(app);
+        assert_eq!(pane.file_editor_search_matches.len(), 1);
+        // Asserting movement, not a pixel value: `#[gpui::test]` measures every
+        // glyph identically, so exact offsets say nothing about the real app.
+        assert!(
+            pane.file_editor_scroll.offset().y < px(0.0),
+            "a match 400 lines down must scroll the buffer, got {:?}",
+            pane.file_editor_scroll.offset()
+        );
+    });
+
+    let _ = std::fs::remove_dir_all(&workdir);
+}
+
+/// A match far along a long line has to be scrolled to sideways too.
+///
+/// A multiline `TextInput` leaves horizontal scrolling to its container, and its
+/// own caret autoscroll only handles the vertical axis, so without the reveal
+/// the line comes into view with the hit still off the right edge.
+#[gpui::test]
+async fn file_editor_search_scrolls_sideways_to_a_match_far_along_a_line(
+    cx: &mut gpui::TestAppContext,
+) {
+    let _visual_guard = lock_visual_test();
+    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::GitCometView::new(store, events, None, window, cx)
+    });
+
+    let mut lines: Vec<String> = (0..20)
+        .map(|line| format!("fn line_{line}() {{}}"))
+        .collect();
+    // The needle sits well past any plausible viewport width.
+    lines.push(format!("// {}needle", "pad ".repeat(200)));
+    let contents = format!("{}\n", lines.join("\n"));
+    let workdir = seed_editor(&view, cx, 986, "file_editor_search_hscroll", &contents);
+
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            this.main_pane.update(cx, |pane, cx| {
+                // Wrapping would fold the long line into the pane and leave
+                // nothing to scroll sideways to.
+                pane.diff_word_wrap = false;
+                cx.notify();
+            });
+        });
+    });
+    draw_and_drain_test_window(cx);
+
+    cx.update(|_window, app| {
+        let pane = view.read(app).main_pane.read(app);
+        assert!(
+            pane.file_editor_scroll.max_offset().x > px(0.0),
+            "the fixture must overflow sideways for this to mean anything; max={:?}",
+            pane.file_editor_scroll.max_offset()
+        );
+        assert_eq!(pane.file_editor_scroll.offset().x, px(0.0));
+    });
+
+    search_the_editor_for(&view, cx, "needle");
+    // One frame places the caret, the next measures it and scrolls to it.
+    draw_and_drain_test_window(cx);
+    draw_and_drain_test_window(cx);
+
+    cx.update(|_window, app| {
+        let pane = view.read(app).main_pane.read(app);
+        assert_eq!(pane.file_editor_search_matches.len(), 1);
+        assert!(
+            pane.file_editor_scroll.offset().x < px(0.0),
+            "a match far along the line must scroll the editor sideways, got {:?}",
+            pane.file_editor_scroll.offset()
+        );
+        assert!(
+            !pane.file_editor_search_reveal_x_pending,
+            "the sideways reveal should be claimed once, not retried every frame"
+        );
+    });
+
+    let _ = std::fs::remove_dir_all(&workdir);
+}
+
+/// The whole loop, driven by the keys the user actually presses.
+///
+/// Ctrl+F reaches the search over a focused editor only because its binding
+/// carries no context predicate — `handle_diff_shortcut` hands every other
+/// keystroke to the buffer.
+#[gpui::test]
+async fn ctrl_f_and_escape_walk_in_and_out_of_the_editor(cx: &mut gpui::TestAppContext) {
+    let _visual_guard = lock_visual_test();
+    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::GitCometView::new(store, events, None, window, cx)
+    });
+
+    let contents = "alpha needle beta\nneedle gamma\n";
+    let workdir = seed_editor(&view, cx, 986, "file_editor_search_keys", contents);
+
+    cx.update(|window, app| {
+        crate::app::bind_app_keys_for_test(app);
+        view.update(app, |this, cx| {
+            this.main_pane.update(cx, |pane, cx| {
+                let focus = pane.file_editor_input.read(cx).focus_handle();
+                window.focus(&focus, cx);
+            });
+        });
+        let _ = window.draw(app);
+    });
+
+    cx.simulate_keystrokes("secondary-f");
+    draw_and_drain_test_window(cx);
+
+    cx.update(|window, app| {
+        let pane = view.read(app).main_pane.read(app);
+        assert!(
+            pane.diff_search_active,
+            "ctrl+f must open the search even with the buffer focused"
+        );
+        assert!(
+            pane.diff_search_input
+                .read(app)
+                .focus_handle()
+                .is_focused(window),
+            "and put the caret in the search box, not the buffer"
+        );
+    });
+
+    cx.simulate_keystrokes("n e e d l e");
+    draw_and_drain_test_window(cx);
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            this.main_pane.update(cx, |pane, _cx| {
+                pane.diff_search_recompute_matches_and_scroll_to_first();
+            });
+        });
+    });
+    draw_and_drain_test_window(cx);
+
+    let matches = editor_search_matches(&view, cx);
+    assert_eq!(matches.len(), 2, "the buffer holds two needles");
+    cx.update(|_window, app| {
+        assert_eq!(
+            view.read(app)
+                .main_pane
+                .read(app)
+                .file_editor_input
+                .read(app)
+                .text(),
+            contents,
+            "the query must land in the search box, never in the file"
+        );
+    });
+
+    cx.simulate_keystrokes("escape");
+    draw_and_drain_test_window(cx);
+
+    cx.update(|window, app| {
+        let pane = view.read(app).main_pane.read(app);
+        assert!(!pane.diff_search_active, "escape closes the search");
+        assert!(
+            pane.file_editor_search_matches.is_empty(),
+            "and takes the wash with it"
+        );
+        assert!(
+            pane.is_file_editor_active(),
+            "escape from the search must not also exit edit mode"
+        );
+        assert!(
+            pane.file_editor_input
+                .read(app)
+                .focus_handle()
+                .is_focused(window),
+            "the buffer gets focus back, so the next keystroke edits the file"
+        );
+    });
+    assert_eq!(
+        editor_selected_range(&view, cx),
+        matches[0],
+        "the caret is left on the match the search was showing"
+    );
 
     let _ = std::fs::remove_dir_all(&workdir);
 }

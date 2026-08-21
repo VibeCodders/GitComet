@@ -19,7 +19,7 @@ use gitcomet_core::conflict_session::{
 use gitcomet_core::error::Error;
 use gitcomet_core::merge::{MergeSource, OrderedSelection};
 use gitcomet_core::services::{InteractiveRebaseAction, InteractiveRebaseEntry};
-use std::collections::HashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -717,7 +717,7 @@ pub(super) fn ref_metadata_loaded(
             // so latch an empty map rather than `Error` — callers retry on
             // `Error`, which would re-schedule a doomed load on every open.
             Err(e) if matches!(e.kind(), gitcomet_core::error::ErrorKind::Unsupported(_)) => {
-                Loadable::Ready(std::collections::HashMap::new())
+                Loadable::Ready(FxHashMap::default())
             }
             // Deliberately no diagnostic: this data only decorates picker rows,
             // which fall back to name-only. A transient failure must not raise
@@ -1439,7 +1439,7 @@ pub(super) fn load_reflog(state: &mut AppState, repo_id: RepoId) -> Vec<Effect> 
     let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) else {
         return Vec::new();
     };
-    repo_state.reflog = Loadable::Loading;
+    repo_state.set_reflog(Loadable::Loading);
     if repo_state
         .loads_in_flight
         .request(RepoLoadsInFlight::REFLOG)
@@ -2507,13 +2507,14 @@ pub(super) fn reflog_loaded(
 ) -> Vec<Effect> {
     let mut effects = Vec::new();
     if let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) {
-        repo_state.reflog = match result {
+        let next = match result {
             Ok(v) => Loadable::Ready(v),
             Err(e) => {
                 push_diagnostic(repo_state, DiagnosticKind::Error, e.to_string());
                 Loadable::Error(e.to_string())
             }
         };
+        repo_state.set_reflog(next);
         if repo_state.loads_in_flight.finish(RepoLoadsInFlight::REFLOG) {
             effects.push(Effect::LoadReflog {
                 repo_id,
@@ -2626,7 +2627,7 @@ pub(super) fn squash_rebase_setup_loaded(
         }
     };
 
-    let selected_strs: HashSet<&str> = selected_ids.iter().map(|id| id.as_ref()).collect();
+    let selected_strs: FxHashSet<&str> = selected_ids.iter().map(|id| id.as_ref()).collect();
 
     // The list loaded asynchronously, so re-validate it against the plan the
     // user confirmed before rewriting history. `git log --reverse base..HEAD`

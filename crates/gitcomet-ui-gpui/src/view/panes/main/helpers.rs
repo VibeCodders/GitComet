@@ -4,6 +4,8 @@ use crate::kit::text_model::TextModelSnapshot;
 use crate::kit::{HighlightProvider, HighlightProviderResult};
 use crate::view::conflict_resolver::ConflictSegment;
 use palette::IntoColor;
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
+use std::collections::HashSet;
 
 const DIFF_ROW_HEIGHT_PX: f32 = 20.0;
 const DIFF_FILE_HEADER_HEIGHT_PX: f32 = 28.0;
@@ -12,6 +14,9 @@ const DIFF_HUNK_HEADER_HEIGHT_PX: f32 = 24.0;
 /// through is measured in these, so anything computing an output scroll offset
 /// by hand has to agree with what the gutter actually lays out.
 pub(in crate::view) const RESOLVED_OUTPUT_ROW_HEIGHT_PX: f32 = 20.0;
+
+/// Frames a sideways search reveal waits for its row to paint before giving up.
+pub(in crate::view) const DIFF_SEARCH_HORIZONTAL_REVEAL_ATTEMPTS: u8 = 4;
 
 /// The scroll offset a `uniform_list` would land on to reveal `row_ix`, or
 /// `None` when the row is already fully visible and the list would not move.
@@ -41,6 +46,48 @@ pub(in crate::view) fn centered_reveal_scroll_y(
     }
     let target_top = (row_top + row_height / 2.0) - viewport_height / 2.0;
     Some(-target_top.clamp(px(0.0), max_offset_y.max(px(0.0))))
+}
+
+/// Margin kept between a revealed search match and the edge it was scrolled
+/// past, so the hit does not sit flush against the pane border.
+pub(in crate::view) const SEARCH_REVEAL_MARGIN_PX: f32 = 24.0;
+
+/// The horizontal scroll offset that brings `[match_left, match_right]` into
+/// view, or `None` when it already is and the pane should not move.
+///
+/// Unlike the vertical reveal this scrolls the *least* it can rather than
+/// centring: a long line jumping sideways on every match is disorienting, and
+/// the surrounding text is what makes a hit readable. A match too wide for the
+/// viewport is anchored by its start, which is where reading resumes.
+///
+/// `match_left`/`match_right` are in content space; offsets run negative as the
+/// view scrolls right, matching `ScrollHandle`.
+pub(in crate::view) fn reveal_scroll_x(
+    match_left: Pixels,
+    match_right: Pixels,
+    viewport_width: Pixels,
+    max_offset_x: Pixels,
+    current_x: Pixels,
+) -> Option<Pixels> {
+    if viewport_width <= px(0.0) {
+        return None;
+    }
+    let margin = px(SEARCH_REVEAL_MARGIN_PX).min(viewport_width / 4.0);
+    let view_left = -current_x;
+    let view_right = view_left + viewport_width;
+
+    let target_left = if match_left < view_left + margin {
+        match_left - margin
+    } else if match_right > view_right - margin {
+        // Anchor the start when the match cannot fit, so reading begins at the
+        // hit rather than at its tail.
+        (match_right + margin - viewport_width).min(match_left - margin)
+    } else {
+        return None;
+    };
+
+    let target = -target_left.clamp(px(0.0), max_offset_x.max(px(0.0)));
+    (target != current_x).then_some(target)
 }
 
 #[inline]
@@ -162,7 +209,7 @@ pub(super) fn resolved_output_heuristic_provider_binding_key(
 ) -> u64 {
     use std::hash::{Hash, Hasher};
 
-    let mut hasher = rustc_hash::FxHasher::default();
+    let mut hasher = FxHasher::default();
     "heuristic".hash(&mut hasher);
     revision.model_id.hash(&mut hasher);
     revision.revision.hash(&mut hasher);
@@ -381,7 +428,9 @@ pub(super) fn worktree_output_requires_protection(
     let (Some(ours), Some(theirs)) = (ours, theirs) else {
         return true;
     };
-    let stage_lines: std::collections::HashSet<&str> = base
+    // `std`'s seeded `HashSet`, not `FxHashSet`: the keys are raw file lines
+    // off disk, i.e. content an untrusted repository controls.
+    let stage_lines: HashSet<&str> = base
         .into_iter()
         .chain([ours, theirs])
         .flat_map(str::lines)
@@ -1405,7 +1454,7 @@ impl ResolvedOutputKey {
 /// and rows computed against the old geometry then land on the wrong lines.
 fn block_map_fingerprint(block_map: &conflict_resolver::ResolvedOutputBlockMap) -> u64 {
     use std::hash::{Hash, Hasher};
-    let mut hasher = rustc_hash::FxHasher::default();
+    let mut hasher = FxHasher::default();
     let ranges = block_map.ranges();
     ranges.len().hash(&mut hasher);
     for range in ranges {
@@ -1419,7 +1468,7 @@ fn block_map_fingerprint(block_map: &conflict_resolver::ResolvedOutputBlockMap) 
 /// the revision already covers that.
 fn resolution_fingerprint(marker_segments: &[conflict_resolver::ConflictSegment]) -> u64 {
     use std::hash::{Hash, Hasher};
-    let mut hasher = rustc_hash::FxHasher::default();
+    let mut hasher = FxHasher::default();
     for segment in marker_segments {
         match segment {
             conflict_resolver::ConflictSegment::Block(block) => {
@@ -1603,7 +1652,7 @@ pub(super) fn resolved_output_live_provider_binding_key(
 ) -> u64 {
     use std::hash::{Hash, Hasher};
 
-    let mut hasher = rustc_hash::FxHasher::default();
+    let mut hasher = FxHasher::default();
     document_version.hash(&mut hasher);
     theme_epoch.hash(&mut hasher);
     unresolved_spans.all.hash(&mut hasher);
@@ -1709,7 +1758,7 @@ pub(super) fn first_output_marker_line_for_conflict(
 pub(super) fn conflict_marker_nav_entries_from_markers(
     markers: &[Option<ResolvedOutputConflictMarker>],
 ) -> Vec<usize> {
-    let mut seen_conflicts = HashSet::default();
+    let mut seen_conflicts = FxHashSet::default();
     markers
         .iter()
         .enumerate()
@@ -3001,7 +3050,7 @@ pub(crate) struct MainPaneView {
     /// Painted bounds of each row's stage-gutter cell, recorded during paint so
     /// tests can drive the button without duplicating its geometry.
     pub(in crate::view) diff_stage_gutter_cells:
-        HashMap<(usize, crate::view::rows::DiffStageSlot), gpui::Bounds<Pixels>>,
+        FxHashMap<(usize, crate::view::rows::DiffStageSlot), gpui::Bounds<Pixels>>,
     /// Memoized `(min, max)` author-time range for the currently loaded blame,
     /// keyed by a clone of the blame `Arc`. The range never changes after load,
     /// so this avoids rescanning all blame lines on every render frame. Holding
@@ -3035,7 +3084,7 @@ pub(crate) struct MainPaneView {
     pub(in crate::view) diff_line_kind_for_src_ix: Vec<gitcomet_core::domain::DiffLineKind>,
     pub(in crate::view) diff_visual_line_kind_for_src_ix: Vec<gitcomet_core::domain::DiffLineKind>,
     pub(in crate::view) diff_hide_unified_header_for_src_ix: Vec<bool>,
-    pub(in crate::view) diff_header_display_cache: HashMap<usize, SharedString>,
+    pub(in crate::view) diff_header_display_cache: FxHashMap<usize, SharedString>,
     pub(in crate::view) diff_split_cache: Vec<PatchSplitRow>,
     pub(in crate::view) diff_split_cache_len: usize,
     pub(in crate::view) diff_panel_focus_handle: FocusHandle,
@@ -3047,11 +3096,11 @@ pub(crate) struct MainPaneView {
     pub(in crate::view) diff_wrap_visible_rows: Vec<DiffWrapVisualRow>,
     pub(in crate::view) diff_wrap_visible_cache_key: Option<DiffWrapVisibleCacheKey>,
     pub(in crate::view) collapsed_diff_hunks: Vec<CollapsedDiffHunk>,
-    pub(in crate::view) collapsed_diff_hunk_ix_by_src_ix: HashMap<usize, usize>,
-    pub(in crate::view) collapsed_diff_reveals: HashMap<usize, CollapsedDiffReveal>,
+    pub(in crate::view) collapsed_diff_hunk_ix_by_src_ix: FxHashMap<usize, usize>,
+    pub(in crate::view) collapsed_diff_reveals: FxHashMap<usize, CollapsedDiffReveal>,
     pub(in crate::view) collapsed_diff_visible_rows: Vec<CollapsedDiffVisibleRow>,
     pub(in crate::view) collapsed_diff_hunk_visible_indices: Vec<usize>,
-    pub(in crate::view) collapsed_diff_header_display_cache: HashMap<usize, SharedString>,
+    pub(in crate::view) collapsed_diff_header_display_cache: FxHashMap<usize, SharedString>,
     pub(in crate::view) collapsed_diff_projection_identity: Option<CollapsedDiffProjectionIdentity>,
     pub(in crate::view) diff_visible_cache_len: usize,
     pub(in crate::view) diff_visible_view: DiffViewMode,
@@ -3078,9 +3127,23 @@ pub(crate) struct MainPaneView {
     pub(super) diff_text_autoscroll_target: Option<DiffTextAutoscrollTarget>,
     pub(super) diff_text_last_mouse_pos: Point<Pixels>,
     pub(in crate::view) diff_suppress_clicks_remaining: u8,
-    pub(in crate::view) diff_text_hitboxes: HashMap<(usize, DiffTextRegion), DiffTextHitbox>,
+    pub(in crate::view) diff_text_hitboxes: FxHashMap<(usize, DiffTextRegion), DiffTextHitbox>,
+    /// A search match whose row still has to be brought into view sideways, and
+    /// how many more frames to keep trying for.
+    ///
+    /// The vertical jump is deferred to the list's own prepaint and the row is
+    /// only measurable once it paints at its new position, which is not always
+    /// the very next frame — the frame that applies the scroll can still be
+    /// painting the rows it was showing before. The budget is what stops a row
+    /// that never paints from leaving the request live for good.
+    pub(in crate::view) diff_search_horizontal_reveal: Option<(usize, u8)>,
+    /// Where the merge tool's column rows painted their text this frame, for the
+    /// sideways half of a search reveal. Rebuilt every frame like
+    /// [`Self::diff_text_hitboxes`].
+    pub(in crate::view) conflict_text_hitboxes:
+        FxHashMap<(usize, ThreeWayColumn), crate::view::mod_helpers::ConflictTextHitbox>,
     pub(in crate::view) diff_text_layout_cache_epoch: u64,
-    pub(in crate::view) diff_text_layout_cache: HashMap<u64, DiffTextLayoutCacheEntry>,
+    pub(in crate::view) diff_text_layout_cache: FxHashMap<u64, DiffTextLayoutCacheEntry>,
     pub(in crate::view) diff_search_active: bool,
     pub(in crate::view) diff_search_query: SharedString,
     pub(in crate::view) diff_search_options: super::diff_search::DiffSearchOptions,
@@ -3128,7 +3191,7 @@ pub(crate) struct MainPaneView {
     pub(in crate::view) file_diff_style_cache_epochs: FileDiffStyleCacheEpochs,
     pub(in crate::view) syntax_chunk_poll_task: Option<gpui::Task<()>>,
     pub(in crate::view) prepared_syntax_documents:
-        HashMap<PreparedSyntaxDocumentKey, rows::PreparedDiffSyntaxDocument>,
+        FxHashMap<PreparedSyntaxDocumentKey, rows::PreparedDiffSyntaxDocument>,
     #[cfg(test)]
     pub(in crate::view) diff_syntax_budget_override: Option<rows::DiffSyntaxBudget>,
 
@@ -3140,6 +3203,10 @@ pub(crate) struct MainPaneView {
     pub(in crate::view) file_markdown_preview_seq: u64,
     pub(in crate::view) file_markdown_preview_inflight: Option<u64>,
     pub(in crate::view) markdown_preview_wrap: MarkdownPreviewWrapCache,
+    /// Row the quick-search cursor wants revealed in the flowing markdown
+    /// preview, shared with the renderer that measures it. See
+    /// [`rows::MarkdownPreviewRevealRequest`].
+    pub(in crate::view) markdown_preview_reveal: rows::MarkdownPreviewRevealRequest,
 
     pub(in crate::view) file_image_diff_cache_repo_id: Option<RepoId>,
     pub(in crate::view) file_image_diff_cache_rev: u64,
@@ -3177,7 +3244,7 @@ pub(crate) struct MainPaneView {
     pub(in crate::view) worktree_markdown_preview_blocks: rows::MarkdownDocumentBlockCache,
     /// Pictures in the rendered preview that are still decoding and already
     /// have someone waiting to repaint the pane when they finish.
-    pub(in crate::view) worktree_markdown_preview_image_waits: HashSet<gpui::Resource>,
+    pub(in crate::view) worktree_markdown_preview_image_waits: FxHashSet<gpui::Resource>,
     pub(in crate::view) worktree_markdown_preview_seq: u64,
     pub(in crate::view) worktree_markdown_preview_inflight: Option<u64>,
     pub(in crate::view) worktree_preview_segments_cache_path: Option<std::path::PathBuf>,
@@ -3185,7 +3252,7 @@ pub(crate) struct MainPaneView {
     pub(in crate::view) worktree_preview_style_cache_epoch: u64,
     pub(in crate::view) worktree_preview_cache_write_blocked_until_rev: Option<u64>,
     pub(in crate::view) worktree_preview_segments_cache:
-        HashMap<usize, VersionedCachedDiffStyledText>,
+        FxHashMap<usize, VersionedCachedDiffStyledText>,
     pub(in crate::view) diff_preview_is_new_file: bool,
 
     /// The editable working-tree buffer. See `super::file_editor`.
@@ -3221,7 +3288,7 @@ pub(crate) struct MainPaneView {
     /// Keyed by repo *and* path: two repo tabs can hold the same relative path,
     /// and one must not restore over the other's buffer.
     pub(in crate::view) file_editor_stash:
-        HashMap<(RepoId, std::path::PathBuf), super::file_editor::StashedFileEdit>,
+        FxHashMap<(RepoId, std::path::PathBuf), super::file_editor::StashedFileEdit>,
     /// Bumped whenever the set of files with unsaved edits changes.
     ///
     /// That set lives here rather than in the store, so nothing outside this
@@ -3245,6 +3312,33 @@ pub(crate) struct MainPaneView {
     pub(in crate::view) file_editor_live_syntax_reparse: Option<gpui::Task<()>>,
     /// The delimiters currently washed as the caret's bracket pair.
     pub(in crate::view) file_editor_bracket_match: Option<(Range<usize>, Range<usize>)>,
+    /// Byte ranges of every search match in the editor buffer, one per
+    /// occurrence and parallel to `diff_search_matches`, which carries the line
+    /// each of them sits on. Keeping the two parallel is what lets the shared
+    /// `n/N` label and match cursor work over the editor unchanged.
+    pub(in crate::view) file_editor_search_matches: Vec<Range<usize>>,
+    /// The buffer the scan reads. It runs without a `cx` and so cannot reach the
+    /// input; a snapshot is an `Arc` bump and immutable under later edits, which
+    /// makes caching one here the cheap way to hand it the live text.
+    pub(in crate::view) file_editor_search_source: Option<TextModelSnapshot>,
+    /// Bumped whenever the *painted* match set moves — a rescan, a cursor step,
+    /// the search closing. `render_file_editor` rebinds the highlight provider
+    /// when it differs from `file_editor_search_applied_rev`.
+    pub(in crate::view) file_editor_search_rev: u64,
+    pub(in crate::view) file_editor_search_applied_rev: u64,
+    /// Bumped only when the match *cursor* moves. Separate from the rev above
+    /// because it drives the selection, and a rescan alone must not re-select:
+    /// the buffer is rescanned on every keystroke while the search box is open,
+    /// which would drag the caret off what the user is typing.
+    pub(in crate::view) file_editor_search_reveal_rev: u64,
+    pub(in crate::view) file_editor_search_reveal_applied_rev: u64,
+    /// Set once a search reveal has moved the caret, cleared once the editor
+    /// has been scrolled sideways to it.
+    ///
+    /// The caret's x can only be read from the layout of a frame that already
+    /// painted it, so the horizontal half of the reveal lands one frame after
+    /// the selection does.
+    pub(in crate::view) file_editor_search_reveal_x_pending: bool,
     /// Bumped on every theme change: the syntax palette is baked into the
     /// snapshot the provider closes over, so a new theme needs a new binding key.
     pub(in crate::view) file_editor_provider_theme_epoch: u64,
@@ -3254,7 +3348,8 @@ pub(crate) struct MainPaneView {
     pub(in crate::view) conflict_resolver_input: Entity<components::TextInput>,
     pub(super) _conflict_resolver_input_subscription: gpui::Subscription,
     pub(in crate::view) conflict_resolver: ConflictResolverUiState,
-    pub(in crate::view) conflict_open_summary_toasted_files: HashSet<(RepoId, std::path::PathBuf)>,
+    pub(in crate::view) conflict_open_summary_toasted_files:
+        FxHashSet<(RepoId, std::path::PathBuf)>,
     pub(in crate::view) conflict_resolver_vsplit_ratio: f32,
     pub(in crate::view) conflict_resolver_vsplit_resize: Option<ConflictVSplitResizeState>,
     pub(in crate::view) conflict_three_way_col_ratios: [f32; 2],
@@ -3271,7 +3366,16 @@ pub(crate) struct MainPaneView {
     pub(in crate::view) conflict_diff_query_cache_query: SharedString,
     pub(in crate::view) conflict_diff_query_cache_options: super::diff_search::DiffSearchOptions,
     pub(in crate::view) conflict_three_way_segments_cache:
-        HashMap<(usize, ThreeWayColumn), CachedDiffStyledText>,
+        FxHashMap<(usize, ThreeWayColumn), CachedDiffStyledText>,
+    /// Quick-search overlay layered on top of `conflict_three_way_segments_cache`.
+    ///
+    /// Separate so a query change throws away only the wash and leaves the
+    /// syntax/word-highlight work standing, the way the two-way columns split
+    /// `conflict_diff_segments_cache_split` from its query twin. Holds only
+    /// non-current matches — the current one moves with the search cursor and
+    /// is built per frame.
+    pub(in crate::view) conflict_three_way_query_segments_cache:
+        FxHashMap<(usize, ThreeWayColumn), CachedDiffStyledText>,
     /// Prepared full-document syntax trees for each merge-input side (base, ours, theirs).
     /// When present, three-way rendering uses document-based syntax instead of per-line heuristics.
     pub(in crate::view) conflict_three_way_prepared_syntax_documents:
@@ -3387,6 +3491,10 @@ pub(crate) struct MainPaneView {
     /// UI-scaled row height the gutter list paints at, computed by the render
     /// pass so the virtualized row processor can read it without a scale lookup.
     pub(in crate::view) file_editor_gutter_row_height: Pixels,
+    /// The same, for the merge tool's resolved-output gutter. Navigation centres
+    /// the editable output on a row from `&self`, where there is no `cx` to look
+    /// the scale up through, so the render pass leaves it here.
+    pub(in crate::view) conflict_resolved_gutter_row_height: Pixels,
     /// Blame for the edited file, resolved by the render pass so the virtualized
     /// gutter rows can read it without rebuilding the context per row.
     pub(in crate::view) file_editor_blame: Option<rows::BlameRenderCtx>,
@@ -3402,7 +3510,7 @@ pub(crate) struct MainPaneView {
     /// setups open in several repo tabs at once stay independent. Entries are
     /// populated when a repo's setup becomes Ready and dropped when its setup
     /// goes away (see `apply_state`).
-    pub(in crate::view) interactive_rebase_states: HashMap<RepoId, IRebaseViewState>,
+    pub(in crate::view) interactive_rebase_states: FxHashMap<RepoId, IRebaseViewState>,
 }
 
 /// View-local editing state for one repo's interactive rebase setup.
@@ -3411,14 +3519,14 @@ pub(in crate::view) struct IRebaseViewState {
     pub(in crate::view) mode: ICommitEditorMode,
     pub(in crate::view) entries: Vec<gitcomet_core::services::InteractiveRebaseEntry>,
     pub(in crate::view) original_entries: Vec<gitcomet_core::services::InteractiveRebaseEntry>,
-    pub(in crate::view) source_colors: std::collections::HashMap<String, u8>,
+    pub(in crate::view) source_colors: FxHashMap<String, u8>,
     /// Active auto-squash strategy, or None when auto-squash is off.
     pub(in crate::view) autosquash_mode: Option<AutosquashMode>,
     /// Commits folded away by auto-squash, keyed by the surviving commit id.
     /// Each survivor's `entries` row displays these ids; they are re-expanded
     /// into `fixup` todo entries when the rebase starts.
     pub(in crate::view) folded:
-        std::collections::HashMap<String, Vec<gitcomet_core::services::InteractiveRebaseEntry>>,
+        FxHashMap<String, Vec<gitcomet_core::services::InteractiveRebaseEntry>>,
     pub(in crate::view) drag_state: Option<IRebaseDragState>,
     /// Variable-height virtualized list state, lazily created on first render
     /// (`ListState` has no `Default`). Kept in sync with `entries`/`folded` via
@@ -3532,5 +3640,73 @@ mod tests {
         assert_eq!(regions[0].selected_line_range, 0..0);
         assert_eq!(regions[0].alternate_line_range, 0..1);
         assert!(regions[0].has_non_emitting_rows);
+    }
+}
+
+#[cfg(test)]
+mod search_reveal_x_tests {
+    use super::{SEARCH_REVEAL_MARGIN_PX, reveal_scroll_x};
+    use gpui::px;
+
+    fn viewport() -> gpui::Pixels {
+        px(800.0)
+    }
+
+    fn max_offset() -> gpui::Pixels {
+        px(4000.0)
+    }
+
+    #[test]
+    fn a_match_already_on_screen_does_not_move_the_view() {
+        assert_eq!(
+            reveal_scroll_x(px(200.0), px(260.0), viewport(), max_offset(), px(0.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_match_off_the_right_edge_scrolls_just_far_enough_to_show_it() {
+        // Right edge at 800; the match ends at 900, so the view slides by the
+        // overshoot plus the margin and no further.
+        let target = reveal_scroll_x(px(840.0), px(900.0), viewport(), max_offset(), px(0.0))
+            .expect("expected the view to scroll right");
+        assert_eq!(target, px(-(900.0 + SEARCH_REVEAL_MARGIN_PX - 800.0)));
+    }
+
+    #[test]
+    fn a_match_off_the_left_edge_scrolls_back_to_it() {
+        // Scrolled 1000 right, with the match at 300 behind the left edge.
+        let target = reveal_scroll_x(px(300.0), px(360.0), viewport(), max_offset(), px(-1000.0))
+            .expect("expected the view to scroll left");
+        assert_eq!(target, px(-(300.0 - SEARCH_REVEAL_MARGIN_PX)));
+    }
+
+    #[test]
+    fn a_match_wider_than_the_viewport_is_anchored_by_its_start() {
+        let target = reveal_scroll_x(px(1000.0), px(3000.0), viewport(), max_offset(), px(0.0))
+            .expect("expected the view to scroll right");
+        assert_eq!(target, px(-(1000.0 - SEARCH_REVEAL_MARGIN_PX)));
+    }
+
+    #[test]
+    fn the_target_is_clamped_into_the_scrollable_range() {
+        // Never past the end of the content...
+        assert_eq!(
+            reveal_scroll_x(px(9000.0), px(9060.0), viewport(), px(500.0), px(0.0)),
+            Some(px(-500.0))
+        );
+        // ...and never before its start.
+        assert_eq!(
+            reveal_scroll_x(px(0.0), px(10.0), viewport(), max_offset(), px(-40.0)),
+            Some(px(0.0))
+        );
+    }
+
+    #[test]
+    fn an_unmeasured_viewport_has_no_reveal_to_compute() {
+        assert_eq!(
+            reveal_scroll_x(px(1000.0), px(1060.0), px(0.0), max_offset(), px(0.0)),
+            None
+        );
     }
 }

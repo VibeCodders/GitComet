@@ -2,7 +2,7 @@ use super::*;
 
 fn push_entry(
     items: &mut Vec<ContextMenuItem>,
-    debug_selectors: &mut std::collections::HashMap<usize, SharedString>,
+    debug_selectors: &mut FxHashMap<usize, SharedString>,
     debug_selector: &'static str,
     icon: &'static str,
     label: &'static str,
@@ -23,13 +23,13 @@ fn push_entry(
 /// initialize a repository.
 pub(super) fn model() -> ContextMenuModel {
     let mut items = Vec::with_capacity(3);
-    let mut debug_selectors = std::collections::HashMap::new();
+    let mut debug_selectors = FxHashMap::with_capacity_and_hasher(3, Default::default());
     push_entry(
         &mut items,
         &mut debug_selectors,
         "add_repo_menu_open",
         "icons/disk.svg",
-        "Open repository",
+        crate::menu_labels::OPEN_REPOSITORY,
         AddRepoMenuAction::Open,
     );
     push_entry(
@@ -37,7 +37,7 @@ pub(super) fn model() -> ContextMenuModel {
         &mut debug_selectors,
         "add_repo_menu_clone",
         "icons/cloud.svg",
-        "Clone repository",
+        crate::menu_labels::CLONE_REPOSITORY,
         AddRepoMenuAction::Clone,
     );
     push_entry(
@@ -45,7 +45,7 @@ pub(super) fn model() -> ContextMenuModel {
         &mut debug_selectors,
         "add_repo_menu_init",
         "icons/git_branch.svg",
-        "Initialize repository",
+        crate::menu_labels::INITIALIZE_REPOSITORY,
         AddRepoMenuAction::Initialize,
     );
 

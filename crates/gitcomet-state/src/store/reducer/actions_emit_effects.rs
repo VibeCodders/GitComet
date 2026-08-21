@@ -18,7 +18,7 @@ use gitcomet_core::services::{
     CommandOutput, GitRepository, InteractiveRebaseEntry, PullMode, RemoteUrlKind, ResetMode,
     SafePushAfterCommitTarget,
 };
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::FxHashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -302,7 +302,7 @@ enum InFlightKind {
 }
 
 fn bump_in_flight(
-    repos: &HashMap<RepoId, Arc<dyn GitRepository>>,
+    repos: &FxHashMap<RepoId, Arc<dyn GitRepository>>,
     state: &mut AppState,
     repo_id: RepoId,
     kind: InFlightKind,
@@ -324,7 +324,7 @@ fn bump_in_flight(
 }
 
 pub(super) fn fetch_all(
-    repos: &HashMap<RepoId, Arc<dyn GitRepository>>,
+    repos: &FxHashMap<RepoId, Arc<dyn GitRepository>>,
     state: &mut AppState,
     repo_id: RepoId,
 ) -> Vec<Effect> {
@@ -342,7 +342,7 @@ pub(super) fn fetch_all(
 }
 
 pub(super) fn prune_merged_branches(
-    repos: &HashMap<RepoId, Arc<dyn GitRepository>>,
+    repos: &FxHashMap<RepoId, Arc<dyn GitRepository>>,
     state: &mut AppState,
     repo_id: RepoId,
 ) -> Vec<Effect> {
@@ -351,7 +351,7 @@ pub(super) fn prune_merged_branches(
 }
 
 pub(super) fn prune_local_tags(
-    repos: &HashMap<RepoId, Arc<dyn GitRepository>>,
+    repos: &FxHashMap<RepoId, Arc<dyn GitRepository>>,
     state: &mut AppState,
     repo_id: RepoId,
 ) -> Vec<Effect> {
@@ -360,7 +360,7 @@ pub(super) fn prune_local_tags(
 }
 
 pub(super) fn pull(
-    repos: &HashMap<RepoId, Arc<dyn GitRepository>>,
+    repos: &FxHashMap<RepoId, Arc<dyn GitRepository>>,
     state: &mut AppState,
     repo_id: RepoId,
     mode: PullMode,
@@ -374,7 +374,7 @@ pub(super) fn pull(
 }
 
 pub(super) fn pull_branch(
-    repos: &HashMap<RepoId, Arc<dyn GitRepository>>,
+    repos: &FxHashMap<RepoId, Arc<dyn GitRepository>>,
     state: &mut AppState,
     repo_id: RepoId,
     remote: String,
@@ -398,7 +398,7 @@ pub(super) fn squash_ref(repo_id: RepoId, reference: String) -> Vec<Effect> {
 }
 
 pub(super) fn push(
-    repos: &HashMap<RepoId, Arc<dyn GitRepository>>,
+    repos: &FxHashMap<RepoId, Arc<dyn GitRepository>>,
     state: &mut AppState,
     repo_id: RepoId,
 ) -> Vec<Effect> {
@@ -410,7 +410,7 @@ pub(super) fn push(
 }
 
 pub(super) fn push_after_commit(
-    repos: &HashMap<RepoId, Arc<dyn GitRepository>>,
+    repos: &FxHashMap<RepoId, Arc<dyn GitRepository>>,
     state: &mut AppState,
     repo_id: RepoId,
     target: SafePushAfterCommitTarget,
@@ -420,7 +420,7 @@ pub(super) fn push_after_commit(
 }
 
 fn push_after_commit_with_auth(
-    repos: &HashMap<RepoId, Arc<dyn GitRepository>>,
+    repos: &FxHashMap<RepoId, Arc<dyn GitRepository>>,
     state: &mut AppState,
     repo_id: RepoId,
     target: SafePushAfterCommitTarget,
@@ -437,7 +437,7 @@ fn push_after_commit_with_auth(
 }
 
 pub(super) fn force_push(
-    repos: &HashMap<RepoId, Arc<dyn GitRepository>>,
+    repos: &FxHashMap<RepoId, Arc<dyn GitRepository>>,
     state: &mut AppState,
     repo_id: RepoId,
 ) -> Vec<Effect> {
@@ -449,7 +449,7 @@ pub(super) fn force_push(
 }
 
 pub(super) fn force_push_with_lease(
-    repos: &HashMap<RepoId, Arc<dyn GitRepository>>,
+    repos: &FxHashMap<RepoId, Arc<dyn GitRepository>>,
     state: &mut AppState,
     repo_id: RepoId,
     lease: gitcomet_core::services::ForcePushLease,
@@ -463,7 +463,7 @@ pub(super) fn force_push_with_lease(
 }
 
 pub(super) fn push_set_upstream(
-    repos: &HashMap<RepoId, Arc<dyn GitRepository>>,
+    repos: &FxHashMap<RepoId, Arc<dyn GitRepository>>,
     state: &mut AppState,
     repo_id: RepoId,
     remote: String,
@@ -495,7 +495,7 @@ pub(super) fn unset_upstream_branch(repo_id: RepoId, branch: String) -> Vec<Effe
 }
 
 pub(super) fn delete_remote_branch(
-    repos: &HashMap<RepoId, Arc<dyn GitRepository>>,
+    repos: &FxHashMap<RepoId, Arc<dyn GitRepository>>,
     state: &mut AppState,
     repo_id: RepoId,
     remote: String,
@@ -511,7 +511,7 @@ pub(super) fn delete_remote_branch(
 }
 
 pub(super) fn delete_remote_branches(
-    repos: &HashMap<RepoId, Arc<dyn GitRepository>>,
+    repos: &FxHashMap<RepoId, Arc<dyn GitRepository>>,
     state: &mut AppState,
     repo_id: RepoId,
     remote: String,
@@ -707,7 +707,7 @@ pub(super) fn delete_tag(repo_id: RepoId, name: String) -> Vec<Effect> {
 }
 
 pub(super) fn push_tag(
-    repos: &HashMap<RepoId, Arc<dyn GitRepository>>,
+    repos: &FxHashMap<RepoId, Arc<dyn GitRepository>>,
     state: &mut AppState,
     repo_id: RepoId,
     remote: String,
@@ -723,7 +723,7 @@ pub(super) fn push_tag(
 }
 
 pub(super) fn delete_remote_tag(
-    repos: &HashMap<RepoId, Arc<dyn GitRepository>>,
+    repos: &FxHashMap<RepoId, Arc<dyn GitRepository>>,
     state: &mut AppState,
     repo_id: RepoId,
     remote: String,
@@ -932,7 +932,7 @@ pub(super) fn commit_amend_finished(
 }
 
 pub(super) fn safe_push_after_commit_finished(
-    repos: &HashMap<RepoId, Arc<dyn GitRepository>>,
+    repos: &FxHashMap<RepoId, Arc<dyn GitRepository>>,
     state: &mut AppState,
     repo_id: RepoId,
     auth: Option<StagedGitAuth>,

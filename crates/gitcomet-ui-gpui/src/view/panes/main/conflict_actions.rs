@@ -12,6 +12,7 @@ use gitcomet_core::mergetool_trace::{
     self, MergetoolTraceEvent, MergetoolTraceRenderingMode, MergetoolTraceSideStats,
     MergetoolTraceStage,
 };
+use rustc_hash::{FxHashMap, FxHasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -142,7 +143,7 @@ const CONFLICT_SOURCE_FINGERPRINT_WINDOW_BYTES: usize = 256;
 fn sampled_content_fingerprint(bytes: &[u8], domain: &str) -> u64 {
     use std::hash::Hasher;
 
-    let mut hasher = rustc_hash::FxHasher::default();
+    let mut hasher = FxHasher::default();
     hasher.write_usize(domain.len());
     hasher.write(domain.as_bytes());
     hasher.write_usize(bytes.len());
@@ -324,7 +325,7 @@ impl MainPaneView {
         let gutter = uniform_list_base_handle(&self.conflict_resolved_preview_gutter_scroll);
         let Some(gutter_y) = centered_reveal_scroll_y(
             row_ix,
-            px(RESOLVED_OUTPUT_ROW_HEIGHT_PX),
+            self.conflict_resolved_gutter_row_height,
             gutter.bounds().size.height,
             gutter.max_offset().y,
             gutter.offset().y,
@@ -337,6 +338,124 @@ impl MainPaneView {
         if offset.y != editor_y {
             editor.set_offset(point(offset.x, editor_y));
         }
+    }
+
+    /// Record where a merge-tool column row painted its text.
+    pub(in crate::view) fn set_conflict_text_hitbox(
+        &mut self,
+        visible_ix: usize,
+        column: ThreeWayColumn,
+        hitbox: crate::view::mod_helpers::ConflictTextHitbox,
+    ) {
+        self.conflict_text_hitboxes
+            .insert((visible_ix, column), hitbox);
+    }
+
+    /// Scroll the merge tool sideways to the current quick-search match.
+    ///
+    /// Only the column the match is in is moved: the columns share a horizontal
+    /// scroll sync, so it carries the others along, and picking one keeps this
+    /// from fighting itself when several columns hold the same text.
+    /// Reports whether the row had been painted, which is what tells the caller
+    /// to stop retrying.
+    pub(in crate::view) fn reveal_conflict_search_match_horizontally(
+        &mut self,
+        visible_ix: usize,
+        matcher: &super::diff_search::DiffSearchMatcher,
+    ) -> bool {
+        let mut painted = false;
+        for column in [
+            ThreeWayColumn::Base,
+            ThreeWayColumn::Ours,
+            ThreeWayColumn::Theirs,
+        ] {
+            let Some(hitbox) = self.conflict_text_hitboxes.get(&(visible_ix, column)) else {
+                continue;
+            };
+            painted = true;
+            let painted_text = hitbox.layout.text.clone();
+            let Some(range) = self.painted_search_range(painted_text.as_ref(), matcher) else {
+                continue;
+            };
+            let Some(hitbox) = self.conflict_text_hitboxes.get(&(visible_ix, column)) else {
+                continue;
+            };
+            let layout = &hitbox.layout;
+            let local_left = layout.x_for_index(range.start.min(layout.len()));
+            let local_right = layout.x_for_index(range.end.min(layout.len()));
+            let row_left = hitbox.bounds.left();
+
+            let Some(handle) = self.conflict_column_scroll_handle(column) else {
+                continue;
+            };
+            let viewport = handle.bounds();
+            let offset = handle.offset();
+            // Painted bounds are window space with the scroll already applied.
+            let to_content = |x: Pixels| row_left + x - viewport.origin.x - offset.x;
+            let Some(target_x) = super::helpers::reveal_scroll_x(
+                to_content(local_left),
+                to_content(local_right),
+                viewport.size.width,
+                handle.max_offset().x,
+                offset.x,
+            ) else {
+                continue;
+            };
+            handle.set_offset(point(target_x, offset.y));
+        }
+        painted
+    }
+
+    /// The list handle a column's rows are actually tracked by.
+    ///
+    /// The two-way view reuses the three-way handles for a two-column layout:
+    /// its left (Ours) list is tracked by `conflict_resolver_diff_scroll`, and
+    /// `conflict_preview_ours_scroll` is never laid out there — writing to it
+    /// scrolls nothing. `None` for a column the current mode does not render.
+    fn conflict_column_scroll_handle(&self, column: ThreeWayColumn) -> Option<ScrollHandle> {
+        let list = match (self.conflict_resolver.view_mode, column) {
+            (ConflictResolverViewMode::ThreeWay, ThreeWayColumn::Base) => {
+                &self.conflict_resolver_diff_scroll
+            }
+            (ConflictResolverViewMode::ThreeWay, ThreeWayColumn::Ours) => {
+                &self.conflict_preview_ours_scroll
+            }
+            (ConflictResolverViewMode::TwoWayDiff, ThreeWayColumn::Ours) => {
+                &self.conflict_resolver_diff_scroll
+            }
+            (_, ThreeWayColumn::Theirs) => &self.conflict_preview_theirs_scroll,
+            (ConflictResolverViewMode::TwoWayDiff, ThreeWayColumn::Base) => return None,
+        };
+        Some(uniform_list_base_handle(list))
+    }
+
+    /// Bring the resolved output to the line a quick-search hit in the input
+    /// columns produced.
+    ///
+    /// `conflict_resolver_scroll_all_columns` knows only the three column
+    /// lists; the output rides handles of its own, so before this a match far
+    /// down the file scrolled the inputs and left the output parked at the top.
+    /// Reveal, not centre — an output line already on screen must not jump,
+    /// matching what `conflict_jump_to_nav_target` does.
+    ///
+    /// Runs without a `cx` because the whole search-scroll path does, so the
+    /// line count comes from the cached `conflict_resolved_preview_line_count`
+    /// rather than a fresh editor snapshot; it is refreshed on every output
+    /// edit, and it only clamps the target.
+    pub(in crate::view) fn conflict_resolver_reveal_search_match_in_output(
+        &self,
+        visible_ix: usize,
+    ) {
+        let Some(output_line) = self
+            .conflict_resolver
+            .output_line_for_visible_row(visible_ix)
+        else {
+            return;
+        };
+        self.conflict_resolver_reveal_resolved_output_line(
+            output_line,
+            self.conflict_resolved_preview_line_count.max(1),
+        );
     }
 
     pub(super) fn conflict_resolver_visible_ix_for_conflict(
@@ -727,6 +846,7 @@ impl MainPaneView {
 
         self.conflict_diff_segments_cache_split.clear();
         self.conflict_diff_query_segments_cache_split.clear();
+        self.conflict_three_way_query_segments_cache.clear();
         self.conflict_diff_query_cache_query = SharedString::default();
 
         // A CurrentOnly load intentionally omits all three immutable conflict
@@ -1156,7 +1276,7 @@ impl MainPaneView {
         // runs even for both-added conflicts where the three-way pass stays empty.
         let two_way_word_highlights_started = Instant::now();
         let two_way_aligned_word_highlights = if three_way_aligned.is_identity() {
-            rustc_hash::FxHashMap::default()
+            FxHashMap::default()
         } else {
             conflict_resolver::compute_aligned_two_way_word_highlights(
                 &three_way_aligned,
@@ -1269,6 +1389,7 @@ impl MainPaneView {
                 .contains(&(repo_id, path.clone()));
 
         self.conflict_three_way_segments_cache.clear();
+        self.conflict_three_way_query_segments_cache.clear();
 
         // Try foreground tree-sitter parse for each merge-input side.
         // If a parse times out, we schedule a background task below.
@@ -1327,14 +1448,14 @@ impl MainPaneView {
             context_fold_reveals: if is_same_conflict {
                 std::mem::take(&mut self.conflict_resolver.context_fold_reveals)
             } else {
-                std::collections::HashMap::default()
+                FxHashMap::default()
             },
             resolved_output_visible: None,
             resolved_output_visible_dirty: true,
             output_context_fold_reveals: if is_same_conflict {
                 std::mem::take(&mut self.conflict_resolver.output_context_fold_reveals)
             } else {
-                std::collections::HashMap::default()
+                FxHashMap::default()
             },
             conflict_region_indices,
             display_plan_block_indices,
@@ -1362,7 +1483,7 @@ impl MainPaneView {
             three_way_horizontal_measure_rows: [0; 3],
             conflict_has_base: Vec::new(),
             conflict_choices: Vec::new(),
-            two_way_split_visual_kind_cache: HashMap::default(),
+            two_way_split_visual_kind_cache: FxHashMap::default(),
             two_way_horizontal_measure_rows: [0; 2],
             three_way_word_highlights,
             two_way_aligned_word_highlights,
@@ -1792,6 +1913,7 @@ impl MainPaneView {
         // Clear segment caches since marker_segments changed.
         self.clear_conflict_diff_style_caches();
         self.conflict_three_way_segments_cache.clear();
+        self.conflict_three_way_query_segments_cache.clear();
         self.conflict_resolver_rebuild_visible_map();
 
         let output_path = self.conflict_resolver.path.clone();
@@ -1915,6 +2037,7 @@ impl MainPaneView {
         // documents instead of pinning stale fallback output across toggles.
         self.clear_conflict_diff_style_caches_preserving_query();
         self.conflict_three_way_segments_cache.clear();
+        self.conflict_three_way_query_segments_cache.clear();
         if view_mode == ConflictResolverViewMode::ThreeWay
             && self
                 .request_conflict_file_load_mode(gitcomet_state::model::ConflictFileLoadMode::Full)

@@ -1,5 +1,6 @@
 use super::*;
 use crate::view::diff_utils::{fill_svg_viewport_white, image_format_for_path};
+use rustc_hash::FxHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -209,7 +210,7 @@ pub(in crate::view) fn render_svg_image_diff_preview(
     resvg::render(&tree, transform, &mut pixmap.as_mut());
 
     let mut buffer = image::ImageBuffer::from_raw(pixmap.width(), pixmap.height(), pixmap.take())?;
-    for pixel in buffer.chunks_exact_mut(4) {
+    for pixel in buffer.as_chunks_mut::<4>().0 {
         swap_rgba_pa_to_bgra(pixel);
     }
 
@@ -232,7 +233,7 @@ fn render_raster_image_diff_preview(
     };
 
     let mut data = decoded.into_rgba8();
-    for pixel in data.chunks_exact_mut(4) {
+    for pixel in data.as_chunks_mut::<4>().0 {
         swap_rgba_to_bgra(pixel);
     }
 
@@ -264,7 +265,7 @@ fn decode_file_image_diff_preview_side(
 }
 
 fn file_image_diff_signature(file: &gitcomet_core::domain::FileDiffImage) -> u64 {
-    let mut hasher = rustc_hash::FxHasher::default();
+    let mut hasher = FxHasher::default();
     file.path.hash(&mut hasher);
     file.old.hash(&mut hasher);
     file.new.hash(&mut hasher);
@@ -276,7 +277,7 @@ fn cached_image_diff_path(bytes: &[u8], extension: &str) -> Option<std::path::Pa
 
     cleanup_image_diff_cache_startup_once();
 
-    let mut hasher = rustc_hash::FxHasher::default();
+    let mut hasher = FxHasher::default();
     hasher.write(bytes);
     hasher.write(extension.as_bytes());
     let path = std::env::temp_dir().join(format!(

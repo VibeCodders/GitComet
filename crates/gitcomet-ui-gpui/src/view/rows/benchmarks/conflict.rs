@@ -1088,6 +1088,7 @@ impl ConflictSearchQueryUpdateFixture {
                         theme,
                         base,
                         query_matcher?,
+                        super::diff_text::DiffSearchMatchEmphasis::Other,
                     )
                 } else {
                     super::diff_text::build_cached_diff_styled_text_with_source_identity(
@@ -1514,7 +1515,7 @@ impl ResolvedOutputRecomputeIncrementalFixture {
     }
 
     fn insert_lookup_from_text<'a>(
-        lookup: &mut HashMap<&'a str, (conflict_resolver::ResolvedLineSource, Option<u32>)>,
+        lookup: &mut FxHashMap<&'a str, (conflict_resolver::ResolvedLineSource, Option<u32>)>,
         source: conflict_resolver::ResolvedLineSource,
         text: &'a str,
         line_starts: &[usize],
@@ -1552,8 +1553,8 @@ impl ResolvedOutputRecomputeIncrementalFixture {
 
     fn build_source_lookup(
         &self,
-    ) -> HashMap<&str, (conflict_resolver::ResolvedLineSource, Option<u32>)> {
-        let mut lookup = HashMap::default();
+    ) -> FxHashMap<&str, (conflict_resolver::ResolvedLineSource, Option<u32>)> {
+        let mut lookup = FxHashMap::default();
         Self::insert_lookup_from_text(
             &mut lookup,
             conflict_resolver::ResolvedLineSource::C,

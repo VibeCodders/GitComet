@@ -4,7 +4,7 @@ use crate::view::shortcut_labels::Shortcut;
 
 fn push_entry(
     items: &mut Vec<ContextMenuItem>,
-    debug_selectors: &mut std::collections::HashMap<usize, SharedString>,
+    debug_selectors: &mut FxHashMap<usize, SharedString>,
     debug_selector: &'static str,
     label: &'static str,
     shortcut: Shortcut,
@@ -29,14 +29,14 @@ pub(super) fn model(this: &PopoverHost) -> ContextMenuModel {
     let show_command_palette = command_palette_available(this.root_view_mode);
 
     let mut items = Vec::new();
-    let mut debug_selectors = std::collections::HashMap::new();
+    let mut debug_selectors = FxHashMap::default();
 
     if show_command_palette {
         push_entry(
             &mut items,
             &mut debug_selectors,
             "app_menu_command_palette",
-            "Command Palette",
+            crate::menu_labels::COMMAND_PALETTE,
             Shortcut::Secondary("P"),
             false,
             AppMenuAction::CommandPalette,
@@ -46,7 +46,7 @@ pub(super) fn model(this: &PopoverHost) -> ContextMenuModel {
         &mut items,
         &mut debug_selectors,
         "app_menu_settings",
-        "Settings…",
+        crate::menu_labels::SETTINGS,
         Shortcut::Secondary(","),
         false,
         AppMenuAction::Settings,
@@ -56,7 +56,7 @@ pub(super) fn model(this: &PopoverHost) -> ContextMenuModel {
             &mut items,
             &mut debug_selectors,
             "app_menu_open_in_code_editor",
-            "Open in code editor",
+            crate::menu_labels::OPEN_IN_CODE_EDITOR,
             Shortcut::Secondary("Shift+E"),
             active_repo_workdir.is_none(),
             AppMenuAction::OpenInCodeEditor {
@@ -78,10 +78,24 @@ pub(super) fn model(this: &PopoverHost) -> ContextMenuModel {
         &mut items,
         &mut debug_selectors,
         "app_menu_locate_file",
-        "Show file in explorer",
+        crate::menu_labels::OPEN_IN_FILE_EXPLORER,
         Shortcut::Secondary("Shift+L"),
         !can_locate,
         AppMenuAction::LocateFileInExplorer,
+    );
+
+    // Sits with the other repository-scoped views rather than the app-wide rows
+    // above: it opens a panel about *this* repo's history.
+    push_entry(
+        &mut items,
+        &mut debug_selectors,
+        "app_menu_show_reflog",
+        "Reflog",
+        Shortcut::None,
+        active_repo_id.is_none(),
+        AppMenuAction::ShowReflog {
+            repo_id: active_repo_id,
+        },
     );
 
     items.push(ContextMenuItem::Separator);
@@ -89,7 +103,7 @@ pub(super) fn model(this: &PopoverHost) -> ContextMenuModel {
         &mut items,
         &mut debug_selectors,
         "app_menu_apply_patch",
-        "Apply patch…",
+        crate::menu_labels::APPLY_PATCH,
         Shortcut::None,
         active_repo_id.is_none(),
         AppMenuAction::ApplyPatch {
@@ -163,6 +177,15 @@ pub(super) fn activate(
                 });
             }
             this.close_popover_and_restore_focus(window, cx);
+        }
+        AppMenuAction::ShowReflog { repo_id } => {
+            this.close_popover_and_restore_focus(window, cx);
+            let Some(repo_id) = repo_id else {
+                return;
+            };
+            let _ = this.root_view.update(cx, |root, cx| {
+                root.open_reflog_panel(repo_id, cx);
+            });
         }
         AppMenuAction::ApplyPatch { repo_id } => {
             let Some(repo_id) = repo_id else {

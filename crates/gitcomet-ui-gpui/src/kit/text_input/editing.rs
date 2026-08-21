@@ -595,6 +595,13 @@ impl TextInput {
             .unwrap_or_else(|| window.line_height())
     }
 
+    /// The explicit line height set by `set_line_height`, if any. Tests use it to
+    /// assert a separate line-number gutter advances at the same rate as the buffer.
+    #[cfg(test)]
+    pub(crate) fn line_height_override(&self) -> Option<Pixels> {
+        self.line_height_override
+    }
+
     pub fn take_enter_pressed(&mut self) -> bool {
         std::mem::take(&mut self.interaction.enter_pressed)
     }
@@ -1695,6 +1702,28 @@ impl TextInput {
         let preferred_x = preferred_x.unwrap_or(caret_point.x);
         let target = point(preferred_x, caret_point.y + page_height * direction);
         Some((self.index_for_position(target), preferred_x))
+    }
+
+    /// The caret's x inside the input's own content, from the layout of the
+    /// frame that last painted it.
+    ///
+    /// A multiline input does not scroll itself sideways — the container it sits
+    /// in does — so the caret's place along its line is the only thing that
+    /// container can steer by. `None` while soft wrap is on, where there is no
+    /// horizontal overflow to reveal into, and before the first layout.
+    pub fn cursor_content_x(&self, cursor: usize) -> Option<Pixels> {
+        let layout = self.layout.last.as_ref()?;
+        let starts = self.layout.line_starts.as_ref()?;
+        match layout {
+            TextInputLayout::Plain(lines) => {
+                let (line_ix, local_ix) = line_for_offset(starts, lines, cursor);
+                lines.get(line_ix).map(|line| line.x_for_index(local_ix))
+            }
+            TextInputLayout::TruncatedSingleLine(line) => {
+                Some(truncated_line_x_for_source_offset(line, cursor))
+            }
+            TextInputLayout::Wrapped { .. } => None,
+        }
     }
 
     pub(super) fn cursor_vertical_span(&self, cursor: usize) -> Option<(Pixels, Pixels)> {

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -127,6 +127,12 @@ const FILE_SUFFIXES_BY_ICON_KEY: &[(&str, &[&str])] = &[
     ("ipynb", &["ipynb"]),
     ("java", &["java"]),
     ("javascript", &["cjs", "js", "mjs"]),
+    // Not in Zed's icon theme: GitComet highlights Nunjucks/Jinja templates (see
+    // DiffSyntaxLanguage::Jinja) and a template file falling back to the generic
+    // page icon reads as "unknown type". The split between the two keys is
+    // cosmetic -- one grammar serves both -- but `.njk` and `.j2` come from
+    // different ecosystems and users sort by icon.
+    ("jinja", &["j2", "jinja", "jinja2", "twig", "dj"]),
     ("json", &["json", "jsonc"]),
     ("julia", &["jl"]),
     ("kdl", &["kdl"]),
@@ -139,6 +145,7 @@ const FILE_SUFFIXES_BY_ICON_KEY: &[(&str, &[&str])] = &[
     ("metal", &["metal"]),
     ("nim", &["nim", "nims", "nimble"]),
     ("nix", &["nix"]),
+    ("nunjucks", &["njk", "nunjucks"]), // see the `jinja` entry above
     ("ocaml", &["ml", "mli", "mlx"]),
     ("odin", &["odin"]),
     ("php", &["php"]),
@@ -299,6 +306,7 @@ const FILE_ICONS: &[(&str, &str)] = &[
     ("ipynb", "icons/file_icons/jupyter.svg"),
     ("java", "icons/file_icons/java.svg"),
     ("javascript", "icons/file_icons/javascript.svg"),
+    ("jinja", "icons/file_icons/jinja.svg"),
     ("json", "icons/file_icons/code.svg"),
     ("julia", "icons/file_icons/julia.svg"),
     ("kdl", "icons/file_icons/kdl.svg"),
@@ -311,6 +319,7 @@ const FILE_ICONS: &[(&str, &str)] = &[
     ("metal", "icons/file_icons/metal.svg"),
     ("nim", "icons/file_icons/nim.svg"),
     ("nix", "icons/file_icons/nix.svg"),
+    ("nunjucks", "icons/file_icons/nunjucks.svg"),
     ("ocaml", "icons/file_icons/ocaml.svg"),
     ("odin", "icons/file_icons/odin.svg"),
     ("phoenix", "icons/file_icons/phoenix.svg"),
@@ -354,8 +363,12 @@ const FILE_ICONS: &[(&str, &str)] = &[
 
 fn icon_keys_by_association(
     associations_by_icon_key: &[(&'static str, &'static [&'static str])],
-) -> HashMap<&'static str, &'static str> {
-    let mut map = HashMap::new();
+) -> FxHashMap<&'static str, &'static str> {
+    let capacity = associations_by_icon_key
+        .iter()
+        .map(|(_, associations)| associations.len())
+        .sum();
+    let mut map = FxHashMap::with_capacity_and_hasher(capacity, Default::default());
     for (icon_key, associations) in associations_by_icon_key {
         for association in *associations {
             map.insert(*association, *icon_key);
@@ -364,13 +377,13 @@ fn icon_keys_by_association(
     map
 }
 
-static FILE_STEMS: LazyLock<HashMap<&'static str, &'static str>> =
+static FILE_STEMS: LazyLock<FxHashMap<&'static str, &'static str>> =
     LazyLock::new(|| icon_keys_by_association(FILE_STEMS_BY_ICON_KEY));
 
-static FILE_SUFFIXES: LazyLock<HashMap<&'static str, &'static str>> =
+static FILE_SUFFIXES: LazyLock<FxHashMap<&'static str, &'static str>> =
     LazyLock::new(|| icon_keys_by_association(FILE_SUFFIXES_BY_ICON_KEY));
 
-static FILE_ICON_PATHS: LazyLock<HashMap<&'static str, &'static str>> =
+static FILE_ICON_PATHS: LazyLock<FxHashMap<&'static str, &'static str>> =
     LazyLock::new(|| FILE_ICONS.iter().copied().collect());
 
 fn default_file_icon() -> &'static str {
@@ -406,13 +419,6 @@ pub fn file_icon_for_path(path: &Path) -> &'static str {
             }
             typ = suffix;
         }
-    }
-
-    // Multi-part suffix (e.g. `Component.stories.tsx` -> `stories.tsx`).
-    if let Some(suffix) = multiple_extensions(path)
-        && let Some(icon) = icon_for_suffix(&suffix)
-    {
-        return icon;
     }
 
     // Extension or hidden-file name (e.g. `.gitignore` -> `gitignore`,
@@ -476,6 +482,8 @@ pub fn file_icon_color(icon_path: &str, is_dark: bool) -> Option<gpui::Rgba> {
         "css" => (0x6BB4F0, 0x1572B6),
         "sass" => (0xE689B8, 0xBF5590),
         "vue" => (0x6BD3A0, 0x2F9668),
+        "nunjucks" => (0x7FBF6E, 0x3D8137),
+        "jinja" => (0xD86A6A, 0xB41717),
         "astro" => (0xF09668, 0xC6551A),
         "yaml" => (0xB8A2D8, 0x7A5C9E),
         "toml" => (0xC79378, 0x9C5B3C),
@@ -526,17 +534,6 @@ fn extension_or_hidden_file_name(path: &Path) -> Option<&str> {
         .or_else(|| path.file_stem()?.to_str())
 }
 
-/// Port of Zed's `PathExt::multiple_extensions`.
-fn multiple_extensions(path: &Path) -> Option<String> {
-    let file_name = path.file_name()?.to_str()?;
-    // Skip the file stem; keep only the dotted suffixes.
-    let parts: Vec<&str> = file_name.split('.').skip(1).collect();
-    if parts.len() < 2 {
-        return None;
-    }
-    Some(parts.join("."))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,6 +572,11 @@ mod tests {
         assert_eq!(icon(".editorconfig"), "icons/file_icons/editorconfig.svg");
         assert_eq!(icon("eslint.config.js"), "icons/file_icons/eslint.svg");
         assert_eq!(icon(".gitlab-ci.yml"), "icons/file_icons/gitlab.svg");
+        assert_eq!(
+            icon("project.eslint.config.js"),
+            "icons/file_icons/eslint.svg"
+        );
+        assert_eq!(icon(".eslint.config.js"), "icons/file_icons/eslint.svg");
     }
 
     #[test]

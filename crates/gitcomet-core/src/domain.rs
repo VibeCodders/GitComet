@@ -10,7 +10,7 @@ use std::{
 };
 
 #[cfg(test)]
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::FxHashMap;
 #[cfg(test)]
 use std::sync::Mutex;
 
@@ -722,7 +722,7 @@ pub trait DiffRowProvider {
 pub(crate) struct PagedDiffLineProvider {
     lines: Arc<[DiffLine]>,
     page_size: usize,
-    pages: Mutex<HashMap<usize, Arc<[DiffLine]>>>,
+    pages: Mutex<FxHashMap<usize, Arc<[DiffLine]>>>,
 }
 
 #[cfg(test)]
@@ -731,7 +731,7 @@ impl PagedDiffLineProvider {
         Self {
             lines,
             page_size: page_size.max(1),
-            pages: Mutex::new(HashMap::default()),
+            pages: Mutex::new(FxHashMap::default()),
         }
     }
 
@@ -955,6 +955,10 @@ pub struct ReflogEntry {
     pub message: Arc<str>,
     pub time: Option<SystemTime>,
     pub selector: Arc<str>,
+    /// The committer name recorded on this reflog line (git stores one
+    /// committer identity per entry, distinct from the commit's own author).
+    /// Empty when the backend could not resolve one.
+    pub author: Arc<str>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1267,6 +1271,7 @@ index 0000000..1111111 100644
             message: "reflog message".into(),
             time: None,
             selector: "HEAD@{0}".into(),
+            author: "Jane Doe".into(),
         };
         let reflog_clone = reflog.clone();
         assert!(Arc::ptr_eq(&reflog.message, &reflog_clone.message));

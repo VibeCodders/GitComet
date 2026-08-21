@@ -95,7 +95,14 @@ fn submodule_range_label(kind: SubmoduleDiffRangeKind) -> &'static str {
 }
 
 fn inline_submodule_entries(summary: &SubmoduleDiffSummary) -> Vec<InlineSubmoduleDiffEntry> {
-    let mut entries = Vec::new();
+    let capacity = summary.ranges.iter().fold(
+        summary
+            .live_staged
+            .len()
+            .saturating_add(summary.live_unstaged.len()),
+        |len, range| len.saturating_add(range.changes.len()),
+    );
+    let mut entries = Vec::with_capacity(capacity);
     for range in &summary.ranges {
         let Some((from_commit_id, to_commit_id)) = range.from.clone().zip(range.to.clone()) else {
             continue;
@@ -181,6 +188,7 @@ impl MainPaneView {
         let handle_w = px(7.0);
         div()
             .id("annotate_resize_handle")
+            .debug_selector(|| "annotate_resize_handle".to_string())
             .group("annotate_resize_handle")
             .absolute()
             .left((annot_w - handle_w / 2.0).max(px(0.0)))
@@ -1125,22 +1133,17 @@ impl MainPaneView {
         self.set_diff_reveal_whitespace_chars_and_persist(!self.reveal_whitespace_chars, cx);
     }
 
-    fn prepare_source_mode_for_diff_search(&mut self, cx: &mut gpui::Context<Self>) {
-        if self.is_markdown_preview_active() {
-            self.rendered_preview_modes
-                .set(RenderedPreviewKind::Markdown, RenderedPreviewMode::Source);
-            let wants_file_diff = self.wants_file_diff_view(self.is_file_preview_active());
-            if wants_file_diff {
-                self.ensure_file_diff_cache(cx);
-            }
-        }
-        if self.is_conflict_rendered_preview_active() {
+    fn activate_diff_search(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) {
+        // Search used to drop every rendered preview back to Source here so there
+        // was plain text to scan. It scans the rendered markdown rows instead,
+        // so opening the search box no longer changes what you are looking at —
+        // except over a rendered *picture*, which has no text at all and would
+        // otherwise leave search with nothing to find.
+        if self.is_conflict_rendered_preview_active()
+            && !self.is_conflict_rendered_markdown_preview_active()
+        {
             self.conflict_resolver.resolver_preview_mode = ConflictResolverPreviewMode::Text;
         }
-    }
-
-    fn activate_diff_search(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) {
-        self.prepare_source_mode_for_diff_search(cx);
         let was_search_active = self.diff_search_active;
         self.diff_search_active = true;
         self.clear_diff_text_query_overlay_cache();
@@ -1172,6 +1175,15 @@ impl MainPaneView {
         self.clear_diff_text_query_overlay_cache();
         self.clear_worktree_preview_segments_cache();
         self.clear_conflict_diff_query_overlay_caches();
+        self.markdown_preview_reveal.clear();
+        // Hand the buffer back, caret still on the match. The panel focus handle
+        // every other view returns to would drop the user out of the text.
+        if self.is_file_editor_active() {
+            self.file_editor_search_clear();
+            let focus = self.file_editor_input.read(cx).focus_handle();
+            window.focus(&focus, cx);
+            return;
+        }
         window.focus(&self.diff_panel_focus_handle, cx);
     }
 
@@ -2796,6 +2808,10 @@ impl MainPaneView {
                             move |this, _e, window, cx| {
                                 this.rendered_preview_modes
                                     .set(preview_kind, RenderedPreviewMode::Rendered);
+                                // Rendered rows and source lines are different
+                                // row spaces, so an open search has to rescan
+                                // rather than keep indices into the old one.
+                                this.diff_search_recompute_matches();
                                 this.restore_diff_panel_focus_after_toolbar_action(window, cx);
                                 cx.notify();
                             },
@@ -2817,6 +2833,7 @@ impl MainPaneView {
                             move |this, _e, window, cx| {
                                 this.rendered_preview_modes
                                     .set(preview_kind, RenderedPreviewMode::Source);
+                                this.diff_search_recompute_matches();
                                 this.restore_diff_panel_focus_after_toolbar_action(window, cx);
                                 cx.notify();
                             },
@@ -2983,6 +3000,15 @@ impl MainPaneView {
                                                 rows::worktree_markdown_preview_bar_color(
                                                     self, theme,
                                                 ),
+                                            query: self.markdown_preview_search_query(),
+                                            reveal: self.markdown_preview_reveal.clone(),
+                                            scroll: Some(
+                                                self.worktree_preview_scroll
+                                                    .0
+                                                    .borrow()
+                                                    .base_handle
+                                                    .clone(),
+                                            ),
                                         },
                                     );
 
@@ -3088,6 +3114,9 @@ impl MainPaneView {
                                 scroll_handle.clone(),
                                 components::ScrollbarAxis::Vertical,
                             );
+                            let annotate_handle = self
+                                .annotate_enabled
+                                .then(|| self.annotate_resize_handle(ui_scale_percent, theme, cx));
                             div()
                                 .id("worktree_preview_scroll_container")
                                 .debug_selector(|| "worktree_preview_scroll_container".to_string())
@@ -3121,6 +3150,9 @@ impl MainPaneView {
                                         .always_visible()
                                         .render(theme),
                                     )
+                                })
+                                .when_some(annotate_handle, |container, handle| {
+                                    container.child(handle)
                                 })
                                 .into_any_element()
                         }
@@ -3767,7 +3799,12 @@ impl MainPaneView {
         };
         self.diff_text_layout_cache_epoch = self.diff_text_layout_cache_epoch.wrapping_add(1);
         self.prune_diff_text_layout_cache();
+        // Last chance to read the geometry the previous frame painted: a search
+        // jump can only be measured sideways once its row has been laid out at
+        // the position the vertical scroll put it in.
+        self.apply_pending_diff_search_horizontal_reveal(window);
         self.diff_text_hitboxes.clear();
+        self.conflict_text_hitboxes.clear();
         // The map still holds last frame's buttons, so it is the one place that
         // knows a hovered button has stopped being painted — the row itself
         // clears its hover on the next mouse move, but a row that scrolled away

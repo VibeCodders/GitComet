@@ -23,6 +23,7 @@ mod pinned_section;
 mod previous_commit_messages;
 mod pull;
 mod push;
+mod reflog_entry;
 mod remote;
 mod repo_picker_row;
 mod repo_tab;
@@ -391,6 +392,11 @@ impl PopoverHost {
             PopoverKind::CommitMenu { repo_id, commit_id } => {
                 Some(commit::model(self, *repo_id, commit_id))
             }
+            PopoverKind::ReflogEntryMenu {
+                repo_id,
+                target,
+                selector,
+            } => Some(reflog_entry::model(*repo_id, selector, target)),
             PopoverKind::TagMenu { repo_id, commit_id } => {
                 Some(tag::model(self, *repo_id, commit_id))
             }
@@ -1660,7 +1666,7 @@ impl PopoverHost {
         // `status_entry_for_path` per path is a linear scan of the whole status
         // list each time and this runs on every right-click.
         let all_untracked = if used_selection {
-            let untracked: std::collections::HashSet<&std::path::Path> = repo
+            let untracked: FxHashSet<&std::path::Path> = repo
                 .status_entries_for_area(area)
                 .unwrap_or(&[])
                 .iter()

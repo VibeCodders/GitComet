@@ -9,7 +9,7 @@ use gitcomet_core::domain::{FileEntry, FileEntryKind, LogScope};
 use gitcomet_state::model::{Loadable, SidebarDataRequest, SidebarMode};
 use gitcomet_state::msg::Msg;
 use palette::IntoColor;
-use rustc_hash::FxHasher;
+use rustc_hash::{FxHashSet, FxHasher};
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
@@ -1447,6 +1447,25 @@ impl SidebarPaneView {
             theme.colors.foreground.secondary,
             if theme.is_dark { 0.45 } else { 0.32 },
         );
+        // On light themes `interaction.selected_background` lands almost on top
+        // of the chrome this strip paints, so a filled chip has no edge of its
+        // own and the selected tab does not read as selected at all. Give it
+        // the same selection indicator outline that selected rows and buttons
+        // already carry on light themes, at rest and on hover alike. Dark
+        // themes have the fill contrast already, so they stay borderless.
+        let tab_selected_border = if theme.is_dark {
+            gpui::rgba(0x00000000)
+        } else {
+            theme.colors.interaction.selected_indicator
+        };
+        // Hovering the selected chip must not trade its outline down for the
+        // weaker idle-hover one, so on light themes it keeps the indicator and
+        // only the fill lifts.
+        let tab_selected_hover_border = if theme.is_dark {
+            tab_hover_border
+        } else {
+            tab_selected_border
+        };
 
         // The ids are load-bearing, not just for tests: gpui only allocates the
         // element state that makes a `.hover()` repaint the view for *stateful*
@@ -1462,21 +1481,22 @@ impl SidebarPaneView {
             .h(scaled_px(22.0))
             .rounded(px(theme.radii.control))
             .border_1()
-            .border_color(gpui::transparent_black())
             .when(mode == SidebarMode::Branches, |d| {
                 d.bg(theme.colors.interaction.selected_background)
+                    .border_color(tab_selected_border)
                     .text_color(theme.colors.interaction.selected_foreground)
             })
             .when(mode != SidebarMode::Branches, |d| {
                 d.bg(gpui::transparent_black())
+                    .border_color(gpui::transparent_black())
                     .text_color(theme.colors.foreground.secondary)
             })
             .hover(move |d| {
-                let d = d.border_color(tab_hover_border);
                 if mode != SidebarMode::Branches {
-                    d.bg(tab_hover_bg)
+                    d.border_color(tab_hover_border).bg(tab_hover_bg)
                 } else {
-                    d.bg(tab_active_hover_bg)
+                    d.border_color(tab_selected_hover_border)
+                        .bg(tab_active_hover_bg)
                 }
             })
             .cursor(CursorStyle::PointingHand)
@@ -1501,7 +1521,6 @@ impl SidebarPaneView {
             .h(scaled_px(22.0))
             .rounded(px(theme.radii.control))
             .border_1()
-            .border_color(gpui::transparent_black())
             .when(mode == SidebarMode::Files, |d| {
                 // Carry the tint onto the active chip too, so it does not read
                 // as a neutral hole punched in a tinted bar.
@@ -1513,18 +1532,20 @@ impl SidebarPaneView {
                 } else {
                     theme.colors.interaction.selected_background
                 })
+                .border_color(tab_selected_border)
                 .text_color(theme.colors.interaction.selected_foreground)
             })
             .when(mode != SidebarMode::Files, |d| {
                 d.bg(gpui::transparent_black())
+                    .border_color(gpui::transparent_black())
                     .text_color(theme.colors.foreground.secondary)
             })
             .hover(move |d| {
-                let d = d.border_color(tab_hover_border);
                 if mode != SidebarMode::Files {
-                    d.bg(tab_hover_bg)
+                    d.border_color(tab_hover_border).bg(tab_hover_bg)
                 } else {
-                    d.bg(tab_active_hover_bg)
+                    d.border_color(tab_selected_hover_border)
+                        .bg(tab_active_hover_bg)
                 }
             })
             .cursor(CursorStyle::PointingHand)
@@ -2122,10 +2143,8 @@ impl SidebarPaneView {
         let has_search = !matchers.is_empty();
 
         let mut tree_rows: Vec<FileBrowserVisibleRow> = if has_search {
-            let mut matching_entry_indices: std::collections::HashSet<usize> =
-                std::collections::HashSet::new();
-            let mut ancestor_paths: std::collections::HashSet<Arc<PathBuf>> =
-                std::collections::HashSet::new();
+            let mut matching_entry_indices = FxHashSet::default();
+            let mut ancestor_paths = FxHashSet::default();
 
             for (i, entry) in entries.iter().enumerate() {
                 let path_str = entry.path.to_string_lossy();
@@ -2208,13 +2227,13 @@ impl SidebarPaneView {
         rows
     }
 
-    fn file_browser_visible_mask(&self, entries: &[FileEntry]) -> std::collections::HashSet<usize> {
+    fn file_browser_visible_mask(&self, entries: &[FileEntry]) -> FxHashSet<usize> {
         let Some(repo) = self.active_repo() else {
-            return std::collections::HashSet::new();
+            return FxHashSet::default();
         };
         let expanded = &repo.file_browser.expanded_dirs;
 
-        let mut visible = std::collections::HashSet::new();
+        let mut visible = FxHashSet::default();
         let mut skip_until_sibling: Option<(usize, usize)> = None;
 
         for (i, entry) in entries.iter().enumerate() {
@@ -2355,7 +2374,7 @@ impl SidebarPaneView {
 
         // Looked up per row, so a set rather than the ordered vec the pinned
         // section is built from.
-        let unsaved_paths: std::collections::HashSet<PathBuf> =
+        let unsaved_paths: FxHashSet<PathBuf> =
             this.unsaved_file_edit_paths(cx).into_iter().collect();
 
         let unsaved_collapsed = this.unsaved_section_is_collapsed();
